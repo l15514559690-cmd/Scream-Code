@@ -1,0 +1,64 @@
+{
+  "allow_global_access": true,
+  "active": "minimax-2-7",
+  "models": [
+    {
+      "id": "deepseek",
+      "alias": "DeepSeek",
+      "base_url": "https://api.deepseek.com/v1",
+      "model_name": "deepseek-chat",
+      "api_key_env_name": "DEEPSEEK_API_KEY"
+    },
+    {
+      "id": "qwen",
+      "alias": "通义千问",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model_name": "qwen-turbo",
+      "api_key_env_name": "DASHSCOPE_API_KEY"
+    },
+    {
+      "id": "kimi",
+      "alias": "Kimi",
+      "base_url": "https://api.moonshot.cn/v1",
+      "model_name": "moonshot-v1-8k",
+      "api_key_env_name": "MOONSHOT_API_KEY"
+    },
+    {
+      "id": "ollama",
+      "alias": "本地 Ollama",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model_name": "llama3.2",
+      "api_key_env_name": "OLLAMA_API_KEY"
+    },
+    {
+      "id": "自定义-openaisas",
+      "alias": "自定义 OpenAIsas",
+      "base_url": "https://api.openai.com/v1",
+      "model_name": "gpt-4o",
+      "api_key_env_name": "API_KEY"
+    },
+    {
+      "id": "minimax-2.7",
+      "alias": "MiniMax · 2.7",
+      "base_url": "https://api.minimax.chat/v1",
+      "model_name": "minimax-2.7",
+      "api_key_env_name": "MINIMAX_API_KEY"
+    },
+    {
+      "id": "minimax",
+      "alias": "minimax",
+      "base_url": "https://api.minimaxi.com/anthropic",
+      "model_name": "minimax-2.7",
+      "api_key_env_name": "MINIMAX_2_API_KEY",
+      "api_protocol": "anthropic"
+    },
+    {
+      "id": "minimax-2-7",
+      "alias": "minimax-2.7",
+      "base_url": "https://api.minimaxi.com/anthropic",
+      "model_name": "miniman-2.7",
+      "api_key_env_name": "MINIMAX_2_7_API_KEY",
+      "api_protocol": "anthropic"
+    }
+  ]
+}

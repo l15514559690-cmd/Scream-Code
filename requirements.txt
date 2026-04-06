@@ -1,0 +1,6 @@
+openai>=1.40.0
+anthropic>=0.25.0
+python-dotenv>=1.0.0
+prompt_toolkit>=3.0.0
+questionary>=2.0.0
+rich>=13.7.0

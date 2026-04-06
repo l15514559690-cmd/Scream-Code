@@ -1,0 +1,598 @@
+from __future__ import annotations
+
+import copy
+import json
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from typing import Any
+
+from openai import OpenAI
+
+from .llm_settings import LlmConnectionSettings
+
+
+class LlmClientError(Exception):
+    """配置缺失或调用方显式拒绝发起请求时使用。"""
+
+
+def get_openai_agent_tools() -> list[dict[str, Any]]:
+    """合并内置技能与 ``skills/`` 动态技能；每次调用刷新 schema（沙箱开关等即时生效）。"""
+    from .skills_registry import get_skills_registry
+
+    return get_skills_registry().get_all_schemas()
+
+MAX_AGENT_TOOL_ROUNDS = 8
+ANTHROPIC_STREAM_MAX_TOKENS = 16_384
+
+
+@dataclass(frozen=True)
+class StreamPart:
+    """流式 Chat Completions 的单次产出：文本、工具调用增量、结束原因与用量。"""
+
+    text_delta: str | None = None
+    tool_index: int | None = None
+    tool_id: str | None = None
+    tool_name_fragment: str | None = None
+    tool_arguments_fragment: str | None = None
+    finish_reason: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+
+@dataclass
+class ToolCallAccumulator:
+    """按 OpenAI / Anthropic 流式 index 拼接完整 tool_calls。"""
+
+    _by_index: dict[int, dict[str, str]] = field(default_factory=dict)
+
+    def consume(self, part: StreamPart) -> None:
+        if part.tool_index is None:
+            return
+        idx = part.tool_index
+        slot = self._by_index.setdefault(idx, {'id': '', 'name': '', 'arguments': ''})
+        if part.tool_id:
+            slot['id'] = part.tool_id
+        if part.tool_name_fragment:
+            slot['name'] += part.tool_name_fragment
+        if part.tool_arguments_fragment:
+            slot['arguments'] += part.tool_arguments_fragment
+
+    def has_tool_calls(self) -> bool:
+        for slot in self._by_index.values():
+            if (slot.get('name') or '').strip():
+                return True
+        return False
+
+    def as_openai_tool_calls(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for idx in sorted(self._by_index):
+            s = self._by_index[idx]
+            name = (s.get('name') or '').strip()
+            if not name:
+                continue
+            tid = (s.get('id') or '').strip() or f'call_{idx}'
+            args = s.get('arguments') or '{}'
+            out.append(
+                {
+                    'id': tid,
+                    'type': 'function',
+                    'function': {'name': name, 'arguments': args},
+                }
+            )
+        return out
+
+
+@dataclass
+class ChatCompletionResult:
+    text: str
+    input_tokens: int
+    output_tokens: int
+    #: 供 ``QueryEnginePort`` 持久化多轮对话（含本轮 tool 往返）；无则未更新。
+    conversation_messages: list[dict[str, Any]] | None = None
+
+
+_KEY_SETUP_HINT = '未检测到密钥，请执行 scream-config 进行设置'
+
+
+def _raise_if_missing_key(settings: LlmConnectionSettings) -> None:
+    if (settings.api_key or '').strip():
+        return
+    bits: list[str] = [_KEY_SETUP_HINT]
+    if settings.profile_alias:
+        bits.append(f'当前模型：{settings.profile_alias}。')
+    if settings.api_key_env_name:
+        bits.append(f'请在项目根 `.env` 中配置 `{settings.api_key_env_name}`。')
+    raise LlmClientError(' '.join(bits))
+
+
+def _map_llm_auth_exception(exc: BaseException) -> LlmClientError | None:
+    """将明显的鉴权失败映射为统一的中文引导（含无效 / 过期密钥）。"""
+    try:
+        import openai
+
+        if isinstance(exc, openai.AuthenticationError):
+            return LlmClientError(_KEY_SETUP_HINT)
+    except ImportError:
+        pass
+    try:
+        import anthropic
+
+        if isinstance(exc, anthropic.AuthenticationError):
+            return LlmClientError(_KEY_SETUP_HINT)
+    except ImportError:
+        pass
+    status = getattr(exc, 'status_code', None)
+    if status == 401:
+        return LlmClientError(_KEY_SETUP_HINT)
+    resp = getattr(exc, 'response', None)
+    if resp is not None and getattr(resp, 'status_code', None) == 401:
+        return LlmClientError(_KEY_SETUP_HINT)
+    return None
+
+
+def openai_tools_to_anthropic(openai_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """将 OpenAI ``tools`` JSON 转为 Anthropic ``tools``（name / description / input_schema）。"""
+    out: list[dict[str, Any]] = []
+    for block in openai_tools:
+        fn = block.get('function') if isinstance(block, dict) else None
+        if not isinstance(fn, dict):
+            continue
+        name = str(fn.get('name', '')).strip()
+        if not name:
+            continue
+        desc = str(fn.get('description', '') or '')
+        params = fn.get('parameters')
+        if not isinstance(params, dict):
+            params = {'type': 'object', 'properties': {}}
+        out.append(
+            {
+                'name': name,
+                'description': desc,
+                'input_schema': params,
+            }
+        )
+    return out
+
+
+def _parse_tool_arguments(raw: str | dict[str, Any] | None) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def openai_messages_to_anthropic_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """
+    提取全部 ``role: system`` 拼接为顶层 ``system`` 文本，并转换为 Anthropic ``messages``。
+    将 OpenAI 的 ``tool`` 轮次合并为单条 user 消息（``tool_result`` 块列表）。
+    """
+    system_chunks: list[str] = []
+    rest: list[dict[str, Any]] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get('role') == 'system':
+            c = m.get('content')
+            if isinstance(c, str) and c.strip():
+                system_chunks.append(c)
+        else:
+            rest.append(m)
+    system_text = '\n\n'.join(system_chunks) if system_chunks else None
+
+    anth: list[dict[str, Any]] = []
+    i = 0
+    while i < len(rest):
+        m = rest[i]
+        role = m.get('role')
+        if role == 'user':
+            content = m.get('content')
+            if isinstance(content, str):
+                anth.append({'role': 'user', 'content': content})
+            else:
+                anth.append({'role': 'user', 'content': str(content or '')})
+            i += 1
+        elif role == 'assistant':
+            blocks: list[dict[str, Any]] = []
+            txt = m.get('content')
+            if isinstance(txt, str) and txt.strip():
+                blocks.append({'type': 'text', 'text': txt})
+            for tc in m.get('tool_calls') or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get('function') if isinstance(tc.get('function'), dict) else {}
+                name = str(fn.get('name', '') or '')
+                tid = str(tc.get('id', '') or '')
+                inp = _parse_tool_arguments(fn.get('arguments'))
+                blocks.append({'type': 'tool_use', 'id': tid, 'name': name, 'input': inp})
+            if not blocks:
+                blocks.append({'type': 'text', 'text': ''})
+            anth.append({'role': 'assistant', 'content': blocks})
+            i += 1
+        elif role == 'tool':
+            results: list[dict[str, Any]] = []
+            while i < len(rest) and rest[i].get('role') == 'tool':
+                t = rest[i]
+                results.append(
+                    {
+                        'type': 'tool_result',
+                        'tool_use_id': str(t.get('tool_call_id', '') or ''),
+                        'content': str(t.get('content', '') or ''),
+                    }
+                )
+                i += 1
+            anth.append({'role': 'user', 'content': results})
+        else:
+            i += 1
+    return system_text, anth
+
+
+def _anthropic_stop_to_finish(stop_reason: str | None) -> str:
+    if stop_reason == 'tool_use':
+        return 'tool_calls'
+    return 'stop'
+
+
+def _open_chat_stream(
+    client: OpenAI,
+    *,
+    use_model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> Iterator[Any]:
+    create_kw: dict[str, Any] = {
+        'model': use_model,
+        'messages': messages,
+        'stream': True,
+    }
+    if tools is not None:
+        create_kw['tools'] = tools
+        create_kw['tool_choice'] = 'auto'
+    try:
+        return client.chat.completions.create(
+            **create_kw,
+            stream_options={'include_usage': True},
+        )
+    except TypeError:
+        return client.chat.completions.create(**create_kw)
+
+
+def _stream_parts_from_openai_chunk(chunk: Any) -> list[StreamPart]:
+    parts: list[StreamPart] = []
+    choices = getattr(chunk, 'choices', None) or []
+    if not choices:
+        return parts
+    c0 = choices[0]
+    delta = getattr(c0, 'delta', None)
+    if delta is not None:
+        piece = getattr(delta, 'content', None) or ''
+        if piece:
+            parts.append(StreamPart(text_delta=piece))
+        tool_calls = getattr(delta, 'tool_calls', None) or []
+        for tc in tool_calls:
+            idx = getattr(tc, 'index', None)
+            tid = getattr(tc, 'id', None) or None
+            fn = getattr(tc, 'function', None)
+            name_frag = ''
+            args_frag = ''
+            if fn is not None:
+                n = getattr(fn, 'name', None)
+                if n:
+                    name_frag = n
+                a = getattr(fn, 'arguments', None)
+                if a:
+                    args_frag = a
+            eff_idx: int | None = idx if isinstance(idx, int) else None
+            if eff_idx is None and (name_frag or args_frag or tid):
+                eff_idx = 0
+            if eff_idx is None:
+                continue
+            parts.append(
+                StreamPart(
+                    tool_index=eff_idx,
+                    tool_id=tid if isinstance(tid, str) else None,
+                    tool_name_fragment=name_frag or None,
+                    tool_arguments_fragment=args_frag or None,
+                )
+            )
+    fr = getattr(c0, 'finish_reason', None)
+    if fr:
+        parts.append(StreamPart(finish_reason=fr))
+    return parts
+
+
+def _chat_completion_stream_openai(
+    messages: list[dict[str, Any]],
+    settings: LlmConnectionSettings,
+    *,
+    use_model: str,
+    tools: list[dict[str, Any]] | None,
+) -> Iterator[StreamPart]:
+    client = OpenAI(base_url=settings.base_url, api_key=settings.api_key)
+    stream = _open_chat_stream(
+        client, use_model=use_model, messages=messages, tools=tools
+    )
+    for chunk in stream:
+        for p in _stream_parts_from_openai_chunk(chunk):
+            yield p
+        usage = getattr(chunk, 'usage', None)
+        if usage is not None:
+            pt = getattr(usage, 'prompt_tokens', None)
+            ct = getattr(usage, 'completion_tokens', None)
+            if pt is not None or ct is not None:
+                yield StreamPart(
+                    prompt_tokens=int(pt) if pt is not None else 0,
+                    completion_tokens=int(ct) if ct is not None else 0,
+                )
+
+
+def _chat_completion_stream_anthropic(
+    messages: list[dict[str, Any]],
+    settings: LlmConnectionSettings,
+    *,
+    use_model: str,
+    tools: list[dict[str, Any]] | None,
+) -> Iterator[StreamPart]:
+    from anthropic import Anthropic
+
+    system_text, anth_msgs = openai_messages_to_anthropic_messages(messages)
+    anth_tool_list = (
+        openai_tools_to_anthropic(tools) if tools else None
+    )
+
+    base_kw: dict[str, Any] = {
+        'api_key': settings.api_key,
+    }
+    if settings.base_url and str(settings.base_url).strip():
+        base_kw['base_url'] = str(settings.base_url).strip().rstrip('/')
+    client = Anthropic(**base_kw)
+
+    req: dict[str, Any] = {
+        'model': use_model,
+        'max_tokens': ANTHROPIC_STREAM_MAX_TOKENS,
+        'messages': anth_msgs,
+    }
+    if system_text and system_text.strip():
+        req['system'] = system_text
+    if anth_tool_list:
+        req['tools'] = anth_tool_list
+        req['tool_choice'] = {'type': 'auto'}
+
+    last_in = 0
+    last_out = 0
+    finish_emitted = False
+
+    with client.messages.stream(**req) as stream:
+        for event in stream:
+            et = getattr(event, 'type', None)
+            if et == 'message_start':
+                msg = getattr(event, 'message', None)
+                u = getattr(msg, 'usage', None) if msg is not None else None
+                if u is not None:
+                    last_in = int(getattr(u, 'input_tokens', 0) or 0) + int(
+                        getattr(u, 'cache_read_input_tokens', 0) or 0
+                    ) + int(getattr(u, 'cache_creation_input_tokens', 0) or 0)
+                    last_out = int(getattr(u, 'output_tokens', 0) or 0)
+            elif et == 'content_block_start':
+                idx = int(getattr(event, 'index', 0))
+                blk = getattr(event, 'content_block', None)
+                btype = getattr(blk, 'type', None) if blk is not None else None
+                if btype == 'tool_use':
+                    tid = str(getattr(blk, 'id', '') or '')
+                    name = str(getattr(blk, 'name', '') or '')
+                    yield StreamPart(
+                        tool_index=idx,
+                        tool_id=tid or None,
+                        tool_name_fragment=name or None,
+                    )
+            elif et == 'content_block_delta':
+                idx = int(getattr(event, 'index', 0))
+                d = getattr(event, 'delta', None)
+                if d is None:
+                    continue
+                dt = getattr(d, 'type', None)
+                if dt == 'text_delta':
+                    tx = getattr(d, 'text', None) or ''
+                    if tx:
+                        yield StreamPart(text_delta=tx)
+                elif dt == 'input_json_delta':
+                    pj = getattr(d, 'partial_json', None) or ''
+                    if pj:
+                        yield StreamPart(
+                            tool_index=idx,
+                            tool_arguments_fragment=pj,
+                        )
+            elif et == 'message_delta':
+                u = getattr(event, 'usage', None)
+                if u is not None:
+                    if getattr(u, 'input_tokens', None) is not None:
+                        last_in = int(u.input_tokens or 0) + int(
+                            getattr(u, 'cache_read_input_tokens', 0) or 0
+                        ) + int(getattr(u, 'cache_creation_input_tokens', 0) or 0)
+                    last_out = int(getattr(u, 'output_tokens', 0) or last_out)
+                delta = getattr(event, 'delta', None)
+                sr = getattr(delta, 'stop_reason', None) if delta is not None else None
+                if sr:
+                    yield StreamPart(finish_reason=_anthropic_stop_to_finish(str(sr)))
+                    finish_emitted = True
+
+    if not finish_emitted:
+        yield StreamPart(finish_reason='stop')
+    yield StreamPart(
+        prompt_tokens=last_in,
+        completion_tokens=last_out,
+    )
+
+
+def chat_completion_stream(
+    messages: list[dict[str, Any]],
+    settings: LlmConnectionSettings,
+    *,
+    model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> Iterator[StreamPart]:
+    """按配置的 ``api_protocol`` 选择 OpenAI 或 Anthropic 流式接口。"""
+    _raise_if_missing_key(settings)
+    use_model = (model or settings.model).strip() or settings.model
+    proto = (settings.api_protocol or 'openai').strip().lower()
+    try:
+        if proto == 'anthropic':
+            yield from _chat_completion_stream_anthropic(
+                messages, settings, use_model=use_model, tools=tools
+            )
+        else:
+            yield from _chat_completion_stream_openai(
+                messages, settings, use_model=use_model, tools=tools
+            )
+    except Exception as exc:
+        mapped = _map_llm_auth_exception(exc)
+        if mapped is not None:
+            raise mapped from exc
+        raise
+
+
+def iter_agent_executor_events(
+    messages: list[dict[str, Any]],
+    settings: LlmConnectionSettings,
+    *,
+    model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """
+    **LLM Provider 侧唯一的多轮工具闭环**（本仓库对 claw-code 链路的 Python 镜像实现）。
+
+    职责边界（不可下沉到 REPL / 通道）：
+
+    - 按 ``api_protocol`` 流式调用 OpenAI 或 Anthropic；
+    - 解析 ``tool_calls``，经 **SkillsRegistry**（与 ``tool-pool`` 展示的运行时工具面同源）执行并写回 ``messages``；
+    - 向外产出 ``text_delta`` / ``api_tool_op`` / ``llm_error``，以及终结事件 ``executor_complete``。
+
+    不负责：会话 transcript、路由摘要、Rich 渲染。调用方须传入已构造好的 ``messages``（含 system/user）。
+    """
+    from .skills_registry import get_skills_registry
+
+    reg = get_skills_registry()
+    use_tools = tools if tools is not None else get_openai_agent_tools()
+    use_model = (model or settings.model).strip() or settings.model
+    msgs = messages
+    in_tok = 0
+    out_tok = 0
+    text_slices: list[str] = []
+
+    for _ in range(MAX_AGENT_TOOL_ROUNDS):
+        acc = ToolCallAccumulator()
+        round_buf: list[str] = []
+        finish_reason: str | None = None
+        round_in = 0
+        round_out = 0
+        try:
+            for part in chat_completion_stream(
+                msgs, settings, model=use_model, tools=use_tools
+            ):
+                if part.text_delta:
+                    round_buf.append(part.text_delta)
+                    yield {'type': 'text_delta', 'text': part.text_delta}
+                acc.consume(part)
+                if part.finish_reason:
+                    finish_reason = part.finish_reason
+                if part.prompt_tokens is not None:
+                    round_in = part.prompt_tokens
+                if part.completion_tokens is not None:
+                    round_out = part.completion_tokens
+        except LlmClientError as exc:
+            yield {'type': 'llm_error', 'output': f'[LLM] {exc}'}
+            return
+        except Exception as exc:  # pragma: no cover - 网络/供应商错误
+            yield {'type': 'llm_error', 'output': f'[LLM] 请求异常: {exc}'}
+            return
+
+        in_tok += round_in
+        out_tok += round_out
+        assistant_round = ''.join(round_buf).strip()
+
+        if finish_reason == 'tool_calls' and acc.has_tool_calls():
+            if assistant_round:
+                text_slices.append(assistant_round)
+            tool_calls = acc.as_openai_tool_calls()
+            assistant_msg: dict[str, Any] = {
+                'role': 'assistant',
+                'tool_calls': tool_calls,
+            }
+            if assistant_round:
+                assistant_msg['content'] = assistant_round
+            msgs.append(assistant_msg)
+            for tc in tool_calls:
+                fn = tc['function']['name']
+                raw_args = tc['function']['arguments']
+                yield {
+                    'type': 'api_tool_op',
+                    'tool_name': fn,
+                    'arguments': raw_args,
+                }
+                result = reg.execute_tool(fn, raw_args)
+                msgs.append(
+                    {
+                        'role': 'tool',
+                        'tool_call_id': tc['id'],
+                        'content': result,
+                    }
+                )
+            continue
+
+        if assistant_round:
+            text_slices.append(assistant_round)
+        llm_text = '\n\n'.join(text_slices).strip()
+        yield {
+            'type': 'executor_complete',
+            'assistant_text': llm_text,
+            'input_tokens': in_tok,
+            'output_tokens': out_tok,
+            'conversation_messages': copy.deepcopy(msgs),
+        }
+        return
+
+    yield {
+        'type': 'llm_error',
+        'output': '[LLM] 工具调用轮次超过上限，请简化任务。',
+    }
+
+
+def chat_completion(
+    messages: list[dict[str, Any]],
+    settings: LlmConnectionSettings,
+    *,
+    model: str | None = None,
+) -> ChatCompletionResult:
+    """非流式：消费 :func:`iter_agent_executor_events` 直至得到最终文本。"""
+    for ev in iter_agent_executor_events(
+        messages,
+        settings,
+        model=model,
+        tools=get_openai_agent_tools(),
+    ):
+        if ev['type'] == 'executor_complete':
+            cm = ev.get('conversation_messages')
+            return ChatCompletionResult(
+                text=str(ev['assistant_text']).strip(),
+                input_tokens=int(ev['input_tokens']),
+                output_tokens=int(ev['output_tokens']),
+                conversation_messages=cm if isinstance(cm, list) else None,
+            )
+        if ev['type'] == 'llm_error':
+            return ChatCompletionResult(
+                text=str(ev['output']),
+                input_tokens=0,
+                output_tokens=0,
+                conversation_messages=None,
+            )
+    return ChatCompletionResult(
+        text='[LLM] 工具调用轮次超过上限，请简化任务。',
+        input_tokens=0,
+        output_tokens=0,
+        conversation_messages=None,
+    )
