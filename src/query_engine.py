@@ -26,6 +26,8 @@ class QueryEngineConfig:
     llm_enabled: bool = False
     #: 覆盖默认模型（仅当使用环境变量直连且未写 llm_config 时参考 ``MODEL``）。
     llm_model: str | None = None
+    #: REPL 展示层专用：累计 token 参与记忆水位提示；``None`` 使用 ``replLauncher.REPL_MEMORY_WARN_TOTAL_TOKENS``。不截断请求。
+    token_warning_threshold: int | None = None
 
 
 @dataclass(frozen=True)

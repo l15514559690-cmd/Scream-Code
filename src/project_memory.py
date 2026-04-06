@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 # 按优先级依次尝试（仅使用 Path.cwd() 下首个可读且非空白的文件）
@@ -45,3 +46,56 @@ def project_memory_system_suffix(cwd: Path | None = None) -> str:
     if not name or body is None:
         return ''
     return format_project_memory_system_suffix(body)
+
+
+# REPL ``/memo``、``/summary`` 追加块使用的稳定小节锚点（便于人工检索，不替换整文件）
+LONG_TERM_MEMORY_SECTION_HEADING = '## 长效记忆库 · 尖叫 REPL'
+
+
+def long_term_memory_target_path(cwd: Path | None = None) -> Path:
+    """
+    写入长效记忆时的目标文件：优先已有 ``SCREAM.md``，否则已有 ``CLAUDE.md``，否则新建 ``SCREAM.md``。
+    仅追加，不覆盖用户原有正文结构。
+    """
+    base = (cwd if cwd is not None else Path.cwd()).resolve()
+    scream = base / 'SCREAM.md'
+    claude = base / 'CLAUDE.md'
+    if scream.is_file():
+        return scream
+    if claude.is_file():
+        return claude
+    return scream
+
+
+def append_long_term_memory_block(
+    body: str,
+    *,
+    cwd: Path | None = None,
+    source_tag: str = '/memo',
+) -> str:
+    """
+    将 ``body`` 以独立小节追加到项目记忆文件（Markdown）。
+
+    Returns:
+        成功时为简短说明；失败时为可读错误信息（不抛异常）。
+    """
+    raw = (body or '').strip()
+    if not raw:
+        return '无内容可写入。'
+    path = long_term_memory_target_path(cwd)
+    stamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+    block = (
+        f'\n\n---\n\n{LONG_TERM_MEMORY_SECTION_HEADING}（`{source_tag}` · {stamp}）\n\n{raw}\n'
+    )
+    try:
+        existing = path.read_text(encoding='utf-8') if path.is_file() else ''
+    except (OSError, UnicodeDecodeError) as exc:
+        return f'读取现有文件失败: {exc}'
+    sep = '\n\n' if existing and not existing.endswith('\n') else ''
+    new_text = f'{existing}{sep}{block.lstrip()}' if existing else block.lstrip()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_text, encoding='utf-8')
+    except OSError as exc:
+        return f'写入失败: {exc}'
+    return f'已安全追加至 {path.name}（{path}）。'

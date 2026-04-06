@@ -72,6 +72,38 @@ class ProjectMemoryTests(unittest.TestCase):
         finally:
             os.chdir(old)
 
+    def test_append_long_term_memory_prefers_existing_scream(self) -> None:
+        old = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                os.chdir(tmp)
+                Path(tmp, 'SCREAM.md').write_text('# 根\n正文', encoding='utf-8')
+                from src.project_memory import append_long_term_memory_block, long_term_memory_target_path
+
+                self.assertEqual(long_term_memory_target_path().name, 'SCREAM.md')
+                msg = append_long_term_memory_block('- 偏好 A', source_tag='/memo')
+                self.assertTrue(msg.startswith('已安全'))
+                text = Path(tmp, 'SCREAM.md').read_text(encoding='utf-8')
+                self.assertIn('# 根', text)
+                self.assertIn('偏好 A', text)
+                self.assertIn('长效记忆库', text)
+        finally:
+            os.chdir(old)
+
+    def test_append_long_term_memory_uses_claude_when_no_scream(self) -> None:
+        old = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                os.chdir(tmp)
+                Path(tmp, 'CLAUDE.md').write_text('# Claude\n', encoding='utf-8')
+                from src.project_memory import append_long_term_memory_block, long_term_memory_target_path
+
+                self.assertEqual(long_term_memory_target_path().name, 'CLAUDE.md')
+                append_long_term_memory_block('note', source_tag='/memo')
+                self.assertIn('note', Path(tmp, 'CLAUDE.md').read_text(encoding='utf-8'))
+        finally:
+            os.chdir(old)
+
 
 if __name__ == '__main__':
     unittest.main()

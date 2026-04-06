@@ -14,10 +14,19 @@ from .command_graph import build_command_graph
 from .llm_settings import read_llm_connection_settings
 from .models import UsageSummary
 from .parity_audit import run_parity_audit
-from .project_memory import read_first_available_project_memory
+from .project_memory import append_long_term_memory_block, read_first_available_project_memory
 from .query_engine import QueryEnginePort
 from .session_store import list_saved_session_entries, load_session
 from .setup import run_setup
+
+_MEMO_EXTRACT_SYSTEM = """你是「长效记忆库」整理助手。下面是一段 REPL 对话摘录（仅作依据，勿外传语气）。
+请只输出 Markdown（可用 `###` 小标题与 `-` 列表），归纳：
+1. 用户的技术偏好（语言、框架、工具、代码风格）
+2. 已确定的架构或设计决策
+3. 关键项目背景与约束
+
+要求：不要寒暄；不要重复摘录全文；禁止臆造摘录中不存在的内容；每条尽量具体可执行。
+若几乎无可保存信息，只输出一行：（本轮无可提取的长效要点）"""
 
 
 def _flush_current_repl_session(engine: QueryEnginePort) -> str:
@@ -34,12 +43,104 @@ def _flush_current_repl_session(engine: QueryEnginePort) -> str:
     return engine.persist_session()
 
 
+def _hard_reset_repl_session(engine: QueryEnginePort) -> str:
+    """
+    比 ``/flush`` 更彻底：在同等清空与会话落盘基础上，额外清空 REPL 展示层 token 水位缓存，
+    使新会话与「刚打开窗口」一致。
+    """
+    try:
+        from . import replLauncher
+
+        replLauncher.clear_all_repl_token_warnings()
+    except Exception:
+        pass
+    return _flush_current_repl_session(engine)
+
+
+def _completion_text_no_tools(
+    messages: list[dict[str, Any]],
+    settings: Any,
+    *,
+    model: str | None = None,
+) -> tuple[str, str | None]:
+    """单次补全（不注册工具），供 ``/memo`` 隐藏 Prompt。"""
+    from .llm_client import LlmClientError, chat_completion_stream
+
+    parts: list[str] = []
+    try:
+        for chunk in chat_completion_stream(messages, settings, model=model, tools=None):
+            if chunk.text_delta:
+                parts.append(chunk.text_delta)
+    except LlmClientError as exc:
+        return '', str(exc)
+    except Exception as exc:  # pragma: no cover - 网络/供应商异常
+        return '', f'{type(exc).__name__}: {exc}'
+    return ''.join(parts).strip(), None
+
+
+def _memo_session_excerpt(engine: QueryEnginePort, *, max_chars: int = 48_000) -> str:
+    blocks: list[str] = []
+    for i, m in enumerate(engine.mutable_messages):
+        blocks.append(f'### 用户轮次 {i + 1}\n{m}\n')
+    tail = engine.llm_conversation_messages[-24:]
+    for msg in tail:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get('role', '') or '')
+        content = msg.get('content', '')
+        if not isinstance(content, str) or not content.strip():
+            continue
+        cap = 12_000
+        body = content if len(content) <= cap else content[:cap] + '\n…(本条已截断)…'
+        blocks.append(f'### assistant/user 历史 ({role})\n{body}\n')
+    blob = '\n'.join(blocks).strip()
+    if len(blob) > max_chars:
+        blob = blob[:max_chars] + '\n\n…(摘录已达长度上限，已截断)…'
+    return blob
+
+
+def _memo_extract_via_llm(engine: QueryEnginePort, *, excerpt: str) -> tuple[str, str | None]:
+    from .llm_settings import read_llm_connection_settings
+
+    settings = read_llm_connection_settings()
+    model = (engine.config.llm_model or '').strip() or None
+    user = '请根据以下会话摘录提取长效记忆要点（仅 Markdown 输出）：\n\n' + (
+        excerpt if excerpt.strip() else '（无摘录）'
+    )
+    messages: list[dict[str, Any]] = [
+        {'role': 'system', 'content': _MEMO_EXTRACT_SYSTEM},
+        {'role': 'user', 'content': user},
+    ]
+    return _completion_text_no_tools(messages, settings, model=model)
+
+
+def _confirm_store_summary(console: Any | None) -> bool:
+    try:
+        import questionary
+    except ImportError:
+        questionary = None
+    if console is not None and questionary is not None:
+        try:
+            return bool(
+                questionary.confirm('是否将此摘要存入永久记忆库？', default=False).ask()
+            )
+        except Exception:
+            pass
+    try:
+        ans = input('是否将此摘要存入永久记忆库？[y/N] ').strip().lower()
+    except EOFError:
+        return False
+    return ans in ('y', 'yes')
+
+
 def _print_help(console: Any | None) -> None:
     sections: list[tuple[str, list[str]]] = [
         (
             '时光机与记忆',
             [
-                '/summary — 当前项目与会话的上下文摘要（原生 summary）',
+                '/summary — 项目与会话摘要；可确认后写入长效记忆（SCREAM.md / CLAUDE.md）',
+                '/memo — 调用模型从当前会话提取要点并追加到长效记忆文件',
+                '/new — 硬重置：清空对话、新 session_id、重置计数与展示层缓存（较 /flush 更彻底）',
                 '/flush — 清空本轮对话、重置 token 累计并落盘新会话',
                 '/sessions — 扫描 .port_sessions 下列出历史会话',
                 '/load <id> — 恢复指定会话 id（原生 load-session）',
@@ -431,7 +532,45 @@ def dispatch_repl_slash_command(
         return True, None
 
     if cmd == '/summary':
-        _print_markdown_block(console, engine.render_summary(), title='/summary · 工作区与会话摘要')
+        body = engine.render_summary()
+        _print_markdown_block(console, body, title='/summary · 工作区与会话摘要')
+        if _confirm_store_summary(console):
+            store_body = f'### /summary 快照\n\n```\n{body}\n```'
+            result = append_long_term_memory_block(store_body, source_tag='/summary')
+            _msg(console, result, style='bold green' if result.startswith('已安全') else 'yellow')
+        return True, None
+
+    if cmd == '/memo':
+        if not engine.config.llm_enabled:
+            _msg(console, '/memo 需要已启用大模型的 REPL（勿使用 repl --no-llm）。', style='yellow')
+            return True, None
+        excerpt = _memo_session_excerpt(engine)
+        if not excerpt.strip():
+            _msg(console, '当前会话尚无足够内容可供提取，可先多聊几句再试。', style='yellow')
+            return True, None
+        _msg(console, '正在调用模型整理长效要点（隐藏 Prompt，不写入当前对话历史）…', style='dim')
+        text, err = _memo_extract_via_llm(engine, excerpt=excerpt)
+        if err:
+            _msg(console, f'模型调用失败: {err}', style='bold red')
+            return True, None
+        if not text.strip():
+            _msg(console, '模型未返回可写入内容。', style='yellow')
+            return True, None
+        result = append_long_term_memory_block(text, source_tag='/memo')
+        _msg(console, result, style='bold green' if result.startswith('已安全') else 'yellow')
+        return True, None
+
+    if cmd == '/new':
+        try:
+            path = _hard_reset_repl_session(engine)
+            _msg(
+                console,
+                f'已硬重置：全新 session、对话与计数器已清空，并已落盘 {path}。'
+                ' 长效记忆文件未改动。',
+                style='bold green',
+            )
+        except OSError as exc:
+            _msg(console, f'/new 落盘失败: {exc}', style='bold red')
         return True, None
 
     if cmd == '/flush':

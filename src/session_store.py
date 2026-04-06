@@ -64,3 +64,17 @@ def list_saved_session_entries(
             n, it, ot = -1, 0, 0
         rows.append((sid, n, it, ot, path))
     return rows
+
+
+def most_recent_saved_session_id(directory: Path | None = None) -> str | None:
+    """
+    返回 ``.port_sessions/*.json`` 中按修改时间最新的一条的 ``session_id``。
+    无法解析或目录为空时返回 ``None``（供 REPL 自动续播）。
+    """
+    entries = list_saved_session_entries(directory=directory, limit=1)
+    if not entries:
+        return None
+    sid, n, _, _, _ = entries[0]
+    if n < 0:
+        return None
+    return sid

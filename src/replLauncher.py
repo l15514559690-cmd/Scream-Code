@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from typing import Any
 
@@ -15,14 +16,248 @@ _SLANT_LOGO_LINES = (
 
 def build_repl_banner() -> str:
     return (
-        '未加 --llm 时仅显示本说明。要进入可对话的交互循环并调用大模型，请执行：'
-        '`python3 -m src.main repl --llm`（密钥见 llm_config.json / .env）。'
-        '也可使用 `summary` 或 `config`。'
+        '当前为「仅说明」模式（例如使用了 `repl --no-llm`）。'
+        '要进入可对话的交互循环并调用大模型，请执行不带 `--no-llm` 的 `python3 -m src.main repl`'
+        '（密钥见 llm_config.json / .env）。也可使用 `summary` 或 `config`。'
     )
 
 
 def _logo_plain() -> str:
     return '\n'.join(_SLANT_LOGO_LINES)
+
+
+# 记忆水位（仅 REPL 展示层；不截断请求、不改写历史）
+REPL_MEMORY_WARN_TOTAL_TOKENS = 200_000
+REPL_MEMORY_WARN_USER_TURNS = 50
+REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA = 50_000
+REPL_MEMORY_WARN_REPEAT_TURN_DELTA = 10
+# 兼容旧名：默认 token 阈值
+TOKEN_WARNING_THRESHOLD = REPL_MEMORY_WARN_TOTAL_TOKENS
+# Live 等待脚注刷新下限：过密则每次全量重解析 Markdown，易占满 CPU 导致卡顿
+_LIVE_WAIT_FOOTER_REFRESH_MIN_S = 0.35
+# session_id -> (上次预警时的累计 tokens, 上次预警时的用户轮次数)
+_REPL_MEMORY_WARN_LAST: dict[str, tuple[int, int]] = {}
+
+
+def clear_all_repl_token_warnings() -> None:
+    """供 ``/new`` 等硬重置：清空记忆水位预警的会话缓存（展示层）。"""
+    _REPL_MEMORY_WARN_LAST.clear()
+
+
+def _repl_engine_autoresume(console: Any | None, *, use_rich: bool) -> Any:
+    """
+    若 ``.port_sessions/`` 下存在最近修改的会话 JSON，则 ``load_session`` 恢复；否则空会话。
+    不改变 ``session_store`` 的读写格式，仅组合现有 API。
+    """
+    from .query_engine import QueryEnginePort
+    from .session_store import load_session, most_recent_saved_session_id
+
+    sid = most_recent_saved_session_id()
+    if not sid:
+        return QueryEnginePort.from_workspace()
+    try:
+        load_session(sid)
+        eng = QueryEnginePort.from_saved_session(sid)
+    except (OSError, FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return QueryEnginePort.from_workspace()
+    if use_rich and console is not None:
+        console.print(
+            f'[dim]已自动恢复上次会话记忆 (ID: {sid})，如需开启全新对话请输出 /new[/dim]'
+        )
+    else:
+        print(
+            f'已自动恢复上次会话记忆 (ID: {sid})；全新对话请输入 /new',
+            flush=True,
+        )
+    return eng
+
+
+def _safe_close_generator(gen: Any) -> None:
+    """关闭事件生成器时吞掉各类异常，避免二次堆栈污染终端。"""
+    if gen is None:
+        return
+    try:
+        gen.close()
+    except BaseException:
+        pass
+
+
+def _repl_poll_next_event(
+    gen: Any,
+    console: Any,
+    *,
+    live: Any | None,
+    use_live: bool,
+    show_thinking_status: bool,
+    wait_footer_holder: list[float | None] | None = None,
+    spin_interval: float = 0.1,
+) -> dict[str, Any] | None:
+    """
+    在独立线程中执行 ``next(gen)``，主线程以 ``spin_interval`` 轮询队列，
+    从而在阻塞期刷新思考 Status 或 Live 底部等待计时。
+    """
+    import queue
+    import threading
+    import time
+
+    from .repl_ui_render import thinking_status_markup
+
+    outq: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            outq.put(('ok', next(gen)))
+        except StopIteration:
+            outq.put(('stop', None))
+        except BaseException as exc:
+            outq.put(('err', exc))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    t0 = time.perf_counter()
+    last_live_footer_refresh_at = t0
+    thinking_st: Any = None
+    try:
+        if show_thinking_status and live is None and use_live:
+            thinking_st = console.status(
+                thinking_status_markup(0.0),
+                spinner='dots12',
+                spinner_style='cyan',
+            )
+            thinking_st.start()
+
+        while True:
+            try:
+                kind, payload = outq.get(timeout=spin_interval)
+                break
+            except queue.Empty:
+                elapsed = time.perf_counter() - t0
+                if thinking_st is not None:
+                    try:
+                        thinking_st.update(thinking_status_markup(elapsed))
+                    except BaseException:
+                        pass
+                if live is not None and wait_footer_holder is not None:
+                    wait_footer_holder[0] = elapsed
+                    now = time.perf_counter()
+                    if now - last_live_footer_refresh_at >= _LIVE_WAIT_FOOTER_REFRESH_MIN_S:
+                        last_live_footer_refresh_at = now
+                        try:
+                            live.refresh()
+                        except BaseException:
+                            pass
+
+        if kind == 'ok':
+            return payload  # type: ignore[no-any-return]
+        if kind == 'stop':
+            return None
+        if kind == 'err':
+            if isinstance(payload, GeneratorExit):
+                raise KeyboardInterrupt from None
+            raise payload
+        return None
+    except KeyboardInterrupt:
+        _safe_close_generator(gen)
+        try:
+            while True:
+                outq.get_nowait()
+        except queue.Empty:
+            pass
+        raise
+    finally:
+        if wait_footer_holder is not None:
+            wait_footer_holder[0] = None
+        if thinking_st is not None:
+            try:
+                thinking_st.stop()
+            except BaseException:
+                pass
+
+
+def _token_warning_threshold_for_engine(engine: Any) -> int:
+    """优先读取 ``engine.config.token_warning_threshold``（若为正整数），否则默认 ``REPL_MEMORY_WARN_TOTAL_TOKENS``。"""
+    cfg = getattr(engine, 'config', None)
+    if cfg is None:
+        return REPL_MEMORY_WARN_TOTAL_TOKENS
+    raw = getattr(cfg, 'token_warning_threshold', None)
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    return REPL_MEMORY_WARN_TOTAL_TOKENS
+
+
+def _maybe_print_repl_memory_load_warning(
+    console: Any | None, engine: Any, *, use_rich: bool
+) -> None:
+    """
+    记忆水位预警：仅 ``console.print``，不截断、不改写 engine。
+    在流式回合正常结束后调用。首次在「累计 tokens ≥ 阈值」或「用户轮次 ≥ 阈值」时提示；
+    之后仅当 tokens 再增 ``REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA`` 或轮次再增
+    ``REPL_MEMORY_WARN_REPEAT_TURN_DELTA`` 时重复提示。token 与轮次均回落至阈值以下时重置。
+    """
+    try:
+        u = getattr(engine, 'total_usage', None)
+        if u is None:
+            return
+        inp = int(getattr(u, 'input_tokens', 0))
+        outp = int(getattr(u, 'output_tokens', 0))
+        current_tokens = inp + outp
+    except (TypeError, ValueError):
+        return
+
+    msgs = getattr(engine, 'mutable_messages', None) or []
+    try:
+        user_turns = len(msgs)
+    except TypeError:
+        user_turns = 0
+
+    token_th = _token_warning_threshold_for_engine(engine)
+    turn_th = REPL_MEMORY_WARN_USER_TURNS
+    sid = str(getattr(engine, 'session_id', '') or '') or str(id(engine))
+
+    below_tokens = current_tokens < token_th
+    below_turns = user_turns < turn_th
+    if below_tokens and below_turns:
+        _REPL_MEMORY_WARN_LAST.pop(sid, None)
+        return
+
+    prev = _REPL_MEMORY_WARN_LAST.get(sid)
+    if prev is None:
+        should_warn = True
+    else:
+        last_tok, last_turn = prev
+        should_warn = (
+            current_tokens - last_tok >= REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA
+            or user_turns - last_turn >= REPL_MEMORY_WARN_REPEAT_TURN_DELTA
+        )
+
+    if not should_warn:
+        return
+
+    _REPL_MEMORY_WARN_LAST[sid] = (current_tokens, user_turns)
+
+    from .repl_ui_render import build_token_warning_panel, format_token_warning_plain
+
+    if use_rich and console is not None:
+        console.print()
+        console.print(build_token_warning_panel(current_tokens, token_th))
+        return
+
+    print(format_token_warning_plain(current_tokens, token_th), end='', flush=True)
+
+
+def _print_graceful_interrupt(console: Any | None, *, use_rich: bool) -> None:
+    """
+    Ctrl+C 后的统一提示：保留已输出内容，REPL 不退出，会话对象不丢弃。
+    """
+    primary = '⏸ 已手动中断'
+    hint = (
+        '当前已输出内容已保留。可直接输入下一句继续；本轮若未跑完则不会写入完整对话历史。'
+        '输入 exit 退出。'
+    )
+    if use_rich and console is not None:
+        console.print(f'[bold yellow]{primary}[/bold yellow]')
+        console.print(f'[dim]{hint}[/dim]')
+        return
+    print(f'\n{primary}。{hint}', flush=True)
 
 
 def print_project_memory_loaded_notice() -> None:
@@ -117,39 +352,29 @@ def print_repl_llm_driver_banner(*, console: Any | None) -> None:
     console.print()
 
 
-def _assistant_panel_title() -> Any:
-    from rich.text import Text
-
-    return Text.from_markup('[bold cyan]🤖 尖叫助理[/bold cyan]')
-
-
-def _assistant_panel(inner: Any) -> Any:
-    from rich.panel import Panel
-
-    return Panel(
-        inner,
-        title=_assistant_panel_title(),
-        border_style='cyan',
-        expand=True,
-        padding=(1, 2),
-    )
-
-
 def _print_assistant_output(console: object, text: str) -> None:
     from rich.markdown import Markdown
+
+    from .repl_ui_render import assistant_panel
 
     stripped = text.strip()
     if not stripped:
         return
-    console.print(_assistant_panel(Markdown(stripped, code_theme='monokai')))
+    console.print(assistant_panel(Markdown(stripped, code_theme='monokai')))
     console.print()
 
 
 def _print_assistant_error(console: object, message: str) -> None:
     from rich.text import Text
 
-    console.print(_assistant_panel(Text(message, style='bold red')))
+    from .repl_ui_render import assistant_panel
+
+    console.print(assistant_panel(Text(message, style='bold red')))
     console.print()
+
+
+# REPL 单行历史仅驻内存；限制条数避免极长会话下 list 膨胀拖慢 prompt_toolkit
+_REPL_HISTORY_MAX_ITEMS = 512
 
 
 def _build_prompt_session() -> Any | None:
@@ -162,9 +387,28 @@ def _build_prompt_session() -> Any | None:
     if not sys.stdin.isatty():
         return None
 
-    history = InMemoryHistory()
-    # interrupt_exception 默认为 KeyboardInterrupt，便于 REPL 捕获 Ctrl+C 而不退出进程。
-    return PromptSession(history=history)
+    class _BoundedInMemoryHistory(InMemoryHistory):
+        """不启用 FileHistory；超限时丢弃最旧条目，避免历史列表无限增长。"""
+
+        def __init__(self, cap: int) -> None:
+            super().__init__()
+            self._cap = max(32, cap)
+
+        def store_string(self, string: str) -> None:
+            super().store_string(string)
+            over = len(self._storage) - self._cap
+            if over > 0:
+                del self._storage[0:over]
+
+    history = _BoundedInMemoryHistory(_REPL_HISTORY_MAX_ITEMS)
+    # 显式关闭边输边补全/校验；mouse/suspend 与 Rich 全屏控件交替时易争用终端
+    return PromptSession(
+        history=history,
+        complete_while_typing=False,
+        validate_while_typing=False,
+        mouse_support=False,
+        enable_suspend=False,
+    )
 
 
 def _repl_read_line(
@@ -187,7 +431,7 @@ def _repl_read_line(
     except EOFError:
         return None
     except KeyboardInterrupt:
-        console.print('[bold red]⛔ 已手动中断[/bold red]')
+        _print_graceful_interrupt(console, use_rich=use_rich_input)
         return ''
 
 
@@ -238,11 +482,8 @@ def _consume_llm_events_plain(
                 print()
                 return
     except KeyboardInterrupt:
-        try:
-            gen.close()
-        except Exception:
-            pass
-        print('\n⛔ 已中断')
+        _safe_close_generator(gen)
+        _print_graceful_interrupt(None, use_rich=False)
 
 
 def _run_streaming_turn(
@@ -255,33 +496,59 @@ def _run_streaming_turn(
     team: bool = False,
 ) -> None:
     from rich.live import Live
-    from rich.markdown import Markdown
+
+    from .repl_ui_render import (
+        build_api_tool_op_renderable,
+        streaming_markdown_panel_with_wait_footer,
+        tool_execution_status_message,
+    )
 
     use_live = bool(
         getattr(console, 'is_terminal', False) and console.is_terminal
     )
-    # 路由与权限推断统一交给 QueryEngine + PortRuntime，本层仅消费事件流。
     gen = engine.iter_repl_assistant_events_with_runtime(
         line, runtime=runtime, route_limit=route_limit, team=team
     )
     buffer = ''
     live: Any = None
+    _md_wait: list[float | None] = [None]
 
     def _live_renderable() -> Any:
-        return _assistant_panel(Markdown(buffer, code_theme='monokai'))
+        # 每次刷新按当前 console 宽度重排 Markdown，减轻终端缩放后的错位感
+        return streaming_markdown_panel_with_wait_footer(buffer, _md_wait[0])
 
     def _stop_live() -> None:
         nonlocal live
         if live is not None:
             try:
                 live.stop()
-            except Exception:
+            except BaseException:
                 pass
             live = None
+        _md_wait[0] = None
+
+    def _poll(
+        *,
+        show_thinking_status: bool,
+    ) -> dict[str, Any] | None:
+        return _repl_poll_next_event(
+            gen,
+            console,
+            live=live,
+            use_live=use_live,
+            show_thinking_status=show_thinking_status,
+            wait_footer_holder=_md_wait if live is not None else None,
+        )
 
     try:
-        for ev in gen:
+        pending: dict[str, Any] | None = _poll(
+            show_thinking_status=use_live and live is None,
+        )
+        while pending is not None:
+            ev = pending
+            pending = None
             et = ev['type']
+
             if et == 'blocked':
                 _stop_live()
                 _print_assistant_output(console, ev['output'])
@@ -300,6 +567,7 @@ def _run_streaming_turn(
                 }
                 st = styles.get(agent, 'bold white')
                 console.print(f'[{st}]━━ {agent} ━━[/{st}]')
+                pending = _poll(show_thinking_status=use_live and live is None)
                 continue
             if et == 'non_llm':
                 _stop_live()
@@ -309,14 +577,21 @@ def _run_streaming_turn(
                 _stop_live()
                 label = ', '.join(ev['tools'])
                 console.print(f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]')
+                pending = _poll(show_thinking_status=use_live and live is None)
                 continue
             if et == 'api_tool_op':
                 _stop_live()
                 buffer = ''
-                console.print(
-                    f'[bold yellow]🛠️ 尖叫 Code 正在操作: {ev["tool_name"]} '
-                    f'-> {ev["arguments"]}[/bold yellow]'
-                )
+                console.print(build_api_tool_op_renderable(ev))
+                console.print()
+                tool_name = str(ev.get('tool_name', 'tool'))
+                # 下一次 next(gen) 会在 llm_client 内同步执行工具；用 Status 覆盖等待期
+                with console.status(
+                    tool_execution_status_message(tool_name),
+                    spinner='dots12',
+                    spinner_style='cyan',
+                ):
+                    pending = _poll(show_thinking_status=False)
                 continue
             if et == 'text_delta':
                 piece = ev['text']
@@ -325,14 +600,18 @@ def _run_streaming_turn(
                     if live is None:
                         live = Live(
                             console=console,
-                            refresh_per_second=20,
+                            refresh_per_second=12,
                             transient=False,
                             vertical_overflow='visible',
                             get_renderable=_live_renderable,
                         )
                         live.start()
                     else:
-                        live.refresh()
+                        try:
+                            live.refresh()
+                        except BaseException:
+                            pass
+                pending = _poll(show_thinking_status=False)
                 continue
             if et == 'finished':
                 _stop_live()
@@ -345,17 +624,17 @@ def _run_streaming_turn(
                     if isinstance(out, str) and out.strip():
                         _print_assistant_output(console, out)
                 return
+
+            pending = _poll(show_thinking_status=use_live and live is None)
     except KeyboardInterrupt:
-        try:
-            gen.close()
-        except Exception:
-            pass
+        _safe_close_generator(gen)
+        _print_graceful_interrupt(console, use_rich=True)
+    finally:
         _stop_live()
-        console.print('[bold red]⛔ 已手动中断[/bold red]')
 
 
 def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int:
-    """打印 Logo 后进入交互：prompt_toolkit 输入 + 流式 Markdown（Rich Live）。"""
+    """打印 Logo 后进入交互：默认可用大模型路径为 prompt_toolkit + Rich Live 流式 Markdown。"""
     from dataclasses import replace
 
     try:
@@ -364,7 +643,6 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
     except ImportError:
         Console = None  # type: ignore[misc, assignment]
 
-    from .query_engine import QueryEnginePort
     from .runtime import PortRuntime
 
     print_startup_banner(ensure_config=True)
@@ -374,22 +652,25 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
         return 0
 
     if Console is None:
-        print('已启用 --llm，将调用大模型 API。输入 exit / quit 结束。')
+        print('大模型 REPL：将调用 API。输入 exit / quit 结束。')
         print(
-            '斜杠指令: /help · doctor cost diff status · team · 记忆/体检/引擎类\n'
+            '斜杠指令: /help · /new /memo · doctor cost diff status · team · 记忆/体检/引擎类\n'
         )
         print_repl_llm_driver_banner(console=None)
         from .repl_slash_commands import dispatch_repl_slash_command
 
         runtime = PortRuntime()
-        engine = QueryEnginePort.from_workspace()
+        engine = _repl_engine_autoresume(None, use_rich=False)
         engine.config = replace(engine.config, llm_enabled=True)
         while True:
             try:
                 line = input('尖叫> ').strip()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
                 print('\n再见。')
                 return 0
+            except KeyboardInterrupt:
+                _print_graceful_interrupt(None, use_rich=False)
+                continue
             if not line:
                 continue
             if line.lower() in ('exit', 'quit', 'q'):
@@ -410,13 +691,17 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
             _consume_llm_events_plain(
                 engine, runtime, msg, route_limit=route_limit, team=use_team
             )
+            _maybe_print_repl_memory_load_warning(None, engine, use_rich=False)
 
     console = Console()
     print_repl_llm_driver_banner(console=console)
-    console.print('[dim]已启用 --llm；输入 exit / quit 结束；Ctrl+C 可中断当前生成。[/dim]')
     console.print(
-        '[dim]斜杠: [bold]/help[/bold] · /doctor /cost /diff /status · /team 或 [bold]$team[/bold] 前缀 · '
-        '记忆 /summary /flush /sessions /load · /audit /report · /subsystems /graph[/dim]'
+        '[dim]大模型 REPL；exit / quit 退出；Ctrl+C 中断当前生成（保留已输出，REPL 不退出）。[/dim]'
+    )
+    console.print(
+        '[dim]斜杠: [bold]/help[/bold] · [bold]/new[/bold] [bold]/memo[/bold] · /doctor /cost /diff /status · '
+        '/team 或 [bold]$team[/bold] 前缀 · 记忆 /summary /flush /sessions /load · '
+        '/audit /report · /subsystems /graph[/dim]'
     )
 
     pt_session = _build_prompt_session()
@@ -424,7 +709,7 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
     from .repl_slash_commands import dispatch_repl_slash_command
 
     runtime = PortRuntime()
-    engine = QueryEnginePort.from_workspace()
+    engine = _repl_engine_autoresume(console, use_rich=True)
     engine.config = replace(engine.config, llm_enabled=True)
     engine.ui_console = console
 
@@ -465,5 +750,17 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
                 engine, runtime, msg, console, route_limit=route_limit, team=use_team
             )
         except KeyboardInterrupt:
-            console.print('[bold red]⛔ 已手动中断[/bold red]')
+            # 理论上由内层 _run_streaming_turn 已处理；此处兜底防止遗漏路径导致进程退出
+            _print_graceful_interrupt(console, use_rich=True)
             continue
+        except Exception as exc:
+            # Rich / prompt_toolkit 混用时，Python 层渲染异常不应整进程退出（无法拦截原生 SIGSEGV）
+            try:
+                console.print(
+                    f'[bold red]本回合展示层异常（已释放 Live/Status）: '
+                    f'{type(exc).__name__}: {exc}[/bold red]'
+                )
+            except Exception:
+                print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
+            continue
+        _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)

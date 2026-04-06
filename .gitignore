@@ -1,5 +1,7 @@
 # --- 密钥与本地环境（切勿提交）---
+# 发版防线显式项：.env · llm_config.json · .port_sessions/ · __pycache__/ · *.pyc · .DS_Store
 .env
+llm_config.json
 .env.local
 .env.*.local
 # 允许提交脱敏样板
@@ -7,6 +9,7 @@
 
 # --- Python ---
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 *.so

@@ -2,7 +2,9 @@
 """
 一键将 ``scream`` 注册为 Zsh 全局命令（macOS）。
 
-在项目根目录执行::
+**推荐**：跨平台一键安装请优先使用仓库根目录的 ``install.sh``（含 venv、pip、zsh/bash 注册）。
+
+本脚本适合仅需写入 ``~/.zshrc``、且已手动装好依赖的场景。在项目根目录执行::
 
     python3 install_mac.py
 
@@ -82,7 +84,7 @@ scream() {{
         Panel.fit(
             '[bold green]安装成功！[/bold green]\n\n'
             '请在终端中执行 [bold cyan]source ~/.zshrc[/bold cyan] 让配置立刻生效。\n\n'
-            '之后可在任意目录使用 [bold]scream[/bold]，例如：[bold]scream summary[/bold]、[bold]scream repl --llm[/bold]。\n\n'
+            '之后可在任意目录使用 [bold]scream[/bold]，例如：[bold]scream summary[/bold]、[bold]scream repl[/bold]（默认进入大模型对话）。\n\n'
             '[dim]若已创建项目内 venv，将优先使用 [bold]venv/bin/python3[/bold]；否则使用当前 PATH 中的 python3。[/dim]',
             title='Scream Code',
             border_style='green',

@@ -87,11 +87,15 @@ class ChineseArgumentParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = ChineseArgumentParser(description='尖叫 Code：Python 移植工作区命令行（原 Claude Code 重写工程的镜像实现）')
     subparsers = parser.add_subparsers(dest='command', required=True, parser_class=ChineseArgumentParser)
-    repl_parser = subparsers.add_parser('repl', help='显示欢迎 Logo；加 --llm 进入可调用大模型 API 的交互循环')
+    repl_parser = subparsers.add_parser(
+        'repl',
+        help='进入交互式 REPL（默认启用大模型；可用 --no-llm 仅显示 Logo 与说明）',
+    )
     repl_parser.add_argument(
         '--llm',
-        action='store_true',
-        help='启用大模型网络调用（密钥见 llm_config.json 或 .env；可用 config 配置）',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='启用大模型（默认开启；密钥见 llm_config.json 或 .env；--no-llm 仅打印说明后退出）',
     )
     subparsers.add_parser('config', help='交互式管理多模型配置（llm_config.json）')
     subparsers.add_parser('summary', help='以 Markdown 渲染 Python 移植工作区摘要')
@@ -199,9 +203,9 @@ def main(argv: list[str] | None = None) -> int:
     check_and_install_dependencies()
     load_project_dotenv()
     load_project_claw_json()
-    # 无子命令时（仅可执行文件名）直接进入 REPL 聊天；需 --llm 才会启动交互循环
+    # 无子命令时（仅可执行文件名）直接进入带大模型的 REPL（repl 默认 --llm）
     if argv is None and len(sys.argv) == 1:
-        argv = ['repl', '--llm']
+        argv = ['repl']
     parser = build_parser()
     args = parser.parse_args(argv)
     manifest = build_port_manifest()

@@ -42,8 +42,8 @@
 
 | 组件 | 职责 |
 |------|------|
-| **`replLauncher`** | Rich / prompt_toolkit；通过 **`QueryEnginePort.iter_repl_assistant_events_with_runtime`** 取事件流，仅负责渲染与 Ctrl+C 关闭生成器；team 模式下消费 **`team_agent`** 等事件并着色前缀。 |
-| **`repl_slash_commands.py`** | 斜杠指令拦截与 Rich 输出；**透传** 体检、Git、`/status` 等，不重复实现 LLM 闭环。 |
+| **`replLauncher`** | Rich / prompt_toolkit；通过 **`QueryEnginePort.iter_repl_assistant_events_with_runtime`** 取事件流，仅负责渲染与 Ctrl+C 关闭生成器；team 模式下消费 **`team_agent`** 等事件并着色前缀。启动时若 **`.port_sessions/`** 有最近 JSON，则 **`load_session` + `from_saved_session`** 自动续播（仍用既有 `session_store` API）。 |
+| **`repl_slash_commands.py`** | 斜杠指令拦截与 Rich 输出；**透传** 体检、Git、`/status` 等，不重复实现 LLM 闭环。扩展：**`/new`** 在 **`/flush`** 同等清空之上调用展示层 **`clear_all_repl_token_warnings`**；**`/memo`** 用 **`chat_completion_stream(..., tools=None)`** 单次提取要点，经 **`project_memory.append_long_term_memory_block`** 追加 **SCREAM.md / CLAUDE.md**，不改动 `session_store` 格式。 |
 
 **原则**：路由必须来自 **`PortRuntime`**，经 **`QueryEnginePort.iter_repl_assistant_events_with_runtime`** 进入 LLM 链。
 
