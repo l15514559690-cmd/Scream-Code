@@ -1,16 +1,13 @@
 # 尖叫 Code（Scream Code）· 使用教程
 
-面向**第一次用终端 AI 编程助手**的开发者：从装环境到改模型、开 TUI、用斜杠命令，按顺序做即可。
+<img width="1632" height="784" alt="image" src="https://github.com/user-attachments/assets/0a535f13-65a5-4908-a488-e0060c1d35df" />
+<img width="1633" height="782" alt="image" src="https://github.com/user-attachments/assets/806e4849-f7f3-45f2-9efb-73f778f2f476" />
+<img width="1637" height="673" alt="image" src="https://github.com/user-attachments/assets/0697d59d-1f32-4cf1-9c44-568d742a54ce" />
+<img width="1631" height="761" alt="image" src="https://github.com/user-attachments/assets/18dc40b0-a0e6-450b-973d-4021a73d0b05" />
 
 ## 这是什么？
 
 **Scream Code** 是跑在你电脑**终端**里的 **AI 编程助手**：全中文界面，可以像聊天一样下指令，让它帮你读代码、改文件、跑终端命令。支持多家大模型（在配置里填自己的 API 即可）。
-
-<img width="842" height="345" alt="image" src="https://github.com/user-attachments/assets/7172ac85-f837-4609-a7d1-8d45c81daf98" />
-
-**如下图测试-通过对话发送需求：我想制作一个电商前端网页
-
-<img width="1372" height="856" alt="image" src="https://github.com/user-attachments/assets/92c1885d-3d1b-47b6-b59a-3445f87e1f76" />
 
 **适合谁？** 习惯用终端、想有一个「常驻命令行里」的 AI 搭档的开发者。
 
