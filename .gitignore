@@ -6,6 +6,13 @@ llm_config.json
 .env.*.local
 # 允许提交脱敏样板
 !.env.example
+!llm_config.json.example
+
+# --- 证书与杂项密钥文件 ---
+*.pem
+*.p12
+*.pfx
+secrets/
 
 # --- Python ---
 __pycache__/

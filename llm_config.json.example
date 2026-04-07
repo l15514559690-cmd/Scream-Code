@@ -1,6 +1,6 @@
 {
   "allow_global_access": true,
-  "active": "minimax-2-7",
+  "active": "deepseek",
   "models": [
     {
       "id": "deepseek",
@@ -31,33 +31,18 @@
       "api_key_env_name": "OLLAMA_API_KEY"
     },
     {
-      "id": "自定义-openaisas",
-      "alias": "自定义 OpenAIsas",
-      "base_url": "https://api.openai.com/v1",
-      "model_name": "gpt-4o",
-      "api_key_env_name": "API_KEY"
-    },
-    {
-      "id": "minimax-2.7",
-      "alias": "MiniMax · 2.7",
+      "id": "minimax-openai",
+      "alias": "MiniMax (OpenAI 兼容)",
       "base_url": "https://api.minimax.chat/v1",
-      "model_name": "minimax-2.7",
+      "model_name": "abab",
       "api_key_env_name": "MINIMAX_API_KEY"
     },
     {
-      "id": "minimax",
-      "alias": "minimax",
+      "id": "minimax-anthropic",
+      "alias": "MiniMax (Anthropic 兼容)",
       "base_url": "https://api.minimaxi.com/anthropic",
       "model_name": "minimax-2.7",
       "api_key_env_name": "MINIMAX_2_API_KEY",
-      "api_protocol": "anthropic"
-    },
-    {
-      "id": "minimax-2-7",
-      "alias": "minimax-2.7",
-      "base_url": "https://api.minimaxi.com/anthropic",
-      "model_name": "miniman-2.7",
-      "api_key_env_name": "MINIMAX_2_7_API_KEY",
       "api_protocol": "anthropic"
     }
   ]

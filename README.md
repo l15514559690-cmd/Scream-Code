@@ -130,6 +130,14 @@ cargo build -p scream-cli
 
 Rust 与 Python 都会从项目根向上查找 `llm_config.json`，并加载 `.env`（行为细节以代码为准）。
 
+**仓库里不会提交你的真实 `llm_config.json`**（已在 `.gitignore` 中）。首次使用可复制脱敏样板：
+
+```bash
+cp llm_config.json.example llm_config.json
+```
+
+再运行 `python3 -m src.main config` 或按需编辑；**不要把含真实密钥或内网地址的自定义配置推送到 GitHub**。
+
 ### 3.2 创建 `.env`
 
 1. 复制样板文件：
