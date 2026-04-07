@@ -40,8 +40,26 @@ const TEXT: Color = Color::Rgb(170, 210, 245);
 const STATUS_BG: Color = Color::Rgb(0, 140, 190);
 const STATUS_FG: Color = Color::Rgb(8, 12, 20);
 const INPUT_LINE_BG: Color = Color::Rgb(18, 28, 48);
+/// 助手正文：亮青，与用户白字区分且对比足够
+const ASSISTANT_BODY_FG: Color = Color::LightCyan;
+/// 用户正文：干净白字
+const USER_BODY_FG: Color = Color::White;
+/// 系统 / 工具 / 错误 / 后端 正文
+const META_BODY_FG: Color = Color::DarkGray;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// 聊天行语义，用于换行折叠后仍能对正文着色。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatLineRole {
+    Spacer,
+    HeaderUser,
+    HeaderAssistant,
+    HeaderMeta,
+    BodyUser,
+    BodyAssistant,
+    BodyMeta,
+}
 
 fn strip_ansi_for_tui(s: &str) -> String {
     String::from_utf8_lossy(&strip(s.as_bytes())).to_string()
@@ -130,27 +148,38 @@ fn textarea_cursor_absolute(
     Some(Position::new(x, y))
 }
 
-fn flatten_wrapped_chat_lines(lines: &[String], content_width: usize) -> Vec<String> {
+fn flatten_wrapped_chat_lines(
+    lines: &[(ChatLineRole, String)],
+    content_width: usize,
+) -> Vec<(ChatLineRole, String)> {
     if content_width == 0 {
         return lines.to_vec();
     }
     let opts = textwrap_options(content_width);
     let mut out = Vec::new();
-    for line in lines {
+    for (role, line) in lines {
         if line.is_empty() {
-            out.push(String::new());
+            out.push((*role, String::new()));
             continue;
         }
         let wrapped = textwrap::wrap(line, &opts);
         if wrapped.is_empty() {
-            out.push(String::new());
+            out.push((*role, String::new()));
         } else {
             for w in wrapped {
-                out.push(w.into_owned());
+                out.push((*role, w.into_owned()));
             }
         }
     }
     out
+}
+
+fn section_header_body_roles(section_title: &str) -> (ChatLineRole, ChatLineRole) {
+    match section_title {
+        "你" => (ChatLineRole::HeaderUser, ChatLineRole::BodyUser),
+        "助手" => (ChatLineRole::HeaderAssistant, ChatLineRole::BodyAssistant),
+        _ => (ChatLineRole::HeaderMeta, ChatLineRole::BodyMeta),
+    }
 }
 
 fn permission_mode_zh(mode: PermissionMode) -> &'static str {
@@ -164,7 +193,7 @@ fn permission_mode_zh(mode: PermissionMode) -> &'static str {
 }
 
 struct ChatLog {
-    lines: Vec<String>,
+    lines: Vec<(ChatLineRole, String)>,
     assistant_stream_line: Option<usize>,
 }
 
@@ -176,25 +205,30 @@ impl ChatLog {
         }
     }
 
+    fn push_spacer_pair(&mut self) {
+        self.lines.push((ChatLineRole::Spacer, String::new()));
+        self.lines.push((ChatLineRole::Spacer, String::new()));
+    }
+
     fn push_section(&mut self, title: &str, body: &str) {
         let title = strip_ansi_for_tui(title);
         let body = strip_ansi_for_tui(body);
-        self.lines.push(format!("— {title} —"));
+        let (h_role, b_role) = section_header_body_roles(title.trim());
+        self.lines.push((h_role, format!("— {title} —")));
         if body.is_empty() {
-            self.lines.push("∅".to_string());
+            self.lines.push((b_role, "∅".to_string()));
         } else {
             for line in body.lines() {
-                self.lines.push(line.to_string());
+                self.lines.push((b_role, line.to_string()));
             }
         }
-        self.lines.push(String::new());
-        self.lines.push(String::new());
+        self.push_spacer_pair();
     }
 
     fn push_plain(&mut self, line: impl Into<String>) {
-        self.lines.push(strip_ansi_for_tui(&line.into()));
-        self.lines.push(String::new());
-        self.lines.push(String::new());
+        self.lines
+            .push((ChatLineRole::BodyMeta, strip_ansi_for_tui(&line.into())));
+        self.push_spacer_pair();
     }
 
     fn clear_all(&mut self) {
@@ -211,9 +245,12 @@ impl ChatLog {
 
     fn begin_assistant_stream(&mut self) {
         if self.assistant_stream_line.is_none() {
-            self.lines.push("— 助手 —".to_string());
-            self.lines.push(String::new());
-            self.lines.push(String::new());
+            self.lines
+                .push((ChatLineRole::HeaderAssistant, "— 助手 —".to_string()));
+            self.lines.push((ChatLineRole::Spacer, String::new()));
+            // 流式正文落在 BodyAssistant，避免写入 Spacer 导致无颜色
+            self.lines
+                .push((ChatLineRole::BodyAssistant, String::new()));
             self.assistant_stream_line = Some(self.lines.len() - 1);
         }
     }
@@ -225,14 +262,13 @@ impl ChatLog {
         }
         self.begin_assistant_stream();
         if let Some(i) = self.assistant_stream_line {
-            self.lines[i].push_str(&t);
+            self.lines[i].1.push_str(&t);
         }
     }
 
     fn end_assistant_stream_if_any(&mut self) {
         if self.assistant_stream_line.take().is_some() {
-            self.lines.push(String::new());
-            self.lines.push(String::new());
+            self.push_spacer_pair();
         }
     }
 
@@ -279,7 +315,7 @@ impl ChatLog {
                 let out = v.get("output").and_then(Value::as_str).unwrap_or("");
                 let had_stream = self
                     .assistant_stream_line
-                    .and_then(|i| self.lines.get(i).map(|s| !s.trim().is_empty()))
+                    .and_then(|i| self.lines.get(i).map(|(_, s)| !s.trim().is_empty()))
                     .unwrap_or(false);
                 self.end_assistant_stream_if_any();
                 if !had_stream && !out.trim().is_empty() {
@@ -315,6 +351,8 @@ struct TuiSnapshot {
     model: String,
     permission: PermissionMode,
     total_tokens: u64,
+    /// Python `state` / `ready` 中的 `repl_team_mode`（群狼 / 常规）。
+    team_mode: bool,
 }
 
 impl Default for TuiSnapshot {
@@ -323,6 +361,7 @@ impl Default for TuiSnapshot {
             model: String::new(),
             permission: PermissionMode::WorkspaceWrite,
             total_tokens: 0,
+            team_mode: false,
         }
     }
 }
@@ -331,6 +370,9 @@ impl TuiSnapshot {
     fn apply_from_json(&mut self, v: &Value) {
         if let Some(m) = v.get("model").and_then(Value::as_str) {
             self.model = m.to_string();
+        }
+        if let Some(b) = v.get("repl_team_mode").and_then(Value::as_bool) {
+            self.team_mode = b;
         }
         let cin = v
             .get("cumulative_input_tokens")
@@ -447,9 +489,15 @@ fn status_left_line(snap: &TuiSnapshot) -> Line<'static> {
     let branch = resolve_git_branch_for(&cwd)
         .map(|b| format!(" · {b}"))
         .unwrap_or_default();
+    let model_disp = if snap.model.trim().is_empty() {
+        "—".to_string()
+    } else {
+        snap.model.clone()
+    };
     let meta = format!(
-        "  {dir}  ·  模型 {}  ·  {}{}",
-        snap.model,
+        "  ·  Rust TUI  ·  {}  ·  模型 {}  ·  {}{}",
+        dir,
+        model_disp,
         permission_mode_zh(snap.permission),
         branch
     );
@@ -463,36 +511,67 @@ fn status_left_line(snap: &TuiSnapshot) -> Line<'static> {
 }
 
 fn status_right_line(snap: &TuiSnapshot, busy: bool) -> Line<'static> {
-    let text = if busy {
-        "Python 后端响应中…".to_string()
+    let mode_label = if snap.team_mode {
+        "[模式: 群狼]"
     } else {
-        format!("累计 Token：{}", snap.total_tokens)
+        "[模式: 常规]"
     };
-    Line::from(Span::styled(text, Style::default().fg(STATUS_FG)))
+    let rest = if busy {
+        format!("  ·  Python 响应中…  ·  Token {}", snap.total_tokens)
+    } else {
+        format!("  ·  累计 Token：{}", snap.total_tokens)
+    };
+    Line::from(vec![
+        Span::styled(
+            mode_label,
+            Style::default()
+                .fg(if snap.team_mode {
+                    Color::Rgb(255, 220, 140)
+                } else {
+                    Color::Rgb(220, 240, 255)
+                })
+                .bold(),
+        ),
+        Span::styled(rest, Style::default().fg(STATUS_FG)),
+    ])
 }
 
-fn style_chat_row(s: &str) -> Line<'static> {
+fn style_chat_line(role: ChatLineRole, s: &str) -> Line<'static> {
     let t = s.to_string();
-    match t.as_str() {
-        "— 你 —" => Line::from(Span::styled(
+    let base_bg = Style::default().bg(BG);
+    match role {
+        ChatLineRole::Spacer => Line::from(Span::styled(t, base_bg)),
+        ChatLineRole::HeaderUser => Line::from(Span::styled(
             t,
             Style::default()
                 .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(Modifier::BOLD)
+                .bg(BG),
         )),
-        "— 助手 —" => Line::from(Span::styled(
+        ChatLineRole::HeaderAssistant => Line::from(Span::styled(
             t,
             Style::default()
                 .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(Modifier::BOLD)
+                .bg(BG),
         )),
-        "— 工具 —" | "— 错误 —" | "— 系统 —" => Line::from(Span::styled(
+        ChatLineRole::HeaderMeta => Line::from(Span::styled(
             t,
             Style::default()
                 .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+                .add_modifier(Modifier::ITALIC)
+                .bg(BG),
         )),
-        _ => Line::from(Span::styled(t, Style::default().fg(TEXT))),
+        ChatLineRole::BodyUser => {
+            Line::from(Span::styled(t, Style::default().fg(USER_BODY_FG).bg(BG)))
+        }
+        ChatLineRole::BodyAssistant => Line::from(Span::styled(
+            t,
+            Style::default().fg(ASSISTANT_BODY_FG).bg(BG),
+        )),
+        ChatLineRole::BodyMeta => {
+            Line::from(Span::styled(t, Style::default().fg(META_BODY_FG).bg(BG)))
+        }
     }
 }
 
@@ -586,10 +665,7 @@ fn draw_ui(
     let chat_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
-        .title(Span::styled(
-            " 🚀Scream Code🚀 ",
-            Style::default().fg(Color::White).bold(),
-        ));
+        .title(Span::styled(" 对话 ", Style::default().fg(ACCENT).bold()));
 
     let inner = chat_block.inner(chat_area);
     let inner_w = inner.width as usize;
@@ -602,7 +678,10 @@ fn draw_ui(
         let flattened = flatten_wrapped_chat_lines(&chat.lines, inner_w.max(1));
         let start = flattened.len().saturating_sub(visible);
         let slice = &flattened[start..];
-        let styled_lines: Vec<Line> = slice.iter().map(|s| style_chat_row(s.as_str())).collect();
+        let styled_lines: Vec<Line> = slice
+            .iter()
+            .map(|(role, s)| style_chat_line(*role, s.as_str()))
+            .collect();
         let para = Paragraph::new(Text::from(styled_lines))
             .block(chat_block)
             .style(Style::default().bg(BG))
@@ -793,7 +872,12 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
                 Some(SpinnerDrawCtx {
                     tick: ui_tick,
                     waiting_first_token: !stream_opened,
-                    after_tool: chat.lines.iter().rev().take(8).any(|l| l.contains("工具")),
+                    after_tool: chat
+                        .lines
+                        .iter()
+                        .rev()
+                        .take(8)
+                        .any(|(_, l)| l.contains("工具")),
                 })
             } else {
                 None
@@ -909,18 +993,22 @@ mod viewport_tests {
 
 #[cfg(test)]
 mod ansi_tests {
-    use super::{flatten_wrapped_chat_lines, strip_ansi_for_tui};
+    use super::{flatten_wrapped_chat_lines, strip_ansi_for_tui, ChatLineRole};
 
     #[test]
     fn wrap_splits_long_logical_line() {
         let s = "a".repeat(50);
-        let lines = vec![s];
+        let lines = vec![(ChatLineRole::BodyUser, s)];
         let out = flatten_wrapped_chat_lines(&lines, 20);
         assert!(
-            out.iter().all(|row| row.chars().count() <= 20),
+            out.iter().all(|(_, row)| row.chars().count() <= 20),
             "each row should fit width: {out:?}"
         );
         assert!(out.len() >= 2, "expected multiple rows: {out:?}");
+        assert!(
+            out.iter().all(|(r, _)| *r == ChatLineRole::BodyUser),
+            "role preserved per wrapped row"
+        );
     }
 
     #[test]

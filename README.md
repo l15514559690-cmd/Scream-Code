@@ -92,7 +92,7 @@ chmod +x install.sh
 bash install.sh
 ```
 
-脚本会：创建 `.venv`、安装 `requirements.txt`、在你 shell 配置里写入函数 **`scream`**（进入仓库并执行 `python3 -m src.main`）。  
+脚本会：创建 `.venv`、安装 `requirements.txt`、在你 shell 配置里写入函数 **`scream`**（`cd` 到仓库根并激活 venv）。**裸命令 `scream`（无任何参数）** 且本机已安装 `~/.cargo/bin/scream` 时，会直接进入 **Rust 全屏 TUI**；否则走 **`python3 -m src.main`**（例如 `scream config`、`scream repl` 仍用 Python）。  
 装完后执行：
 
 ```bash
@@ -109,7 +109,7 @@ cargo install --path crates/rusty-claude-cli
 ```
 
 - 默认会把名为 **`scream`** 的二进制安装到 `~/.cargo/bin`（请确保该目录在 `PATH` 中）。
-- **注意**：若你已用 `install.sh` 定义了 shell 函数 `scream`，在交互式终端里**函数会优先于** `~/.cargo/bin/scream`，详见 [FAQ：scream 重名](#user-guide-scream-path)。
+- **与 `install.sh` 的配合**：重新运行 **`bash install.sh`** 写入的函数会在 **无参数** 时自动 `exec ~/.cargo/bin/scream`（全屏 TUI）。若你仍是旧版函数，见 [FAQ：裸 scream 不进 TUI](#user-guide-scream-path)。
 
 **本地调试不安装到全局**时：
 
@@ -189,9 +189,27 @@ python3 -m src.main config
 
 ## 4. 启动与基础使用
 
+### 4.0 仓库根「一键启动」脚本
+
+克隆仓库后，在**项目根目录**执行（需已 `chmod +x start.sh`，或 `bash start.sh`）：
+
+```bash
+./start.sh
+```
+
+会按顺序尝试：`~/.cargo/bin/scream` → `rust/target/release|debug/scream` → **`cargo run -p scream-cli`**（自动编译）→ **Python `repl`**。工作区目录会设为仓库根（可用环境变量 `SCREAM_WORKSPACE_ROOT` 覆盖）。
+
+**任意目录打开 TUI**：把下面一行写入 `~/.zshrc`（路径改成你的克隆目录）后 `source ~/.zshrc`，之后终端里执行 **`screamcode-tui`** 或 **`scream-tui`**：
+
+```bash
+source "/path/to/ScreamCode/scripts/screamcode-tui.sh"
+```
+
 ### 4.1 用 `scream` 打开 Rust 全屏 TUI
 
-确保你启动的是 **Cargo 安装的二进制**（见 [FAQ：scream 重名](#user-guide-scream-path)），在项目目录下：
+1. 先按 [2.5](#25-编译并全局安装-rust-tui-客户端) 安装 **`~/.cargo/bin/scream`**。  
+2. 若用 **`install.sh`**：请用**新版**脚本重新安装一次（或见 FAQ 手动改函数），使 **裸命令 `scream`** 能调用到该二进制。  
+3. 在**项目根目录**（或已设置 `SCREAM_WORKSPACE_ROOT`）执行：
 
 ```bash
 scream
@@ -475,11 +493,12 @@ pip install -r requirements.txt
 
 <a id="user-guide-scream-path"></a>
 
-### 尖叫：我输入 `scream`，进的不是 TUI，也不是 Python？
+### 尖叫：我输入 `scream`，进的不是 TUI？
 
-- **`install.sh`** 会定义 **shell 函数** `scream`，通常优先于 PATH 里的可执行文件。  
-- **想用 Rust TUI**：临时用 **`command scream`** 或 **`~/.cargo/bin/scream`**，或从函数里去掉/改名。  
-- **想用 Python**：保持函数，或显式 `python3 -m src.main repl`。
+- **原因**：旧版 **`install.sh`** 里的函数只会跑 **`python3 -m src.main`**，默认是 **Python Rich REPL**，不是 Rust 全屏 TUI。  
+- **办法一（推荐）**：装好 `cargo install --path crates/rusty-claude-cli` 后，在仓库根重新执行 **`bash install.sh`**，再 `source ~/.zshrc`；**无参数的 `scream`** 会自动进 TUI。  
+- **办法二**：直接调用二进制 **`~/.cargo/bin/scream`**（或在项目根 **`cd rust && cargo run -p scream-cli`**）。  
+- **仍要 Python 行内 REPL**：执行 **`scream repl`** 或 **`python3 -m src.main repl`**。
 
 ### TUI 花屏、乱码
 
