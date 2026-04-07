@@ -3,9 +3,11 @@
 <img width="1640" height="408" alt="image" src="https://github.com/user-attachments/assets/e72aa88b-49e5-42ad-a8df-b895d8114333" />
 <img width="1633" height="782" alt="image" src="https://github.com/user-attachments/assets/806e4849-f7f3-45f2-9efb-73f778f2f476" />
 <img width="1637" height="673" alt="image" src="https://github.com/user-attachments/assets/0697d59d-1f32-4cf1-9c44-568d742a54ce" />
-<img width="840" height="454" alt="image" src="https://github.com/user-attachments/assets/684123cc-af80-47f2-b6c4-d16f7760f827" />
+
 
 ## 这是什么？
+
+<img width="840" height="454" alt="image" src="https://github.com/user-attachments/assets/684123cc-af80-47f2-b6c4-d16f7760f827" />
 
 **Scream Code** 是跑在你电脑**终端**里的 **AI 编程助手**：全中文界面，可以像聊天一样下指令，让它帮你读代码、改文件、跑终端命令。支持多家大模型（在配置里填自己的 API 即可）。
 
