@@ -29,6 +29,13 @@ def _chunk(
 
 
 class LlmClientTests(unittest.TestCase):
+    def test_agent_tool_iteration_cap_default_100(self) -> None:
+        env = {k: v for k, v in os.environ.items()}
+        env.pop('SCREAM_MAX_AGENT_TOOL_ROUNDS', None)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(agent_tool_iteration_cap(), 100)
+            self.assertEqual(max_agent_tool_rounds(), 100)
+
     def test_agent_tool_iteration_cap_env(self) -> None:
         with patch.dict(os.environ, {'SCREAM_MAX_AGENT_TOOL_ROUNDS': '99'}, clear=False):
             self.assertEqual(agent_tool_iteration_cap(), 99)

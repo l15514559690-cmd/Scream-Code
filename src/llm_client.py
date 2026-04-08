@@ -25,12 +25,13 @@ def get_openai_agent_tools() -> list[dict[str, Any]]:
     return get_skills_registry().get_all_schemas()
 
 
-# 可选硬上限（防模型异常死循环）；默认不限制，由 ``while True`` 直到模型不再发起 tool_calls
+# 可选硬上限（防模型异常死循环）；默认 100 轮（1.0）；可用环境变量覆盖或关闭
 _AGENT_TOOL_CAP_ENV = 'SCREAM_MAX_AGENT_TOOL_ROUNDS'
 _AGENT_TOOL_CAP_MAX = 10_000_000
+_DEFAULT_AGENT_TOOL_ROUNDS = 100
 
-# 兼容旧文档/外部引用：未设置上限时表示「极大」占位，实际循环见 :func:`agent_tool_iteration_cap`
-MAX_AGENT_TOOL_ROUNDS = 0
+# 兼容旧文档/外部引用：与 :func:`agent_tool_iteration_cap` 默认一致
+MAX_AGENT_TOOL_ROUNDS = _DEFAULT_AGENT_TOOL_ROUNDS
 ANTHROPIC_STREAM_MAX_TOKENS = 16_384
 
 
@@ -38,14 +39,17 @@ def agent_tool_iteration_cap() -> int | None:
     """
     单次用户消息内「模型 ↔ 工具」闭环的最大迭代次数。
 
-    - ``None``：不限制（``while True``，直至 ``finish_reason != tool_calls``）。
-    - 正整数：硬上限；可通过 ``SCREAM_MAX_AGENT_TOOL_ROUNDS`` 设置（最大 10_000_000）。
+    - **默认**：``100``（未设置 ``SCREAM_MAX_AGENT_TOOL_ROUNDS`` 时）。
+    - ``None``：不限制（直至 ``finish_reason != tool_calls``）。
+    - 正整数：硬上限（最大 10_000_000）。
 
-    以下环境变量取值视为**不限制**：空、``0``、``unlimited``、``none``、``inf``、``infinity``（大小写不敏感）。
+    以下环境变量取值视为**不限制**：``0``、``unlimited``、``none``、``inf``、``infinity``（大小写不敏感）。
     """
     raw = (os.environ.get(_AGENT_TOOL_CAP_ENV) or '').strip().lower()
-    if not raw or raw in ('0', 'unlimited', 'none', 'inf', 'infinity'):
+    if raw in ('0', 'unlimited', 'none', 'inf', 'infinity'):
         return None
+    if not raw:
+        return _DEFAULT_AGENT_TOOL_ROUNDS
     try:
         n = int(raw, 10)
     except ValueError:

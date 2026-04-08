@@ -1,5 +1,8 @@
 """
 发往 LLM 前的历史消息内存修剪：滑动窗口 + 长 tool 输出折叠，不修改落盘与会话内完整快照。
+
+与 ``QueryEngineConfig.max_budget_tokens``（默认 3_000_000）配合：日常尽量保留原文与尾部细节，
+仅在中间段对**极长** tool 输出做折叠，避免上下文暴涨；真正触顶由引擎侧 token 预算与 LLM 窗口兜底。
 """
 
 from __future__ import annotations
@@ -8,12 +11,12 @@ import copy
 import json
 from typing import Any
 
-# 仅压缩「中间段」里超过此长度的 tool 内容（字符数按统一文本化后计量）
-_TOOL_FOLD_THRESHOLD_CHARS = 500
+# 仅压缩「中间段」里超过此长度的 tool 内容（字符数按统一文本化后计量；提高阈值以减少误折叠）
+_TOOL_FOLD_THRESHOLD_CHARS = 8_000
 # 折叠后展示的前缀长度
-_TOOL_FOLD_PREVIEW_CHARS = 200
+_TOOL_FOLD_PREVIEW_CHARS = 600
 # 尾部原样保留的消息条数（不含头部 system 段）
-_TAIL_PRESERVE_COUNT = 24
+_TAIL_PRESERVE_COUNT = 64
 
 
 def _content_as_text(content: Any) -> str:
@@ -51,7 +54,7 @@ def prune_historical_messages(messages: list[dict[str, Any]]) -> list[dict[str, 
 
     - 头部：从索引 0 起连续 ``role == 'system'`` 的消息原样保留；
     - 尾部：紧接在头部之后的子数组中，**最后** ``_TAIL_PRESERVE_COUNT`` 条原样保留；
-    - 中间：其余消息里，若 ``role == 'tool'`` 且内容文本化后长度 > 500，则折叠为短前缀说明。
+    - 中间：其余消息里，若 ``role == 'tool'`` 且内容文本化后长度超过阈值，则折叠为短前缀说明。
 
     若中间段为空（总消息过少），则返回深拷贝后的原列表（无折叠）。
     """

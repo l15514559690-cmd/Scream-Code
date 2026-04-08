@@ -31,7 +31,7 @@ use runtime::PermissionMode;
 use serde_json::Value;
 use strip_ansi_escapes::strip;
 use textwrap::WordSeparator;
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::resolve_git_branch_for;
@@ -53,6 +53,9 @@ const META_BODY_FG: Color = Color::DarkGray;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// 鼠标滚轮每次滚动的逻辑行数（折叠后）
 const MOUSE_SCROLL_STEP: usize = 3;
+/// 输入区最少/最多展示的逻辑行数（`tui-textarea` 0.7 无 API 软折行，由 `reflow_textarea_hard_wrap` 按宽度硬换行）
+const MIN_INPUT_INNER_ROWS: usize = 3;
+const MAX_INPUT_INNER_ROWS: usize = 8;
 
 #[inline]
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
@@ -208,6 +211,97 @@ fn textwrap_options(content_width: usize) -> textwrap::Options<'static> {
 
 fn hide_textarea_buffer_caret(textarea: &mut TextArea<'_>) {
     textarea.set_cursor_style(Style::default().add_modifier(Modifier::HIDDEN));
+}
+
+/// 在显示宽度超过 `max_w` 时拆成两行（按字符/宽字符边界，避免穿透边框）。
+fn split_overflow_line(line: &str, max_w: usize) -> Option<(String, String)> {
+    let max_w = max_w.max(1);
+    if UnicodeWidthStr::width(line) <= max_w {
+        return None;
+    }
+    let mut acc = 0usize;
+    let mut last_fit_end = 0usize;
+    for (i, c) in line.char_indices() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if acc + cw > max_w {
+            if i == 0 {
+                let end = i + c.len_utf8();
+                return Some((line[..end].to_string(), line[end..].to_string()));
+            }
+            return Some((
+                line[..last_fit_end].to_string(),
+                line[last_fit_end..].to_string(),
+            ));
+        }
+        acc += cw;
+        last_fit_end = i + c.len_utf8();
+    }
+    None
+}
+
+/// 将过长的逻辑行按输入区宽度硬换行，并尽量保持光标位置。
+/// （`tui-textarea` 0.7 无 `set_soft_wrap`，此处等价于可视软折行。）
+fn reflow_textarea_hard_wrap(textarea: &mut TextArea<'_>, max_cols: usize) {
+    let max_cols = max_cols.max(1);
+    let (mut cur_r, mut cur_c) = textarea.cursor();
+    let mut lines: Vec<String> = textarea.lines().to_vec();
+    let mut any_split = false;
+
+    let mut repeat = true;
+    while repeat {
+        repeat = false;
+        let mut i = 0;
+        while i < lines.len() {
+            if UnicodeWidthStr::width(lines[i].as_str()) <= max_cols {
+                i += 1;
+                continue;
+            }
+            let Some((head, tail)) = split_overflow_line(&lines[i], max_cols) else {
+                i += 1;
+                continue;
+            };
+            any_split = true;
+            let head_chars = head.chars().count();
+            lines[i] = head;
+            lines.insert(i + 1, tail);
+            if cur_r == i {
+                if cur_c > head_chars {
+                    cur_r += 1;
+                    cur_c = cur_c.saturating_sub(head_chars);
+                }
+            } else if cur_r > i {
+                cur_r += 1;
+            }
+            repeat = true;
+        }
+    }
+
+    if any_split {
+        let mut t = TextArea::new(lines);
+        configure_textarea(&mut t);
+        *textarea = t;
+        textarea.move_cursor(CursorMove::Jump(
+            u16::try_from(cur_r).unwrap_or(u16::MAX),
+            u16::try_from(cur_c).unwrap_or(u16::MAX),
+        ));
+    }
+}
+
+fn configure_textarea(textarea: &mut TextArea<'_>) {
+    textarea.set_style(Style::default().fg(TEXT));
+    textarea.set_cursor_line_style(Style::default().bg(INPUT_LINE_BG));
+    textarea.set_cursor_style(Style::default().add_modifier(Modifier::HIDDEN));
+    textarea
+        .set_placeholder_text("尖叫> (Shift+Enter 换行，Enter 发送 · 由 Python QueryEngine 执行)");
+    textarea.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER))
+            .title(Line::from(vec![
+                Span::styled(" 输入 ", Style::default().fg(ACCENT).bold()),
+                Span::styled(" · Enter 发送 ", Style::default().fg(Color::DarkGray)),
+            ])),
+    );
 }
 
 #[inline]
@@ -662,17 +756,13 @@ fn status_left_line(snap: &TuiSnapshot) -> Line<'static> {
     ])
 }
 
-fn status_right_line(snap: &TuiSnapshot, busy: bool) -> Line<'static> {
+fn status_right_line(snap: &TuiSnapshot) -> Line<'static> {
     let mode_label = if snap.team_mode {
         "[模式: 群狼]"
     } else {
         "[模式: 常规]"
     };
-    let rest = if busy {
-        format!("  ·  Python 响应中…  ·  Token {}", snap.total_tokens)
-    } else {
-        format!("  ·  累计 Token：{}", snap.total_tokens)
-    };
+    let tokens = format!("累计 Token {}", snap.total_tokens);
     Line::from(vec![
         Span::styled(
             mode_label,
@@ -684,7 +774,7 @@ fn status_right_line(snap: &TuiSnapshot, busy: bool) -> Line<'static> {
                 })
                 .bold(),
         ),
-        Span::styled(rest, Style::default().fg(STATUS_FG)),
+        Span::styled(format!("  ·  {tokens}"), Style::default().fg(STATUS_FG)),
     ])
 }
 
@@ -703,7 +793,7 @@ fn style_chat_line(role: ChatLineRole, s: &str) -> Line<'static> {
         ChatLineRole::HeaderAssistant => Line::from(Span::styled(
             t,
             Style::default()
-                .fg(Color::Green)
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD)
                 .bg(BG),
         )),
@@ -750,20 +840,7 @@ fn resume(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<(
 
 fn build_textarea() -> TextArea<'static> {
     let mut textarea = TextArea::default();
-    textarea.set_style(Style::default().fg(TEXT));
-    textarea.set_cursor_line_style(Style::default().bg(INPUT_LINE_BG));
-    textarea.set_cursor_style(Style::default().add_modifier(Modifier::HIDDEN));
-    textarea
-        .set_placeholder_text("尖叫> (Shift+Enter 换行，Enter 发送 · 由 Python QueryEngine 执行)");
-    textarea.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(BORDER))
-            .title(Line::from(vec![
-                Span::styled(" 输入 ", Style::default().fg(ACCENT).bold()),
-                Span::styled(" · Enter 发送 ", Style::default().fg(Color::DarkGray)),
-            ])),
-    );
+    configure_textarea(&mut textarea);
     textarea
 }
 
@@ -788,7 +865,6 @@ fn spinner_label(ctx: &SpinnerDrawCtx) -> String {
 fn draw_ui(
     f: &mut Frame<'_>,
     snap: &TuiSnapshot,
-    busy: bool,
     chat: &ChatLog,
     textarea: &TextArea<'_>,
     main: Rect,
@@ -867,7 +943,7 @@ fn draw_ui(
         cols[0],
     );
     f.render_widget(
-        Paragraph::new(status_right_line(snap, busy))
+        Paragraph::new(status_right_line(snap))
             .style(status_base)
             .alignment(Alignment::Right)
             .wrap(Wrap { trim: false }),
@@ -990,7 +1066,8 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut textarea = build_textarea();
     let mut textarea_scroll = TextViewportScroll::default();
-    let input_height = 8u16;
+    // 上一帧输入区高度（供本帧事件命中与布局；首帧最少 3 行内容 + 上下边框）
+    let mut input_height: u16 = MIN_INPUT_INNER_ROWS as u16 + 2;
     let mut busy = false;
     let mut ui_tick: usize = 0;
     const UI_FRAME_MS: u64 = 50;
@@ -1062,11 +1139,6 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
 
             let term_sz = terminal.size()?;
             let term_rect = Rect::new(0, 0, term_sz.width, term_sz.height);
-            let layout_pre =
-                compute_repl_draw_layout(term_rect, input_height, spinner_ctx.is_some());
-            let vmax = usize::from(layout_pre.inner_h.max(1));
-            chat_scroll_up =
-                chat_scroll_up.min(max_chat_scroll_up(&chat, layout_pre.inner_w, vmax));
 
             if had_event {
                 let event = event::read()?;
@@ -1167,12 +1239,25 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            let inner_input_w = term_rect.width.saturating_sub(2).max(1) as usize;
+            reflow_textarea_hard_wrap(&mut textarea, inner_input_w);
+            let input_rows = textarea
+                .lines()
+                .len()
+                .clamp(MIN_INPUT_INNER_ROWS, MAX_INPUT_INNER_ROWS);
+            input_height = input_rows as u16 + 2;
+
+            let layout_pre =
+                compute_repl_draw_layout(term_rect, input_height, spinner_ctx.is_some());
+            let vmax = usize::from(layout_pre.inner_h.max(1));
+            chat_scroll_up =
+                chat_scroll_up.min(max_chat_scroll_up(&chat, layout_pre.inner_w, vmax));
+
             hide_textarea_buffer_caret(&mut textarea);
             terminal.draw(|f| {
                 draw_ui(
                     f,
                     &last_snap,
-                    busy,
                     &chat,
                     &textarea,
                     f.area(),
@@ -1201,7 +1286,21 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod viewport_tests {
-    use super::{display_width_char_range, next_scroll_top};
+    use super::{display_width_char_range, next_scroll_top, split_overflow_line};
+
+    #[test]
+    fn split_overflow_wraps_at_display_width() {
+        let (a, b) = split_overflow_line("abcdefghij", 4).expect("split");
+        assert_eq!(a, "abcd");
+        assert_eq!(b, "efghij");
+    }
+
+    #[test]
+    fn split_overflow_respects_wide_chars() {
+        let (a, b) = split_overflow_line("你你好", 2).expect("split");
+        assert_eq!(a, "你");
+        assert_eq!(b, "你好");
+    }
 
     #[test]
     fn next_scroll_top_keeps_cursor_visible() {
