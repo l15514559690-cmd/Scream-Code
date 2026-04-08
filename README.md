@@ -65,9 +65,11 @@
 ### 2.2 克隆仓库
 
 ```bash
-git clone <你的仓库地址>
-cd ScreamCode    # 以你本地目录名为准
+git clone https://github.com/LIUTod/Scream-Code.git
+cd ScreamCode    # 以你本地目录名为准；若克隆时用了其它目录名则 cd 到该目录
 ```
+
+**Git 远程（日常推送）**：本仓库约定 **`origin`** → `https://github.com/LIUTod/Scream-Code.git`；**`upstream`** → `https://github.com/ultraworkers/claw-code.git`（上游镜像，可选 `git fetch upstream` 后合并）。若你本地仍是旧地址，请执行：`git remote set-url origin https://github.com/LIUTod/Scream-Code.git`，并将 `main` 设为跟踪 `origin/main`（`git branch -u origin/main`）。
 
 ### 2.3 安装 Python 依赖
 
