@@ -2,6 +2,8 @@
 
 终端里的中文 AI 编程助手（多模型、读写代码、跑命令）。
 
+<img width="839" height="453" alt="image" src="https://github.com/user-attachments/assets/c01e6e29-f3aa-46a6-a5f5-fe727cb6f9a2" />
+
 ---
 
 ## 安装
