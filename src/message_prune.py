@@ -13,7 +13,7 @@ _TOOL_FOLD_THRESHOLD_CHARS = 500
 # 折叠后展示的前缀长度
 _TOOL_FOLD_PREVIEW_CHARS = 200
 # 尾部原样保留的消息条数（不含头部 system 段）
-_TAIL_PRESERVE_COUNT = 10
+_TAIL_PRESERVE_COUNT = 24
 
 
 def _content_as_text(content: Any) -> str:

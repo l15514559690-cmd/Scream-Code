@@ -17,9 +17,12 @@ from .transcript import TranscriptStore
 
 @dataclass(frozen=True)
 class QueryEngineConfig:
-    max_turns: int = 8
-    max_budget_tokens: int = 2000
-    compact_after_turns: int = 12
+    #: 用户轮次硬上限（极大放宽；真正超长会话靠 compact / LLM 侧 prune）
+    max_turns: int = 128
+    #: 累计 token 预算（放宽，避免长对话误触顶）
+    max_budget_tokens: int = 2_000_000
+    #: 超过此轮次时裁剪 ``mutable_messages`` / transcript，须小于 ``max_turns`` 以便有缓冲
+    compact_after_turns: int = 96
     structured_output: bool = False
     structured_retry_limit: int = 2
     #: 为 True 时通过 OpenAI SDK 兼容接口请求大模型（须配置 API_KEY）；默认关闭以保持离线测试稳定。
@@ -93,6 +96,40 @@ class QueryEnginePort:
             repl_team_mode=False,
         )
 
+    def _coerce_turn_capacity_before_turn(self) -> None:
+        """
+        在判定轮次上限前，将 ``mutable_messages`` 压到 ``compact_after_turns`` 以内，
+        并收缩过大的 ``llm_conversation_messages``，避免长会话直接 blocked。
+        """
+        cap = self.config.max_turns
+        soft = self.config.compact_after_turns
+        if len(self.mutable_messages) < cap:
+            self._shrink_llm_conversation_if_huge()
+            return
+        keep = soft if soft < cap else max(cap - 1, 1)
+        keep = max(keep, 1)
+        if len(self.mutable_messages) > keep:
+            self.mutable_messages[:] = self.mutable_messages[-keep:]
+        self._shrink_llm_conversation_if_huge()
+
+    def _shrink_llm_conversation_if_huge(self) -> None:
+        """内存侧防止 ``llm_conversation_messages`` 无限增长；发往模型前仍会经 ``prune_historical_messages``。"""
+        msgs = self.llm_conversation_messages
+        max_keep = 240
+        if len(msgs) <= max_keep:
+            return
+        head_end = 0
+        for m in msgs:
+            if (m.get('role') or '').strip().lower() == 'system':
+                head_end += 1
+            else:
+                break
+        if head_end >= len(msgs):
+            return
+        body_keep = max(max_keep - head_end, 1)
+        tail = msgs[-body_keep:]
+        self.llm_conversation_messages = msgs[:head_end] + tail
+
     def submit_message(
         self,
         prompt: str,
@@ -100,6 +137,7 @@ class QueryEnginePort:
         matched_tools: tuple[str, ...] = (),
         denied_tools: tuple[PermissionDenial, ...] = (),
     ) -> TurnResult:
+        self._coerce_turn_capacity_before_turn()
         if len(self.mutable_messages) >= self.config.max_turns:
             output = f'在处理该提示前已达到最大对话轮次上限: {prompt}'
             return TurnResult(
@@ -323,6 +361,7 @@ class QueryEnginePort:
         from .llm_client import get_openai_agent_tools, iter_agent_executor_events
         from .llm_settings import read_llm_connection_settings
 
+        self._coerce_turn_capacity_before_turn()
         if len(self.mutable_messages) >= self.config.max_turns:
             yield {
                 'type': 'blocked',
@@ -441,6 +480,7 @@ class QueryEnginePort:
         from .llm_client import iter_agent_executor_events
         from .llm_settings import read_llm_connection_settings
 
+        self._coerce_turn_capacity_before_turn()
         if len(self.mutable_messages) >= self.config.max_turns:
             yield {
                 'type': 'blocked',
@@ -672,6 +712,7 @@ class QueryEnginePort:
         if len(self.mutable_messages) > self.config.compact_after_turns:
             self.mutable_messages[:] = self.mutable_messages[-self.config.compact_after_turns :]
         self.transcript_store.compact(self.config.compact_after_turns)
+        self._shrink_llm_conversation_if_huge()
 
     def replay_user_messages(self) -> tuple[str, ...]:
         return self.transcript_store.replay()

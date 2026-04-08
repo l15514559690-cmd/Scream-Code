@@ -7,14 +7,17 @@ mod render;
 use std::env;
 use std::io::{self, stdout, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -48,6 +51,138 @@ const USER_BODY_FG: Color = Color::White;
 const META_BODY_FG: Color = Color::DarkGray;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// 鼠标滚轮每次滚动的逻辑行数（折叠后）
+const MOUSE_SCROLL_STEP: usize = 3;
+
+#[inline]
+fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
+}
+
+/// 与 `draw_ui` 中纵向分区一致，便于鼠标命中与滚动计算。
+struct ReplDrawLayout {
+    chat_area: Rect,
+    chat_scrollbar_rect: Rect,
+    inner_w: usize,
+    inner_h: u16,
+    spinner_area: Rect,
+    input_area: Rect,
+    status_area: Rect,
+}
+
+fn compute_repl_draw_layout(main: Rect, input_h: u16, spinner_visible: bool) -> ReplDrawLayout {
+    let spinner_h = u16::from(spinner_visible);
+    let status_h = 1u16;
+    let chat_h = main
+        .height
+        .saturating_sub(spinner_h)
+        .saturating_sub(input_h)
+        .saturating_sub(status_h)
+        .max(1);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(chat_h),
+            Constraint::Length(spinner_h),
+            Constraint::Length(input_h),
+            Constraint::Length(status_h),
+        ])
+        .split(main);
+    let chat_row = chunks[0];
+    let spinner_area = chunks[1];
+    let input_area = chunks[2];
+    let status_area = chunks[3];
+
+    let chat_hs = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(chat_row);
+    let chat_area = chat_hs[0];
+    let chat_scrollbar_rect = chat_hs[1];
+
+    let chat_block = Block::default().borders(Borders::ALL);
+    let inner = chat_block.inner(chat_area);
+    let inner_w = (inner.width as usize).max(1);
+    let inner_h = inner.height.max(1);
+
+    ReplDrawLayout {
+        chat_area,
+        chat_scrollbar_rect,
+        inner_w,
+        inner_h,
+        spinner_area,
+        input_area,
+        status_area,
+    }
+}
+
+/// `scroll_up`：从「贴底」视图再向上滚动的行数（越大约看越早的内容）。
+fn chat_visible_rows(
+    chat: &ChatLog,
+    inner_w: usize,
+    visible: usize,
+    scroll_up: usize,
+) -> Vec<(ChatLineRole, String)> {
+    let flat = flatten_wrapped_chat_lines(&chat.lines, inner_w.max(1));
+    let total = flat.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let vis = visible.min(total);
+    let max_start = total.saturating_sub(vis);
+    let su = scroll_up.min(max_start);
+    let start = max_start.saturating_sub(su);
+    flat[start..start + vis].to_vec()
+}
+
+fn max_chat_scroll_up(chat: &ChatLog, inner_w: usize, visible: usize) -> usize {
+    let total = flatten_wrapped_chat_lines(&chat.lines, inner_w.max(1)).len();
+    total.saturating_sub(visible.min(total.max(1)))
+}
+
+fn render_chat_scrollbar(
+    f: &mut Frame<'_>,
+    area: Rect,
+    scroll_up: usize,
+    total: usize,
+    visible: usize,
+) {
+    if area.width == 0 || area.height == 0 || total == 0 || total <= visible {
+        return;
+    }
+    let max_start = total.saturating_sub(visible);
+    let su = scroll_up.min(max_start);
+    let bar_h = area.height as usize;
+    let thumb_h = (bar_h / 4).max(2).min(bar_h);
+    let travel = bar_h.saturating_sub(thumb_h).max(1);
+    let thumb_start_u = if max_start == 0 {
+        0usize
+    } else {
+        (su * travel) / max_start
+    };
+    let thumb_start_u = thumb_start_u.min(travel);
+    let thumb_end_u = thumb_start_u.saturating_add(thumb_h).min(bar_h);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(bar_h);
+    for r in 0..bar_h {
+        let ch = if r >= thumb_start_u && r < thumb_end_u {
+            "█"
+        } else {
+            "░"
+        };
+        lines.push(Line::from(Span::styled(
+            ch,
+            Style::default().fg(Color::DarkGray).bg(BG),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
+        area,
+    );
+}
 
 /// 聊天行语义，用于换行折叠后仍能对正文着色。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,6 +611,23 @@ fn spawn_python_backend() -> Result<
     Ok((child, rx, stdin))
 }
 
+/// 优雅关闭 Python 后端并在必要时 `kill` + `wait`，避免僵尸/孤儿进程。
+fn shutdown_python_backend(stdin: &mut ChildStdin, child: &mut Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) | Err(_) => {}
+    }
+    let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
+    let _ = stdin.flush();
+    thread::sleep(Duration::from_millis(200));
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) | Err(_) => {}
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn project_label(cwd: &Path) -> String {
     cwd.file_name()
         .and_then(|s| s.to_str())
@@ -577,12 +729,20 @@ fn style_chat_line(role: ChatLineRole, s: &str) -> Line<'static> {
 
 fn suspend(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 
 fn resume(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
     enable_raw_mode()?;
     terminal.clear()?;
     Ok(())
@@ -635,50 +795,37 @@ fn draw_ui(
     input_h: u16,
     spinner_ctx: Option<&SpinnerDrawCtx>,
     textarea_viewport: &mut TextViewportScroll,
+    chat_scroll_up: usize,
 ) {
     let term = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG)), term);
 
-    let spinner_h = u16::from(spinner_ctx.is_some());
-    let status_h = 1u16;
-    let chat_h = main
-        .height
-        .saturating_sub(spinner_h)
-        .saturating_sub(input_h)
-        .saturating_sub(status_h)
-        .max(1);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(chat_h),
-            Constraint::Length(spinner_h),
-            Constraint::Length(input_h),
-            Constraint::Length(status_h),
-        ])
-        .split(main);
-
-    let chat_area = chunks[0];
-    let spinner_area = chunks[1];
-    let input_area = chunks[2];
-    let status_area = chunks[3];
+    let geom = compute_repl_draw_layout(main, input_h, spinner_ctx.is_some());
+    let chat_area = geom.chat_area;
+    let spinner_area = geom.spinner_area;
+    let input_area = geom.input_area;
+    let status_area = geom.status_area;
 
     let chat_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER))
         .title(Span::styled(" 对话 ", Style::default().fg(ACCENT).bold()));
 
-    let inner = chat_block.inner(chat_area);
-    let inner_w = inner.width as usize;
-    let inner_h = inner.height.max(1);
-    let visible = usize::from(inner_h);
+    let visible = usize::from(geom.inner_h);
 
     if chat.lines.is_empty() {
         render::render_idle_splash(f, chat_area, chat_block, BG);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "│",
+                Style::default().fg(Color::DarkGray).bg(BG),
+            )))
+            .style(Style::default().bg(BG)),
+            geom.chat_scrollbar_rect,
+        );
     } else {
-        let flattened = flatten_wrapped_chat_lines(&chat.lines, inner_w.max(1));
-        let start = flattened.len().saturating_sub(visible);
-        let slice = &flattened[start..];
-        let styled_lines: Vec<Line> = slice
+        let rows = chat_visible_rows(chat, geom.inner_w, visible, chat_scroll_up);
+        let styled_lines: Vec<Line> = rows
             .iter()
             .map(|(role, s)| style_chat_line(*role, s.as_str()))
             .collect();
@@ -687,6 +834,8 @@ fn draw_ui(
             .style(Style::default().bg(BG))
             .wrap(Wrap { trim: false });
         f.render_widget(para, chat_area);
+        let total = flatten_wrapped_chat_lines(&chat.lines, geom.inner_w.max(1)).len();
+        render_chat_scrollbar(f, geom.chat_scrollbar_rect, chat_scroll_up, total, visible);
     }
 
     if let Some(ctx) = spinner_ctx {
@@ -807,7 +956,7 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
 
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, Hide)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
@@ -845,27 +994,55 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
     let mut busy = false;
     let mut ui_tick: usize = 0;
     const UI_FRAME_MS: u64 = 50;
+    // 聊天记录从底部向上偏移的折叠行数（鼠标滚轮 / PageUp 更新）。
+    let mut chat_scroll_up: usize = 0;
 
     let run_result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let mut stream_opened = false;
         loop {
+            // 先阻塞等待帧间隔或输入，避免在鼠标移动等高频事件下 draw + poll 形成忙等占满 CPU。
+            let had_event = event::poll(Duration::from_millis(UI_FRAME_MS))?;
+            if !had_event && busy {
+                ui_tick = ui_tick.wrapping_add(1);
+            }
+
             let mut turn_done = false;
-            while let Ok(msg) = rx.try_recv() {
-                let line = match msg {
-                    BackendLine::Stdout(l) => l,
-                    BackendLine::Stderr(l) => {
-                        chat.push_section("Python stderr", &strip_ansi_for_tui(&l));
-                        continue;
+            let mut backend_disconnected = false;
+            const RX_DRAIN_CAP: usize = 4096;
+            for _ in 0..RX_DRAIN_CAP {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        let line = match msg {
+                            BackendLine::Stdout(l) => l,
+                            BackendLine::Stderr(l) => {
+                                chat.push_section("Python stderr", &strip_ansi_for_tui(&l));
+                                continue;
+                            }
+                        };
+                        if process_backend_line(
+                            &line,
+                            &mut chat,
+                            &mut last_snap,
+                            &mut stream_opened,
+                        )? {
+                            turn_done = true;
+                            stream_opened = false;
+                            break;
+                        }
                     }
-                };
-                if process_backend_line(&line, &mut chat, &mut last_snap, &mut stream_opened)? {
-                    turn_done = true;
-                    stream_opened = false;
-                    break;
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        backend_disconnected = true;
+                        break;
+                    }
                 }
             }
             if turn_done {
                 busy = false;
+                chat_scroll_up = 0;
+            }
+            if backend_disconnected {
+                break;
             }
 
             let spinner_ctx = if busy {
@@ -883,6 +1060,113 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
+            let term_sz = terminal.size()?;
+            let term_rect = Rect::new(0, 0, term_sz.width, term_sz.height);
+            let layout_pre =
+                compute_repl_draw_layout(term_rect, input_height, spinner_ctx.is_some());
+            let vmax = usize::from(layout_pre.inner_h.max(1));
+            chat_scroll_up =
+                chat_scroll_up.min(max_chat_scroll_up(&chat, layout_pre.inner_w, vmax));
+
+            if had_event {
+                let event = event::read()?;
+                match event {
+                    Event::Mouse(me) => {
+                        let lay = compute_repl_draw_layout(
+                            term_rect,
+                            input_height,
+                            spinner_ctx.is_some(),
+                        );
+                        if rect_contains(lay.chat_area, me.column, me.row) {
+                            let vis = usize::from(lay.inner_h.max(1));
+                            let mx = max_chat_scroll_up(&chat, lay.inner_w, vis);
+                            match me.kind {
+                                MouseEventKind::ScrollUp => {
+                                    chat_scroll_up = (chat_scroll_up + MOUSE_SCROLL_STEP).min(mx);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    chat_scroll_up =
+                                        chat_scroll_up.saturating_sub(MOUSE_SCROLL_STEP);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Event::Key(key) => {
+                        if key.kind != KeyEventKind::Press {
+                            // ignore Release / Repeat
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c')
+                        {
+                            let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
+                            let _ = stdin.flush();
+                            break;
+                        } else if key.code == KeyCode::Esc {
+                            let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
+                            let _ = stdin.flush();
+                            break;
+                        } else {
+                            let lay_k = compute_repl_draw_layout(
+                                term_rect,
+                                input_height,
+                                spinner_ctx.is_some(),
+                            );
+                            let vis_k = usize::from(lay_k.inner_h.max(1));
+                            let mx_k = max_chat_scroll_up(&chat, lay_k.inner_w, vis_k);
+                            match key.code {
+                                KeyCode::PageUp => {
+                                    chat_scroll_up = (chat_scroll_up + vis_k).min(mx_k);
+                                }
+                                KeyCode::PageDown => {
+                                    chat_scroll_up = chat_scroll_up.saturating_sub(vis_k);
+                                }
+                                _ => {
+                                    let submit = key.code == KeyCode::Enter
+                                        && !key.modifiers.contains(KeyModifiers::SHIFT);
+
+                                    if submit {
+                                        let lines: Vec<String> = textarea.lines().to_vec();
+                                        let raw = lines.join("\n");
+                                        let trimmed = raw.trim();
+                                        if trimmed.is_empty() {
+                                            // no-op
+                                        } else if busy && trimmed == "/stop" {
+                                            writeln!(stdin, r#"{{"op":"stop"}}"#)?;
+                                            stdin.flush()?;
+                                            textarea = build_textarea();
+                                            textarea_scroll = TextViewportScroll::default();
+                                        } else if busy {
+                                            // ignore submit while busy
+                                        } else if trimmed == "/stop" {
+                                            let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
+                                            let _ = stdin.flush();
+                                            break;
+                                        } else if matches!(trimmed, "/exit" | "/quit") {
+                                            let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
+                                            let _ = stdin.flush();
+                                            break;
+                                        } else {
+                                            chat.push_section("你", trimmed);
+                                            chat.push_plain("… 正在思考 …");
+                                            chat_scroll_up = 0;
+                                            let payload = serde_json::json!({ "op": "submit", "text": trimmed });
+                                            writeln!(stdin, "{payload}")?;
+                                            stdin.flush()?;
+                                            busy = true;
+                                            textarea = build_textarea();
+                                            textarea_scroll = TextViewportScroll::default();
+                                        }
+                                    } else {
+                                        textarea.input(key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             hide_textarea_buffer_caret(&mut textarea);
             terminal.draw(|f| {
                 draw_ui(
@@ -895,79 +1179,22 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
                     input_height,
                     spinner_ctx.as_ref(),
                     &mut textarea_scroll,
+                    chat_scroll_up,
                 );
             })?;
-
-            if event::poll(Duration::from_millis(UI_FRAME_MS))? {
-                let event = event::read()?;
-                let Event::Key(key) = event else {
-                    continue;
-                };
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
-                    let _ = stdin.flush();
-                    let _ = child.wait();
-                    break;
-                }
-
-                let submit =
-                    key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT);
-
-                if submit {
-                    let lines: Vec<String> = textarea.lines().to_vec();
-                    let raw = lines.join("\n");
-                    let trimmed = raw.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-
-                    if busy && trimmed == "/stop" {
-                        writeln!(stdin, r#"{{"op":"stop"}}"#)?;
-                        stdin.flush()?;
-                        textarea = build_textarea();
-                        textarea_scroll = TextViewportScroll::default();
-                        continue;
-                    }
-                    if busy {
-                        continue;
-                    }
-
-                    if matches!(trimmed, "/exit" | "/quit") {
-                        writeln!(stdin, r#"{{"op":"shutdown"}}"#)?;
-                        stdin.flush()?;
-                        let _ = child.wait();
-                        break;
-                    }
-
-                    chat.push_section("你", trimmed);
-                    chat.push_plain("… 正在思考 …");
-                    let payload = serde_json::json!({ "op": "submit", "text": trimmed });
-                    writeln!(stdin, "{payload}")?;
-                    stdin.flush()?;
-                    busy = true;
-                    textarea = build_textarea();
-                    textarea_scroll = TextViewportScroll::default();
-                    continue;
-                }
-
-                textarea.input(key);
-            } else if busy {
-                ui_tick = ui_tick.wrapping_add(1);
-            }
         }
         Ok(())
     })();
 
-    let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
-    let _ = stdin.flush();
-    let _ = child.wait();
+    shutdown_python_backend(&mut stdin, &mut child);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    )?;
     terminal.show_cursor()?;
     run_result
 }
