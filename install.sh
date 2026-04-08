@@ -134,6 +134,10 @@ scream() {{
     python3 -m src.main "$@"
   )
 }}
+# 配置大模型（等同于 scream config）
+scream-config() {{
+  scream config "$@"
+}}
 {end}
 """
 
@@ -162,7 +166,7 @@ rc_path.parent.mkdir(parents=True, exist_ok=True)
 rc_path.write_text("".join(out), encoding="utf-8")
 PY
 
-ok "已在配置文件中写入 scream 函数"
+ok "已在配置文件中写入 scream、scream-config 函数"
 
 # ── 大功告成 ─────────────────────────────────────────
 echo ""
