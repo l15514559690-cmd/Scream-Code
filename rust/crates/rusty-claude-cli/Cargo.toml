@@ -13,6 +13,7 @@ path = "src/main.rs"
 api = { path = "../api" }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }
+command-group = "5"
 crossterm = "0.28"
 dotenvy = "0.15"
 pulldown-cmark = "0.13"
@@ -29,6 +30,7 @@ textwrap = { version = "0.16", default-features = false, features = [
     "unicode-linebreak",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
+tokio-util = "0.7"
 unicode-width = "0.2"
 tools = { path = "../tools" }
 

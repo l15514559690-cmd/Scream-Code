@@ -7,10 +7,13 @@ mod render;
 use std::env;
 use std::io::{self, stdout, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, TryRecvError};
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::Duration;
+
+use command_group::CommandGroup;
+use tokio_util::sync::CancellationToken;
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -56,6 +59,8 @@ const MOUSE_SCROLL_STEP: usize = 3;
 /// 输入区最少/最多展示的逻辑行数（`tui-textarea` 0.7 无 API 软折行，由 `reflow_textarea_hard_wrap` 按宽度硬换行）
 const MIN_INPUT_INNER_ROWS: usize = 3;
 const MAX_INPUT_INNER_ROWS: usize = 8;
+/// Python 握手阶段 `rx.recv` 超时，便于响应 `CancellationToken` / 信号退出，避免永久阻塞。
+const HANDSHAKE_POLL: Duration = Duration::from_millis(100);
 
 #[inline]
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
@@ -651,7 +656,7 @@ enum BackendLine {
 
 fn spawn_python_backend() -> Result<
     (
-        std::process::Child,
+        command_group::GroupChild,
         mpsc::Receiver<BackendLine>,
         std::process::ChildStdin,
     ),
@@ -664,17 +669,23 @@ fn spawn_python_backend() -> Result<
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("SCREAM_REPL_JSON_STDIO", "1")
-        .spawn()?;
+        .group_spawn()?;
 
     let stdout = child
+        .inner()
         .stdout
         .take()
         .ok_or("python backend: missing stdout")?;
     let stderr = child
+        .inner()
         .stderr
         .take()
         .ok_or("python backend: missing stderr")?;
-    let stdin = child.stdin.take().ok_or("python backend: missing stdin")?;
+    let stdin = child
+        .inner()
+        .stdin
+        .take()
+        .ok_or("python backend: missing stdin")?;
 
     let (tx, rx) = mpsc::channel::<BackendLine>();
     let tx_out = tx.clone();
@@ -705,8 +716,61 @@ fn spawn_python_backend() -> Result<
     Ok((child, rx, stdin))
 }
 
-/// 优雅关闭 Python 后端并在必要时 `kill` + `wait`，避免僵尸/孤儿进程。
-fn shutdown_python_backend(stdin: &mut ChildStdin, child: &mut Child) {
+/// 在杀掉 Python 进程组之后恢复本机终端（先停输入循环，再杀子进程，最后恢复 —— 见 `run_tui_repl` 收尾顺序）。
+fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    let _ = disable_raw_mode();
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    )?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_shutdown_os_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
+        return;
+    };
+    let Ok(mut sighup) = signal(SignalKind::hangup()) else {
+        return;
+    };
+    let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+        return;
+    };
+    tokio::select! {
+        _ = sigint.recv() => {}
+        _ = sighup.recv() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_shutdown_os_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// 在独立线程里等 OS 信号，用 `CancellationToken` 通知主循环退出（不 `join` 该线程，避免退出死锁）。
+fn spawn_shutdown_signal_listener(cancel: CancellationToken) {
+    thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            wait_shutdown_os_signal().await;
+            cancel.cancel();
+        });
+    });
+}
+
+/// 优雅关闭 Python 进程组并在必要时 `kill` + `wait`，避免僵尸/孤儿进程（Unix 上 `GroupChild::kill` 杀整组）。
+fn shutdown_python_backend(stdin: &mut ChildStdin, child: &mut command_group::GroupChild) {
     match child.try_wait() {
         Ok(Some(_)) => return,
         Ok(None) | Err(_) => {}
@@ -1019,49 +1083,59 @@ fn process_backend_line(
 
 /// Full-screen TUI backed by Python `repl --json-stdio` (``QueryEnginePort`` / ``llm_client``).
 pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown = CancellationToken::new();
+    spawn_shutdown_signal_listener(shutdown.clone());
+
     let (mut child, rx, mut stdin) = spawn_python_backend()?;
 
     let mut last_snap = TuiSnapshot::default();
     let mut pending_stderr: Vec<String> = Vec::new();
     let first_line = loop {
-        match rx.recv().map_err(|_| "python backend 无输出即退出")? {
-            BackendLine::Stdout(s) => break s,
-            BackendLine::Stderr(s) => pending_stderr.push(s),
+        if shutdown.is_cancelled() {
+            shutdown_python_backend(&mut stdin, &mut child);
+            return Ok(());
+        }
+        match rx.recv_timeout(HANDSHAKE_POLL) {
+            Ok(BackendLine::Stdout(s)) => break s,
+            Ok(BackendLine::Stderr(s)) => pending_stderr.push(s),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                shutdown_python_backend(&mut stdin, &mut child);
+                return Err("python backend 无输出即退出".into());
+            }
         }
     };
 
-    enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.hide_cursor()?;
-    terminal.clear()?;
-
-    let mut chat = ChatLog::new();
-    for s in pending_stderr {
-        chat.push_section("Python stderr", &strip_ansi_for_tui(&s));
+    if let Err(e) = enable_raw_mode() {
+        shutdown_python_backend(&mut stdin, &mut child);
+        return Err(e.into());
     }
-    let mut stream_handshake = false;
-    match serde_json::from_str::<Value>(first_line.trim()) {
-        Ok(v) => {
-            if v.get("type").and_then(Value::as_str) == Some("ready") {
-                last_snap.apply_from_json(&v);
-            } else {
-                process_backend_line(
-                    &first_line,
-                    &mut chat,
-                    &mut last_snap,
-                    &mut stream_handshake,
-                )?;
-            }
-        }
+    let mut stdout = stdout();
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide) {
+        let _ = disable_raw_mode();
+        shutdown_python_backend(&mut stdin, &mut child);
+        return Err(e.into());
+    }
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
         Err(e) => {
-            chat.push_section(
-                "首行解析失败",
-                &format!("{e}\n{}", first_line.chars().take(2000).collect::<String>()),
-            );
+            let mut out = io::stdout();
+            let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen, Show);
+            let _ = disable_raw_mode();
+            shutdown_python_backend(&mut stdin, &mut child);
+            return Err(e.into());
         }
+    };
+    if let Err(e) = terminal.hide_cursor() {
+        shutdown_python_backend(&mut stdin, &mut child);
+        let _ = cleanup_terminal(&mut terminal);
+        return Err(e.into());
+    }
+    if let Err(e) = terminal.clear() {
+        shutdown_python_backend(&mut stdin, &mut child);
+        let _ = cleanup_terminal(&mut terminal);
+        return Err(e.into());
     }
 
     let mut textarea = build_textarea();
@@ -1075,8 +1149,39 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
     let mut chat_scroll_up: usize = 0;
 
     let run_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut chat = ChatLog::new();
+        for s in pending_stderr {
+            chat.push_section("Python stderr", &strip_ansi_for_tui(&s));
+        }
+        let mut stream_handshake = false;
+        match serde_json::from_str::<Value>(first_line.trim()) {
+            Ok(v) => {
+                if v.get("type").and_then(Value::as_str) == Some("ready") {
+                    last_snap.apply_from_json(&v);
+                } else {
+                    process_backend_line(
+                        &first_line,
+                        &mut chat,
+                        &mut last_snap,
+                        &mut stream_handshake,
+                    )?;
+                }
+            }
+            Err(e) => {
+                chat.push_section(
+                    "首行解析失败",
+                    &format!("{e}\n{}", first_line.chars().take(2000).collect::<String>()),
+                );
+            }
+        }
+
         let mut stream_opened = false;
         loop {
+            if shutdown.is_cancelled() {
+                let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
+                let _ = stdin.flush();
+                break;
+            }
             // 先阻塞等待帧间隔或输入，避免在鼠标移动等高频事件下 draw + poll 形成忙等占满 CPU。
             let had_event = event::poll(Duration::from_millis(UI_FRAME_MS))?;
             if !had_event && busy {
@@ -1271,16 +1376,9 @@ pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })();
 
+    // 退出顺序：已离开输入循环 → 结束 Python 进程组 → 恢复终端 → 由 `main` 在成功路径 `exit(0)`。
     shutdown_python_backend(&mut stdin, &mut child);
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        Show
-    )?;
-    terminal.show_cursor()?;
+    cleanup_terminal(&mut terminal)?;
     run_result
 }
 

@@ -58,6 +58,35 @@ CLI_CRATE="$ROOT/rust/crates/rusty-claude-cli"
 [[ -d "$CLI_CRATE" ]] || die "未找到 Rust 工程路径：$CLI_CRATE（请在仓库根目录执行本脚本）"
 [[ -f "$ROOT/requirements.txt" ]] || die "未找到 requirements.txt（请在仓库根目录执行本脚本）"
 
+# ── 运行中实例：避免旧 scream 占用二进制或残留 Python 后端 ──
+info "${BOLD}[运行检查]${RESET} 是否已有 scream 进程…"
+if command -v pgrep >/dev/null 2>&1 && pgrep -x scream >/dev/null 2>&1; then
+  warn "检测到已有名为 ${BOLD}scream${RESET} 的进程在运行；继续安装可能使旧进程仍驻留或干扰新版本。"
+  if [[ -t 0 ]]; then
+    read -r -p "是否执行 killall scream 后继续？[Y/n] " _scream_kill_choice || true
+    case "${_scream_kill_choice:-Y}" in
+      [nN]|[nN][oO])
+        warn "已跳过 killall；若安装或启动异常，请先手动结束 scream 再试。"
+        ;;
+      *)
+        if command -v killall >/dev/null 2>&1; then
+          if killall scream 2>/dev/null; then
+            ok "已结束 scream 进程"
+          else
+            warn "killall scream 未成功（权限或进程名不同）；请手动检查后重试。"
+          fi
+        else
+          warn "系统未提供 killall，请手动结束 scream 进程后再安装。"
+        fi
+        ;;
+    esac
+  else
+    warn "非交互环境未自动结束进程；若需干净安装请先执行 ${CYAN}killall scream${RESET} 再运行本脚本。"
+  fi
+else
+  ok "无已运行的 scream 进程"
+fi
+
 # ── Python：虚拟环境与依赖 ───────────────────────────
 info "${BOLD}[Python]${RESET} 创建虚拟环境 .venv …"
 if [[ ! -d "$ROOT/.venv" ]]; then

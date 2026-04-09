@@ -158,6 +158,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if tui {
                 // 全屏 TUI：仅 UI；LLM 与斜杠指令由 Python `QueryEnginePort`（`repl --json-stdio`）执行。
                 tui::run_tui_repl()?;
+                // TUI 已显式杀掉 Python 进程组并恢复终端；直接退出，避免残留异步监视器等拖住进程。
+                std::process::exit(0);
             } else {
                 ensure_any_llm_credentials_configured()?;
                 run_repl(model, allowed_tools, permission_mode)?;
