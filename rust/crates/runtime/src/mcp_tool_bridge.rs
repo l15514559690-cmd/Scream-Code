@@ -1,3 +1,11 @@
+#![allow(
+    clippy::await_holding_lock,
+    clippy::doc_markdown,
+    clippy::match_same_arms,
+    clippy::must_use_candidate,
+    clippy::uninlined_format_args,
+    clippy::unnested_or_patterns
+)]
 //! Bridge between MCP tool surface (ListMcpResources, ReadMcpResource, McpAuth, MCP)
 //! and the existing McpServerManager runtime.
 //!

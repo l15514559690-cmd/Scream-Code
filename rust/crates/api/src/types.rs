@@ -2,7 +2,7 @@ use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
     pub model: String,
     pub max_tokens: u32,
@@ -15,6 +15,22 @@ pub struct MessageRequest {
     pub tool_choice: Option<ToolChoice>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+    /// OpenAI-compatible tuning parameters. Optional — omitted from payload when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    /// Reasoning effort level for OpenAI-compatible reasoning models (e.g. `o4-mini`).
+    /// Accepted values: `"low"`, `"medium"`, `"high"`. Omitted when `None`.
+    /// Silently ignored by backends that do not support it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl MessageRequest {
@@ -113,6 +129,7 @@ pub struct MessageResponse {
     pub stop_reason: Option<String>,
     #[serde(default)]
     pub stop_sequence: Option<String>,
+    #[serde(default)]
     pub usage: Usage,
     #[serde(default)]
     pub request_id: Option<String>,
@@ -147,13 +164,15 @@ pub enum OutputContentBlock {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    #[serde(default)]
     pub input_tokens: u32,
     #[serde(default)]
     pub cache_creation_input_tokens: u32,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    #[serde(default)]
     pub output_tokens: u32,
 }
 
@@ -194,6 +213,7 @@ pub struct MessageStartEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageDeltaEvent {
     pub delta: MessageDelta,
+    #[serde(default)]
     pub usage: Usage,
 }
 

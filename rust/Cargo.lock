@@ -1850,6 +1850,8 @@ name = "tools"
 version = "1.0.1"
 dependencies = [
  "api",
+ "commands",
+ "flate2",
  "plugins",
  "reqwest",
  "runtime",

@@ -1,3 +1,4 @@
+#![allow(clippy::must_use_candidate, clippy::unnecessary_map_or)]
 //! In-memory task registry for sub-agent task lifecycle management.
 
 use std::collections::HashMap;

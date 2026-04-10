@@ -242,6 +242,11 @@ fn env_var_nonempty(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Anthropic 系凭据是否已配置（与 `api` crate 旧版 `anthropic_auth_configured` 对齐）。
+fn anthropic_auth_configured() -> bool {
+    env_var_nonempty("ANTHROPIC_API_KEY") || env_var_nonempty("ANTHROPIC_AUTH_TOKEN")
+}
+
 fn default_model_from_env() -> String {
     if let Ok(m) = env::var("MODEL") {
         let t = m.trim();
@@ -249,7 +254,7 @@ fn default_model_from_env() -> String {
             return api::resolve_model_alias(t);
         }
     }
-    let anthropic_ready = api::anthropic_auth_configured();
+    let anthropic_ready = anthropic_auth_configured();
     let compat_anthropic_stack_keys = env_var_nonempty("DEEPSEEK_API_KEY")
         || env_var_nonempty("DASHSCOPE_API_KEY")
         || env_var_nonempty("MOONSHOT_API_KEY")
@@ -270,7 +275,7 @@ fn default_model_from_env() -> String {
 }
 
 fn has_any_llm_credential() -> bool {
-    api::anthropic_auth_configured()
+    anthropic_auth_configured()
         || llm_config::try_resolve_active_profile().is_some()
         || env_var_nonempty("OPENAI_API_KEY")
         || env_var_nonempty("XAI_API_KEY")
@@ -1642,6 +1647,7 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::History { .. }
         | SlashCommand::Team
         | SlashCommand::Memo { .. }
         | SlashCommand::Stop => Err("unsupported resumed slash command".into()),
@@ -2625,7 +2631,8 @@ impl LiveCli {
             | SlashCommand::Ide { .. }
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
-            | SlashCommand::AddDir { .. } => {
+            | SlashCommand::AddDir { .. }
+            | SlashCommand::History { .. } => {
                 eprintln!("Command registered but not yet implemented.");
                 false
             }
@@ -4211,6 +4218,12 @@ async fn memo_completion_extract_markdown(
         tools: None,
         tool_choice: None,
         stream: true,
+        temperature: None,
+        top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        reasoning_effort: None,
     };
     let mut stream = client.stream_message(&request).await?;
     let mut text = String::new();
@@ -5008,6 +5021,12 @@ impl ApiClient for LlmRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            reasoning_effort: None,
         };
 
         self.runtime.block_on(async {

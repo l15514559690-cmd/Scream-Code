@@ -221,11 +221,6 @@ where
         self
     }
 
-    /// Mutable access to the API client (e.g. to attach a TUI streaming sink between turns).
-    pub fn api_client_mut(&mut self) -> &mut C {
-        &mut self.api_client
-    }
-
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
         if let Some(reporter) = self.hook_progress_reporter.as_mut() {
             self.hook_runner.run_pre_tool_use_with_context(
@@ -507,6 +502,14 @@ where
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    pub fn api_client_mut(&mut self) -> &mut C {
+        &mut self.api_client
+    }
+
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
     }
 
     #[must_use]
@@ -895,6 +898,7 @@ mod tests {
                 current_date: "2026-03-31".to_string(),
                 git_status: None,
                 git_diff: None,
+                git_context: None,
                 instruction_files: Vec::new(),
             })
             .with_os("linux", "6.8")

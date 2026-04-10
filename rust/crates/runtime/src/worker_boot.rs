@@ -1,3 +1,10 @@
+#![allow(
+    clippy::struct_excessive_bools,
+    clippy::too_many_lines,
+    clippy::question_mark,
+    clippy::redundant_closure,
+    clippy::map_unwrap_or
+)]
 //! In-memory worker-boot state machine and control registry.
 //!
 //! This provides a foundational control plane for reliable worker startup:
@@ -553,6 +560,7 @@ fn push_event(
     let timestamp = now_secs();
     let seq = worker.events.len() as u64 + 1;
     worker.updated_at = timestamp;
+    worker.status = status;
     worker.events.push(WorkerEvent {
         seq,
         kind,
@@ -561,6 +569,50 @@ fn push_event(
         payload,
         timestamp,
     });
+    emit_state_file(worker);
+}
+
+/// Write current worker state to `.claw/worker-state.json` under the worker's cwd.
+/// This is the file-based observability surface: external observers (clawhip, orchestrators)
+/// poll this file instead of requiring an HTTP route on the opencode binary.
+fn emit_state_file(worker: &Worker) {
+    let state_dir = std::path::Path::new(&worker.cwd).join(".claw");
+    if let Err(_) = std::fs::create_dir_all(&state_dir) {
+        return;
+    }
+    let state_path = state_dir.join("worker-state.json");
+    let tmp_path = state_dir.join("worker-state.json.tmp");
+
+    #[derive(serde::Serialize)]
+    struct StateSnapshot<'a> {
+        worker_id: &'a str,
+        status: WorkerStatus,
+        is_ready: bool,
+        trust_gate_cleared: bool,
+        prompt_in_flight: bool,
+        last_event: Option<&'a WorkerEvent>,
+        updated_at: u64,
+        /// Seconds since last state transition. Clawhip uses this to detect
+        /// stalled workers without computing epoch deltas.
+        seconds_since_update: u64,
+    }
+
+    let now = now_secs();
+    let snapshot = StateSnapshot {
+        worker_id: &worker.worker_id,
+        status: worker.status,
+        is_ready: worker.status == WorkerStatus::ReadyForPrompt,
+        trust_gate_cleared: worker.trust_gate_cleared,
+        prompt_in_flight: worker.prompt_in_flight,
+        last_event: worker.events.last(),
+        updated_at: worker.updated_at,
+        seconds_since_update: now.saturating_sub(worker.updated_at),
+    };
+
+    if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+        let _ = std::fs::write(&tmp_path, json);
+        let _ = std::fs::rename(&tmp_path, &state_path);
+    }
 }
 
 fn path_matches_allowlist(cwd: &str, trusted_root: &str) -> bool {
@@ -1049,6 +1101,58 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == WorkerEventKind::Failed));
+    }
+
+    #[test]
+    fn emit_state_file_writes_worker_status_on_transition() {
+        let cwd_path = std::env::temp_dir().join(format!(
+            "claw-state-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cwd_path).expect("test dir should create");
+        let cwd = cwd_path.to_str().expect("test path should be utf8");
+        let registry = WorkerRegistry::new();
+        let worker = registry.create(cwd, &[], true);
+
+        // After create the worker is Spawning — state file should exist
+        let state_path = cwd_path.join(".claw").join("worker-state.json");
+        assert!(
+            state_path.exists(),
+            "state file should exist after worker creation"
+        );
+
+        let raw = std::fs::read_to_string(&state_path).expect("state file should be readable");
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).expect("state file should be valid JSON");
+        assert_eq!(
+            value["status"].as_str(),
+            Some("spawning"),
+            "initial status should be spawning"
+        );
+        assert_eq!(value["is_ready"].as_bool(), Some(false));
+
+        // Transition to ReadyForPrompt by observing trust-cleared text
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("observe ready should succeed");
+
+        let raw = std::fs::read_to_string(&state_path)
+            .expect("state file should be readable after observe");
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).expect("state file should be valid JSON after observe");
+        assert_eq!(
+            value["status"].as_str(),
+            Some("ready_for_prompt"),
+            "status should be ready_for_prompt after observe"
+        );
+        assert_eq!(
+            value["is_ready"].as_bool(),
+            Some(true),
+            "is_ready should be true when ReadyForPrompt"
+        );
     }
 
     #[test]

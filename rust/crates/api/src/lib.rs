@@ -1,5 +1,6 @@
 mod client;
 mod error;
+mod http_client;
 mod prompt_cache;
 mod providers;
 mod sse;
@@ -10,6 +11,9 @@ pub use client::{
     resolve_startup_auth_source, MessageStream, OAuthTokenSet, ProviderClient,
 };
 pub use error::ApiError;
+pub use http_client::{
+    build_http_client, build_http_client_or_default, build_http_client_with, ProxyConfig,
+};
 pub use prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
     PromptCacheStats,
@@ -17,7 +21,8 @@ pub use prompt_cache::{
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
 pub use providers::{
-    detect_provider_kind, max_tokens_for_model, resolve_model_alias, ProviderKind,
+    detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
+    resolve_model_alias, ProviderKind,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{
@@ -32,10 +37,3 @@ pub use telemetry::{
     MemoryTelemetrySink, SessionTraceRecord, SessionTracer, TelemetryEvent, TelemetrySink,
     DEFAULT_ANTHROPIC_VERSION,
 };
-
-/// True when `ANTHROPIC_*` env or saved OAuth can satisfy Anthropic-shaped requests.
-#[inline]
-#[must_use]
-pub fn anthropic_auth_configured() -> bool {
-    crate::providers::anthropic::has_auth_from_env_or_saved().unwrap_or(false)
-}

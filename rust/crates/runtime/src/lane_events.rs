@@ -1,3 +1,4 @@
+#![allow(clippy::similar_names)]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -77,6 +78,20 @@ pub struct LaneEventBlocker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneCommitProvenance {
+    pub commit: String,
+    pub branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(rename = "canonicalCommit", skip_serializing_if = "Option::is_none")]
+    pub canonical_commit: Option<String>,
+    #[serde(rename = "supersededBy", skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneEvent {
     pub event: LaneEventName,
     pub status: LaneEventStatus,
@@ -123,6 +138,36 @@ impl LaneEvent {
     }
 
     #[must_use]
+    pub fn commit_created(
+        emitted_at: impl Into<String>,
+        detail: Option<String>,
+        provenance: LaneCommitProvenance,
+    ) -> Self {
+        Self::new(
+            LaneEventName::CommitCreated,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_optional_detail(detail)
+        .with_data(serde_json::to_value(provenance).expect("commit provenance should serialize"))
+    }
+
+    #[must_use]
+    pub fn superseded(
+        emitted_at: impl Into<String>,
+        detail: Option<String>,
+        provenance: LaneCommitProvenance,
+    ) -> Self {
+        Self::new(
+            LaneEventName::Superseded,
+            LaneEventStatus::Superseded,
+            emitted_at,
+        )
+        .with_optional_detail(detail)
+        .with_data(serde_json::to_value(provenance).expect("commit provenance should serialize"))
+    }
+
+    #[must_use]
     pub fn blocked(emitted_at: impl Into<String>, blocker: &LaneEventBlocker) -> Self {
         Self::new(LaneEventName::Blocked, LaneEventStatus::Blocked, emitted_at)
             .with_failure_class(blocker.failure_class)
@@ -161,11 +206,54 @@ impl LaneEvent {
     }
 }
 
+#[must_use]
+pub fn dedupe_superseded_commit_events(events: &[LaneEvent]) -> Vec<LaneEvent> {
+    let mut keep = vec![true; events.len()];
+    let mut latest_by_key = std::collections::BTreeMap::<String, usize>::new();
+
+    for (index, event) in events.iter().enumerate() {
+        if event.event != LaneEventName::CommitCreated {
+            continue;
+        }
+        let Some(data) = event.data.as_ref() else {
+            continue;
+        };
+        let key = data
+            .get("canonicalCommit")
+            .or_else(|| data.get("commit"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let superseded = data
+            .get("supersededBy")
+            .and_then(serde_json::Value::as_str)
+            .is_some();
+        if superseded {
+            keep[index] = false;
+            continue;
+        }
+        if let Some(key) = key {
+            if let Some(previous) = latest_by_key.insert(key, index) {
+                keep[previous] = false;
+            }
+        }
+    }
+
+    events
+        .iter()
+        .cloned()
+        .zip(keep)
+        .filter_map(|(event, retain)| retain.then_some(event))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass};
+    use super::{
+        dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+        LaneEventName, LaneEventStatus, LaneFailureClass,
+    };
 
     #[test]
     fn canonical_lane_event_names_serialize_to_expected_wire_values() {
@@ -239,5 +327,57 @@ mod tests {
         assert_eq!(failed.event, LaneEventName::Failed);
         assert_eq!(failed.status, LaneEventStatus::Failed);
         assert_eq!(failed.detail.as_deref(), Some("broken server"));
+    }
+
+    #[test]
+    fn commit_events_can_carry_worktree_and_supersession_metadata() {
+        let event = LaneEvent::commit_created(
+            "2026-04-04T00:00:00Z",
+            Some("commit created".to_string()),
+            LaneCommitProvenance {
+                commit: "abc123".to_string(),
+                branch: "feature/provenance".to_string(),
+                worktree: Some("wt-a".to_string()),
+                canonical_commit: Some("abc123".to_string()),
+                superseded_by: None,
+                lineage: vec!["abc123".to_string()],
+            },
+        );
+        let event_json = serde_json::to_value(&event).expect("lane event should serialize");
+        assert_eq!(event_json["event"], "lane.commit.created");
+        assert_eq!(event_json["data"]["branch"], "feature/provenance");
+        assert_eq!(event_json["data"]["worktree"], "wt-a");
+    }
+
+    #[test]
+    fn dedupes_superseded_commit_events_by_canonical_commit() {
+        let retained = dedupe_superseded_commit_events(&[
+            LaneEvent::commit_created(
+                "2026-04-04T00:00:00Z",
+                Some("old".to_string()),
+                LaneCommitProvenance {
+                    commit: "old123".to_string(),
+                    branch: "feature/provenance".to_string(),
+                    worktree: Some("wt-a".to_string()),
+                    canonical_commit: Some("canon123".to_string()),
+                    superseded_by: Some("new123".to_string()),
+                    lineage: vec!["old123".to_string(), "new123".to_string()],
+                },
+            ),
+            LaneEvent::commit_created(
+                "2026-04-04T00:00:01Z",
+                Some("new".to_string()),
+                LaneCommitProvenance {
+                    commit: "new123".to_string(),
+                    branch: "feature/provenance".to_string(),
+                    worktree: Some("wt-b".to_string()),
+                    canonical_commit: Some("canon123".to_string()),
+                    superseded_by: None,
+                    lineage: vec!["old123".to_string(), "new123".to_string()],
+                },
+            ),
+        ]);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].detail.as_deref(), Some("new"));
     }
 }

@@ -1,3 +1,4 @@
+#![allow(clippy::must_use_candidate)]
 //! In-memory registries for Team and Cron lifecycle management.
 //!
 //! Provides TeamCreate/Delete and CronCreate/Delete/List runtime backing

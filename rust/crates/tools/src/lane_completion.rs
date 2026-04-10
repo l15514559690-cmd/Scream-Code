@@ -19,6 +19,7 @@ use crate::AgentOutput;
 ///
 /// Returns `Some(LaneContext)` with `completed = true` if all conditions met,
 /// `None` if lane should remain active.
+#[allow(dead_code)]
 pub(crate) fn detect_lane_completion(
     output: &AgentOutput,
     test_green: bool,
@@ -65,6 +66,7 @@ pub(crate) fn detect_lane_completion(
 }
 
 /// Evaluates policy actions for a completed lane.
+#[allow(dead_code)]
 pub(crate) fn evaluate_completed_lane(context: &LaneContext) -> Vec<PolicyAction> {
     let engine = PolicyEngine::new(vec![
         PolicyRule::new(
@@ -106,6 +108,7 @@ mod tests {
             started_at: Some("2024-01-01T00:00:00Z".to_string()),
             completed_at: Some("2024-01-01T00:00:00Z".to_string()),
             lane_events: vec![],
+            derived_state: "working".to_string(),
             current_blocker: None,
             error: None,
         }

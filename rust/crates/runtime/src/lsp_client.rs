@@ -1,3 +1,4 @@
+#![allow(clippy::should_implement_trait, clippy::must_use_candidate)]
 //! LSP (Language Server Protocol) client registry for tool dispatch.
 
 use std::collections::HashMap;

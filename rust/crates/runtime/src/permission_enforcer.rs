@@ -1,3 +1,8 @@
+#![allow(
+    clippy::match_wildcard_for_single_variants,
+    clippy::must_use_candidate,
+    clippy::uninlined_format_args
+)]
 //! Permission enforcement layer that gates tool execution based on the
 //! active `PermissionPolicy`.
 

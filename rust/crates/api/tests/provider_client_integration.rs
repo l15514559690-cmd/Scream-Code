@@ -17,15 +17,16 @@ fn provider_client_routes_grok_aliases_through_xai() {
 fn provider_client_reports_missing_xai_credentials_for_grok_models() {
     let _lock = env_lock();
     let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", None);
-    let _api_key = EnvVarGuard::set("API_KEY", None);
 
     let error = ProviderClient::from_model("grok-3")
         .expect_err("grok requests without XAI_API_KEY should fail fast");
 
     match error {
-        ApiError::MissingCredentials { provider, env_vars } => {
+        ApiError::MissingCredentials {
+            provider, env_vars, ..
+        } => {
             assert_eq!(provider, "xAI");
-            assert_eq!(env_vars, &["XAI_API_KEY", "API_KEY"]);
+            assert_eq!(env_vars, &["XAI_API_KEY"]);
         }
         other => panic!("expected missing xAI credentials, got {other:?}"),
     }

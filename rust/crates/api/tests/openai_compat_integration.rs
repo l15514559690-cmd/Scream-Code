@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 
 use api::{
-    ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
-    InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest, OpenAiCompatClient,
-    OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent, ToolChoice,
-    ToolDefinition,
+    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
+    ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
+    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent,
+    ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -61,6 +61,43 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
     assert_eq!(body["model"], json!("grok-3"));
     assert_eq!(body["messages"][0]["role"], json!("system"));
     assert_eq!(body["tools"][0]["type"], json!("function"));
+}
+
+#[tokio::test]
+async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", "{}")],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+        .with_base_url(server.base_url());
+    let error = client
+        .send_message(&MessageRequest {
+            model: "grok-3".to_string(),
+            max_tokens: 64_000,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "x".repeat(300_000),
+                }],
+            }],
+            system: Some("Keep the answer short.".to_string()),
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            ..Default::default()
+        })
+        .await
+        .expect_err("oversized request should fail local context-window preflight");
+
+    assert!(matches!(error, ApiError::ContextWindowExceeded { .. }));
+    assert!(
+        state.lock().await.is_empty(),
+        "preflight failure should avoid any upstream HTTP request"
+    );
 }
 
 #[tokio::test]
@@ -460,6 +497,7 @@ fn sample_request(stream: bool) -> MessageRequest {
         }]),
         tool_choice: Some(ToolChoice::Auto),
         stream,
+        ..Default::default()
     }
 }
 

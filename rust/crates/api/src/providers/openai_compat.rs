@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
+use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -12,15 +14,16 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{Provider, ProviderFuture};
+use super::{preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
-const DEFAULT_MAX_RETRIES: u32 = 2;
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
+const DEFAULT_MAX_RETRIES: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -32,6 +35,7 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -53,11 +57,27 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
         }
     }
+
+    /// Alibaba DashScope compatible-mode endpoint (Qwen family models).
+    /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
+    /// Requested via Discord #clawcode-get-help: native Alibaba API for
+    /// higher rate limits than going through OpenRouter.
+    #[must_use]
+    pub const fn dashscope() -> Self {
+        Self {
+            provider_name: "DashScope",
+            api_key_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "DashScope" => DASHSCOPE_ENV_VARS,
             _ => &[],
         }
     }
@@ -78,10 +98,15 @@ impl OpenAiCompatClient {
     const fn config(&self) -> OpenAiCompatConfig {
         self.config
     }
+
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client_or_default(),
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
@@ -99,23 +124,6 @@ impl OpenAiCompatClient {
             ));
         };
         Ok(Self::new(api_key, config))
-    }
-
-    /// Same as [`Self::from_env`] but also accepts generic `API_KEY` and `BASE_URL` (Python / `.env` style).
-    pub fn from_env_with_dotenv_aliases(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let api_key = read_env_non_empty(config.api_key_env)?
-            .or(read_env_non_empty("API_KEY")?)
-            .ok_or_else(|| match config.provider_name {
-                "xAI" => ApiError::missing_credentials("xAI", &["XAI_API_KEY", "API_KEY"]),
-                _ => ApiError::missing_credentials(
-                    "OpenAI-compatible",
-                    &["OPENAI_API_KEY", "API_KEY"],
-                ),
-            })?;
-        let base_url = std::env::var(config.base_url_env)
-            .or_else(|_| std::env::var("BASE_URL"))
-            .unwrap_or_else(|_| config.default_base_url.to_string());
-        Ok(Self::new(api_key, config).with_base_url(base_url))
     }
 
     #[must_use]
@@ -145,9 +153,42 @@ impl OpenAiCompatClient {
             stream: false,
             ..request.clone()
         };
+        preflight_message_request(&request)?;
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
-        let payload = response.json::<ChatCompletionResponse>().await?;
+        let body = response.text().await.map_err(ApiError::from)?;
+        // Some backends return {"error":{"message":"...","type":"...","code":...}}
+        // instead of a valid completion object. Check for this before attempting
+        // full deserialization so the user sees the actual error, not a cryptic
+        // "missing field 'id'" parse failure.
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(err_obj) = raw.get("error") {
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("provider returned an error")
+                    .to_string();
+                let code = err_obj
+                    .get("code")
+                    .and_then(|c| c.as_u64())
+                    .map(|c| c as u16);
+                return Err(ApiError::Api {
+                    status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                        .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                    error_type: err_obj
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned),
+                    message: Some(msg),
+                    request_id,
+                    body,
+                    retryable: false,
+                });
+            }
+        }
+        let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
+            ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
+        })?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
@@ -159,13 +200,14 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        preflight_message_request(request)?;
         let response = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::new(),
+            parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),
@@ -194,7 +236,7 @@ impl OpenAiCompatClient {
                 break retryable_error;
             }
 
-            tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
         };
 
         Err(ApiError::RetriesExhausted {
@@ -230,6 +272,52 @@ impl OpenAiCompatClient {
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
     }
+
+    fn jittered_backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
+        let base = self.backoff_for_attempt(attempt)?;
+        Ok(base + jitter_for_base(base))
+    }
+}
+
+/// Process-wide counter that guarantees distinct jitter samples even when
+/// the system clock resolution is coarser than consecutive retry sleeps.
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a random additive jitter in `[0, base]` to decorrelate retries
+/// Deserialize a JSON field as a `Vec<T>`, treating an explicit `null` value
+/// the same as a missing field (i.e. as an empty vector).
+/// Some OpenAI-compatible providers emit `"tool_calls": null` instead of
+/// omitting the field or using `[]`, which serde's `#[serde(default)]` alone
+/// does not tolerate — `default` only handles absent keys, not null values.
+fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// from multiple concurrent clients. Entropy is drawn from the nanosecond
+/// wall clock mixed with a monotonic counter and run through a splitmix64
+/// finalizer; adequate for retry jitter (no cryptographic requirement).
+fn jitter_for_base(base: Duration) -> Duration {
+    let base_nanos = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+    if base_nanos == 0 {
+        return Duration::ZERO;
+    }
+    let raw_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut mixed = raw_nanos
+        .wrapping_add(tick)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    let jitter_nanos = mixed % base_nanos.saturating_add(1);
+    Duration::from_nanos(jitter_nanos)
 }
 
 impl Provider for OpenAiCompatClient {
@@ -297,11 +385,17 @@ impl MessageStream {
 #[derive(Debug, Default)]
 struct OpenAiSseParser {
     buffer: Vec<u8>,
+    provider: String,
+    model: String,
 }
 
 impl OpenAiSseParser {
-    fn new() -> Self {
-        Self::default()
+    fn with_context(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            provider: provider.into(),
+            model: model.into(),
+        }
     }
 
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ChatCompletionChunk>, ApiError> {
@@ -309,7 +403,7 @@ impl OpenAiSseParser {
         let mut events = Vec::new();
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
-            if let Some(event) = parse_sse_frame(&frame)? {
+            if let Some(event) = parse_sse_frame(&frame, &self.provider, &self.model)? {
                 events.push(event);
             }
         }
@@ -557,8 +651,6 @@ impl ToolCallState {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     id: String,
-    /// Some OpenAI-compatible gateways omit `model` on completion payloads; fall back to the request model.
-    #[serde(default)]
     model: String,
     choices: Vec<ChatChoice>,
     #[serde(default)]
@@ -623,7 +715,7 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
 }
 
@@ -657,6 +749,43 @@ struct ErrorBody {
     message: Option<String>,
 }
 
+/// Returns true for models known to reject tuning parameters like temperature,
+/// top_p, frequency_penalty, and presence_penalty. These are typically
+/// reasoning/chain-of-thought models with fixed sampling.
+fn is_reasoning_model(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    // Strip any provider/ prefix for the check (e.g. qwen/qwen-qwq -> qwen-qwq)
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    // OpenAI reasoning models
+    canonical.starts_with("o1")
+        || canonical.starts_with("o3")
+        || canonical.starts_with("o4")
+        // xAI reasoning: grok-3-mini always uses reasoning mode
+        || canonical == "grok-3-mini"
+        // Alibaba DashScope reasoning variants (QwQ + Qwen3-Thinking family)
+        || canonical.starts_with("qwen-qwq")
+        || canonical.starts_with("qwq")
+        || canonical.contains("thinking")
+}
+
+/// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
+/// The prefix is used only to select transport; the backend expects the
+/// bare model id.
+fn strip_routing_prefix(model: &str) -> &str {
+    if let Some(pos) = model.find('/') {
+        let prefix = &model[..pos];
+        // Only strip if the prefix before "/" is a known routing prefix,
+        // not if "/" appears in the middle of the model name for other reasons.
+        if matches!(prefix, "openai" | "xai" | "grok" | "qwen") {
+            &model[pos + 1..]
+        } else {
+            model
+        }
+    } else {
+        model
+    }
+}
+
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
@@ -668,10 +797,30 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     for message in &request.messages {
         messages.extend(translate_message(message));
     }
+    // Sanitize: drop any `role:"tool"` message that does not have a valid
+    // paired `role:"assistant"` with a `tool_calls` entry carrying the same
+    // `id` immediately before it (directly or as part of a run of tool
+    // results). OpenAI-compatible backends return 400 for orphaned tool
+    // messages regardless of how they were produced (compaction, session
+    // editing, resume, etc.). We drop rather than error so the request can
+    // still proceed with the remaining history intact.
+    messages = sanitize_tool_message_pairing(messages);
+
+    // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
+    let wire_model = strip_routing_prefix(&request.model);
+
+    // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
+    // We send the correct field based on the wire model name so gpt-5.x requests
+    // don't fail with "unknown field max_tokens".
+    let max_tokens_key = if wire_model.starts_with("gpt-5") {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
 
     let mut payload = json!({
-        "model": request.model,
-        "max_tokens": request.max_tokens,
+        "model": wire_model,
+        max_tokens_key: request.max_tokens,
         "messages": messages,
         "stream": request.stream,
     });
@@ -686,6 +835,34 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
     if let Some(tool_choice) = &request.tool_choice {
         payload["tool_choice"] = openai_tool_choice(tool_choice);
+    }
+
+    // OpenAI-compatible tuning parameters — only included when explicitly set.
+    // Reasoning models (o1/o3/o4/grok-3-mini) reject these params with 400;
+    // silently strip them to avoid cryptic provider errors.
+    if !is_reasoning_model(&request.model) {
+        if let Some(temperature) = request.temperature {
+            payload["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            payload["top_p"] = json!(top_p);
+        }
+        if let Some(frequency_penalty) = request.frequency_penalty {
+            payload["frequency_penalty"] = json!(frequency_penalty);
+        }
+        if let Some(presence_penalty) = request.presence_penalty {
+            payload["presence_penalty"] = json!(presence_penalty);
+        }
+    }
+    // stop is generally safe for all providers
+    if let Some(stop) = &request.stop {
+        if !stop.is_empty() {
+            payload["stop"] = json!(stop);
+        }
+    }
+    // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.)
+    if let Some(effort) = &request.reasoning_effort {
+        payload["reasoning_effort"] = json!(effort);
     }
 
     payload
@@ -713,11 +890,16 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             if text.is_empty() && tool_calls.is_empty() {
                 Vec::new()
             } else {
-                vec![json!({
+                let mut msg = serde_json::json!({
                     "role": "assistant",
                     "content": (!text.is_empty()).then_some(text),
-                    "tool_calls": tool_calls,
-                })]
+                });
+                // Only include tool_calls when non-empty: some providers reject
+                // assistant messages with an explicit empty tool_calls array.
+                if !tool_calls.is_empty() {
+                    msg["tool_calls"] = json!(tool_calls);
+                }
+                vec![msg]
             }
         }
         _ => message
@@ -744,6 +926,75 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
     }
 }
 
+/// Remove `role:"tool"` messages from `messages` that have no valid paired
+/// `role:"assistant"` message with a matching `tool_calls[].id` immediately
+/// preceding them. This is a last-resort safety net at the request-building
+/// layer — the compaction boundary fix (6e301c8) prevents the most common
+/// producer path, but resume, session editing, or future compaction variants
+/// could still create orphaned tool messages.
+///
+/// Algorithm: scan left-to-right. For each `role:"tool"` message, check the
+/// immediately preceding non-tool message. If it's `role:"assistant"` with a
+/// `tool_calls` array containing an entry whose `id` matches the tool
+/// message's `tool_call_id`, the pair is valid and both are kept. Otherwise
+/// the tool message is dropped.
+fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
+    // Collect indices of tool messages that are orphaned.
+    let mut drop_indices = std::collections::HashSet::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Find the nearest preceding non-tool message.
+        let preceding = messages[..i]
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) != Some("tool"));
+        // A tool message is considered paired when:
+        // (a) the nearest preceding non-tool message is an assistant message
+        //     whose `tool_calls` array contains an entry with the matching id, OR
+        // (b) there's no clear preceding context (e.g. the message comes right
+        //     after a user turn — this can happen with translated mixed-content
+        //     user messages). In case (b) we allow the message through rather
+        //     than silently dropping potentially valid history.
+        let preceding_role = preceding
+            .and_then(|m| m.get("role"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Only apply sanitization when the preceding message is an assistant
+        // turn (the invariant is: assistant-with-tool_calls must precede tool).
+        // If the preceding is something else (user, system) don't drop — it
+        // may be a valid translation artifact or a path we don't understand.
+        if preceding_role != "assistant" {
+            continue;
+        }
+        let paired = preceding
+            .and_then(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
+            .map(|tool_calls| {
+                tool_calls
+                    .iter()
+                    .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(tool_call_id))
+            })
+            .unwrap_or(false);
+        if !paired {
+            drop_indices.insert(i);
+        }
+    }
+    if drop_indices.is_empty() {
+        return messages;
+    }
+    messages
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !drop_indices.contains(i))
+        .map(|(_, m)| m)
+        .collect()
+}
+
 fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
     content
         .iter()
@@ -755,13 +1006,45 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
         .join("\n")
 }
 
+/// Recursively ensure every object-type node in a JSON Schema has
+/// `"properties"` (at least `{}`) and `"additionalProperties": false`.
+/// The OpenAI `/responses` endpoint validates schemas strictly and rejects
+/// objects that omit these fields; `/chat/completions` is lenient but also
+/// accepts them, so we normalise unconditionally.
+fn normalize_object_schema(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        if obj.get("type").and_then(Value::as_str) == Some("object") {
+            obj.entry("properties").or_insert_with(|| json!({}));
+            obj.entry("additionalProperties")
+                .or_insert(Value::Bool(false));
+        }
+        // Recurse into properties values
+        if let Some(props) = obj.get_mut("properties") {
+            if let Some(props_obj) = props.as_object_mut() {
+                let keys: Vec<String> = props_obj.keys().cloned().collect();
+                for k in keys {
+                    if let Some(v) = props_obj.get_mut(&k) {
+                        normalize_object_schema(v);
+                    }
+                }
+            }
+        }
+        // Recurse into items (arrays)
+        if let Some(items) = obj.get_mut("items") {
+            normalize_object_schema(items);
+        }
+    }
+}
+
 fn openai_tool_definition(tool: &ToolDefinition) -> Value {
+    let mut parameters = tool.input_schema.clone();
+    normalize_object_schema(&mut parameters);
     json!({
         "type": "function",
         "function": {
             "name": tool.name,
             "description": tool.description,
-            "parameters": tool.input_schema,
+            "parameters": parameters,
         }
     })
 }
@@ -852,7 +1135,11 @@ fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
     Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
 }
 
-fn parse_sse_frame(frame: &str) -> Result<Option<ChatCompletionChunk>, ApiError> {
+fn parse_sse_frame(
+    frame: &str,
+    provider: &str,
+    model: &str,
+) -> Result<Option<ChatCompletionChunk>, ApiError> {
     let trimmed = frame.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -874,15 +1161,44 @@ fn parse_sse_frame(frame: &str) -> Result<Option<ChatCompletionChunk>, ApiError>
     if payload == "[DONE]" {
         return Ok(None);
     }
-    serde_json::from_str(&payload)
+    // Some backends embed an error object in a data: frame instead of using an
+    // HTTP error status. Surface the error message directly rather than letting
+    // ChatCompletionChunk deserialization fail with a cryptic 'missing field' error.
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if let Some(err_obj) = raw.get("error") {
+            let msg = err_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("provider returned an error in stream")
+                .to_string();
+            let code = err_obj
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .map(|c| c as u16);
+            let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+            return Err(ApiError::Api {
+                status,
+                error_type: err_obj
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_owned),
+                message: Some(msg),
+                request_id: None,
+                body: payload.to_string(),
+                retryable: false,
+            });
+        }
+    }
+    serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
-        .map_err(ApiError::from)
+        .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
         Err(error) => Err(ApiError::from(error)),
     }
 }
@@ -923,6 +1239,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
+    let request_id = request_id_from_headers(response.headers());
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
@@ -935,6 +1252,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         message: parsed_error
             .as_ref()
             .and_then(|error| error.error.message.clone()),
+        request_id,
         body,
         retryable,
     })
@@ -970,9 +1288,9 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
-        normalize_response, openai_tool_choice, parse_tool_arguments, ChatCompletionResponse,
-        OpenAiCompatClient, OpenAiCompatConfig,
+        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
+        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
+        OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1011,6 +1329,7 @@ mod tests {
                 }]),
                 tool_choice: Some(ToolChoice::Auto),
                 stream: false,
+                ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );
@@ -1020,6 +1339,76 @@ mod tests {
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn tool_schema_object_gets_strict_fields_for_responses_endpoint() {
+        // OpenAI /responses endpoint rejects object schemas missing
+        // "properties" and "additionalProperties". Verify normalize_object_schema
+        // fills them in so the request shape is strict-validator-safe.
+        use super::normalize_object_schema;
+
+        // Bare object — no properties at all
+        let mut schema = json!({"type": "object"});
+        normalize_object_schema(&mut schema);
+        assert_eq!(schema["properties"], json!({}));
+        assert_eq!(schema["additionalProperties"], json!(false));
+
+        // Nested object inside properties
+        let mut schema2 = json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": "object", "properties": {"lat": {"type": "number"}}}
+            }
+        });
+        normalize_object_schema(&mut schema2);
+        assert_eq!(schema2["additionalProperties"], json!(false));
+        assert_eq!(
+            schema2["properties"]["location"]["additionalProperties"],
+            json!(false)
+        );
+
+        // Existing properties/additionalProperties should not be overwritten
+        let mut schema3 = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "additionalProperties": true
+        });
+        normalize_object_schema(&mut schema3);
+        assert_eq!(
+            schema3["additionalProperties"],
+            json!(true),
+            "must not overwrite existing"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_is_included_when_set() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "o4-mini".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("think hard")],
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(payload["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn reasoning_effort_omitted_when_not_set() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(payload.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -1033,6 +1422,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+                ..Default::default()
             },
             OpenAiCompatConfig::openai(),
         );
@@ -1051,6 +1441,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+                ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );
@@ -1123,17 +1514,285 @@ mod tests {
     }
 
     #[test]
-    fn chat_completion_response_allows_missing_model() {
-        let v = json!({
-            "id": "chat-1",
-            "choices": [{
-                "message": {"role": "assistant", "content": "hello"},
-                "finish_reason": "stop"
-            }]
-        });
-        let parsed: ChatCompletionResponse = serde_json::from_value(v).expect("deserialize");
-        assert!(parsed.model.is_empty());
-        let normalized = normalize_response("fallback-model", parsed).expect("normalize");
-        assert_eq!(normalized.model, "fallback-model");
+    fn tuning_params_included_in_payload_when_set() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            stop: Some(vec!["\n".to_string()]),
+            reasoning_effort: None,
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["temperature"], 0.7);
+        assert_eq!(payload["top_p"], 0.9);
+        assert_eq!(payload["frequency_penalty"], 0.5);
+        assert_eq!(payload["presence_penalty"], 0.3);
+        assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn reasoning_model_strips_tuning_params() {
+        let request = MessageRequest {
+            model: "o1-mini".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            stop: Some(vec!["\n".to_string()]),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert!(
+            payload.get("temperature").is_none(),
+            "reasoning model should strip temperature"
+        );
+        assert!(
+            payload.get("top_p").is_none(),
+            "reasoning model should strip top_p"
+        );
+        assert!(payload.get("frequency_penalty").is_none());
+        assert!(payload.get("presence_penalty").is_none());
+        // stop is safe for all providers
+        assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn grok_3_mini_is_reasoning_model() {
+        assert!(is_reasoning_model("grok-3-mini"));
+        assert!(is_reasoning_model("o1"));
+        assert!(is_reasoning_model("o1-mini"));
+        assert!(is_reasoning_model("o3-mini"));
+        assert!(!is_reasoning_model("gpt-4o"));
+        assert!(!is_reasoning_model("grok-3"));
+        assert!(!is_reasoning_model("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn qwen_reasoning_variants_are_detected() {
+        // QwQ reasoning model
+        assert!(is_reasoning_model("qwen-qwq-32b"));
+        assert!(is_reasoning_model("qwen/qwen-qwq-32b"));
+        // Qwen3 thinking family
+        assert!(is_reasoning_model("qwen3-30b-a3b-thinking"));
+        assert!(is_reasoning_model("qwen/qwen3-30b-a3b-thinking"));
+        // Bare qwq
+        assert!(is_reasoning_model("qwq-plus"));
+        // Regular Qwen models must NOT be classified as reasoning
+        assert!(!is_reasoning_model("qwen-max"));
+        assert!(!is_reasoning_model("qwen/qwen-plus"));
+        assert!(!is_reasoning_model("qwen-turbo"));
+    }
+
+    #[test]
+    fn tuning_params_omitted_from_payload_when_none() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert!(
+            payload.get("temperature").is_none(),
+            "temperature should be absent"
+        );
+        assert!(payload.get("top_p").is_none(), "top_p should be absent");
+        assert!(payload.get("frequency_penalty").is_none());
+        assert!(payload.get("presence_penalty").is_none());
+        assert!(payload.get("stop").is_none());
+    }
+
+    #[test]
+    fn gpt5_uses_max_completion_tokens_not_max_tokens() {
+        // gpt-5* models require `max_completion_tokens`; legacy `max_tokens` causes
+        // a request-validation failure. Verify the correct key is emitted.
+        let request = MessageRequest {
+            model: "gpt-5.2".to_string(),
+            max_tokens: 512,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(
+            payload["max_completion_tokens"],
+            json!(512),
+            "gpt-5.2 should emit max_completion_tokens"
+        );
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "gpt-5.2 must not emit max_tokens"
+        );
+    }
+
+    /// Regression test: some OpenAI-compatible providers emit `"tool_calls": null`
+    /// in stream delta chunks instead of omitting the field or using `[]`.
+    /// Before the fix this produced: `invalid type: null, expected a sequence`.
+    #[test]
+    fn delta_with_null_tool_calls_deserializes_as_empty_vec() {
+        // Simulate the exact shape observed in the wild (gaebal-gajae repro 2026-04-09)
+        let json = r#"{
+            "content": "",
+            "function_call": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+        }"#;
+
+        use super::deserialize_null_as_empty_vec;
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize, Debug)]
+        struct Delta {
+            content: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+            tool_calls: Vec<super::DeltaToolCall>,
+        }
+        let delta: Delta = serde_json::from_str(json)
+            .expect("delta with tool_calls:null must deserialize without error");
+        assert!(
+            delta.tool_calls.is_empty(),
+            "tool_calls:null must produce an empty vec, not an error"
+        );
+    }
+
+    /// Regression: when building a multi-turn request where a prior assistant
+    /// turn has no tool calls, the serialized assistant message must NOT include
+    /// `tool_calls: []`. Some providers reject requests that carry an empty
+    /// tool_calls array on assistant turns (gaebal-gajae repro 2026-04-09).
+    #[test]
+    fn assistant_message_without_tool_calls_omits_tool_calls_field() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "Hello".to_string(),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().unwrap();
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        assert!(
+            assistant_msg.get("tool_calls").is_none(),
+            "assistant message without tool calls must omit tool_calls field: {:?}",
+            assistant_msg
+        );
+    }
+
+    /// Regression: assistant messages WITH tool calls must still include
+    /// the tool_calls array (normal multi-turn tool-use flow).
+    #[test]
+    fn assistant_message_with_tool_calls_includes_tool_calls_field() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/test"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().unwrap();
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        let tool_calls = assistant_msg
+            .get("tool_calls")
+            .expect("assistant message with tool calls must include tool_calls field");
+        assert!(tool_calls.is_array());
+        assert_eq!(tool_calls.as_array().unwrap().len(), 1);
+    }
+
+    /// Orphaned tool messages (no preceding assistant tool_calls) must be
+    /// dropped by the request-builder sanitizer. Regression for the second
+    /// layer of the tool-pairing invariant fix (gaebal-gajae 2026-04-10).
+    #[test]
+    fn sanitize_drops_orphaned_tool_messages() {
+        use super::sanitize_tool_message_pairing;
+
+        // Valid pair: assistant with tool_calls → tool result
+        let valid = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "result"}),
+        ];
+        let out = sanitize_tool_message_pairing(valid);
+        assert_eq!(out.len(), 2, "valid pair must be preserved");
+
+        // Orphaned tool message: no preceding assistant tool_calls
+        let orphaned = vec![
+            json!({"role": "assistant", "content": "hi"}),
+            json!({"role": "tool", "tool_call_id": "call_2", "content": "orphaned"}),
+        ];
+        let out = sanitize_tool_message_pairing(orphaned);
+        assert_eq!(out.len(), 1, "orphaned tool message must be dropped");
+        assert_eq!(out[0]["role"], json!("assistant"));
+
+        // Mismatched tool_call_id
+        let mismatched = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_3", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "call_WRONG", "content": "bad"}),
+        ];
+        let out = sanitize_tool_message_pairing(mismatched);
+        assert_eq!(out.len(), 1, "tool message with wrong id must be dropped");
+
+        // Two tool results both valid (same preceding assistant)
+        let two_results = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "fa", "arguments": "{}"}},
+                {"id": "call_b", "type": "function", "function": {"name": "fb", "arguments": "{}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "call_a", "content": "ra"}),
+            json!({"role": "tool", "tool_call_id": "call_b", "content": "rb"}),
+        ];
+        let out = sanitize_tool_message_pairing(two_results);
+        assert_eq!(out.len(), 3, "both valid tool results must be preserved");
+    }
+
+    #[test]
+    fn non_gpt5_uses_max_tokens() {
+        // Older OpenAI models expect `max_tokens`; verify gpt-4o is unaffected.
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 512,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["max_tokens"], json!(512));
+        assert!(
+            payload.get("max_completion_tokens").is_none(),
+            "gpt-4o must not emit max_completion_tokens"
+        );
     }
 }
