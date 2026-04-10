@@ -19,7 +19,7 @@ from .transcript import TranscriptStore
 class QueryEngineConfig:
     #: 用户轮次硬上限（1.0 默认 100；与工具闭环上限分轨，见 ``llm_client.agent_tool_iteration_cap``）
     max_turns: int = 100
-    #: 累计 token 预算（>2M，避免长对话误触顶；与 ``message_prune`` 策略配套）
+    #: 累计 token 预算（默认 3M；产品线长上下文底线 ≥2M，勿与上游 stub 的 2k 级默认对齐）
     max_budget_tokens: int = 3_000_000
     #: 仅当 ``mutable_messages`` 条数超过此值时才做滑动裁剪；贴近 ``max_turns`` 以尽量保留原文
     compact_after_turns: int = 99

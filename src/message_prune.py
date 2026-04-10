@@ -1,8 +1,11 @@
 """
 发往 LLM 前的历史消息内存修剪：滑动窗口 + 长 tool 输出折叠，不修改落盘与会话内完整快照。
 
-与 ``QueryEngineConfig.max_budget_tokens``（默认 3_000_000）配合：日常尽量保留原文与尾部细节，
-仅在中间段对**极长** tool 输出做折叠，避免上下文暴涨；真正触顶由引擎侧 token 预算与 LLM 窗口兜底。
+尖叫 Code 产品参数（勿用上游 claw-code Python stub 的保守默认覆盖本模块常量）：
+
+- 与 ``QueryEngineConfig.max_turns``（默认 100）及 ``max_budget_tokens``（默认 3_000_000，不低于 2_000_000
+  的长上下文底线）配套；折叠只减轻中间段**极长** tool 文本，触顶仍由引擎 token 预算与模型窗口兜底。
+- ``_TAIL_PRESERVE_COUNT`` / ``_TOOL_FOLD_THRESHOLD_CHARS`` 等为刻意放宽的熔断阈值，合并上游时须保留。
 """
 
 from __future__ import annotations

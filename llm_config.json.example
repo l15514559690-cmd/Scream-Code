@@ -3,6 +3,14 @@
   "active": "deepseek",
   "models": [
     {
+      "id": "openrouter",
+      "alias": "OpenRouter（OpenAI 兼容端点，与 claw-code USAGE 一致）",
+      "base_url": "https://openrouter.ai/api/v1",
+      "model_name": "anthropic/claude-sonnet-4",
+      "api_key_env_name": "OPENAI_API_KEY",
+      "api_protocol": "openai"
+    },
+    {
       "id": "deepseek",
       "alias": "DeepSeek",
       "base_url": "https://api.deepseek.com/v1",
