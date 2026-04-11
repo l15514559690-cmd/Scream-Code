@@ -407,7 +407,9 @@ def _chat_completion_stream_anthropic(
     last_out = 0
     finish_emitted = False
 
-    with client.messages.stream(**req) as stream:
+    # 使用 create(..., stream=True) 迭代 RawMessageStreamEvent，避免 messages.stream() 封装层缓冲
+    stream = client.messages.create(**req, stream=True)
+    try:
         for event in stream:
             et = getattr(event, 'type', None)
             if et == 'message_start':
@@ -460,6 +462,11 @@ def _chat_completion_stream_anthropic(
                 if sr:
                     yield StreamPart(finish_reason=_anthropic_stop_to_finish(str(sr)))
                     finish_emitted = True
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
 
     if not finish_emitted:
         yield StreamPart(finish_reason='stop')

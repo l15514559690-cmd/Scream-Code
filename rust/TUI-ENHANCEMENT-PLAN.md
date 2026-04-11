@@ -4,6 +4,14 @@
 
 This plan covers a comprehensive analysis of the current terminal user interface and proposes phased enhancements that will transform the existing REPL/prompt CLI into a polished, modern TUI experience — while preserving the existing clean architecture and test coverage.
 
+### **[UPDATE 2026-04] — Python TUI is canonical**
+
+The **originally envisioned Rust-first TUI overhaul** (including optional `ratatui` full-screen work) has been **fully superseded** by a **Python TUI stack** (`rich` + `prompt_toolkit`), shipped as the default Scream Code interactive experience (`scream` → `python3 -m src.main repl --python-tui`). Rust remains a **lightweight launcher** (env injection, workspace root, `--line-repl` classic path) and **API / runtime engine**, not the primary TUI renderer.
+
+**Phases 1–4 goals from this document are met or exceeded on the Python side**, including: status/HUD (bottom toolbar), streaming markdown with `Live`, thinking/status indicators, tool-call panels and diff visualization, enhanced `/diff` and `/sessions`, slash completion with metadata, and a deliberate “waterfall” REPL that avoids scrollback pollution.
+
+The sections below are **retained as historical design context** and for the **Rust line-REPL** surface; treat **Phase 6 (ratatui)** as **archived** (see §2 Phase 6).
+
 ---
 
 ## 1. Current Architecture Analysis
@@ -75,7 +83,7 @@ This plan covers a comprehensive analysis of the current terminal user interface
 | 0.1 | **Extract `LiveCli` into `app.rs`** — Move the entire `LiveCli` struct, its impl, and helpers (`format_*`, `render_*`, session management) out of `main.rs` into focused modules: `app.rs` (core), `format.rs` (report formatting), `session_manager.rs` (session CRUD) | M |
 | 0.2 | **Remove or merge the legacy `CliApp`** — The existing `app.rs` has an unused `CliApp` with its own `ConversationClient`-based rendering. Either delete it or merge its unique features (stream event handler pattern) into the active `LiveCli` | S |
 | 0.3 | **Extract `main.rs` arg parsing** — The current `parse_args()` is a hand-rolled parser that duplicates the clap-based `args.rs`. Consolidate on the hand-rolled parser (it's more feature-complete) and move it to `args.rs`, or adopt clap fully | S |
-| 0.4 | **Create a `tui/` module** — Introduce `crates/rusty-claude-cli/src/tui/mod.rs` as the namespace for all new TUI components: `status_bar.rs`, `layout.rs`, `tool_panel.rs`, etc. | S |
+| 0.4 | ~~**Create a `tui/` module**~~ **(Obsolete)** — Was planned under Rust; **`tui/` removed** (2026-04). Equivalent concerns live in **`src/tui_app.py`** / **`repl_ui_render.py`** (Python). | — |
 
 ### Phase 1: Status Bar & Live HUD
 
@@ -135,17 +143,23 @@ This plan covers a comprehensive analysis of the current terminal user interface
 | 5.3 | **Configurable spinner style** — Allow choosing between braille dots, bar, moon phases, etc. | S |
 | 5.4 | **Banner customization** — Make the ASCII art banner optional or configurable via settings | S |
 
-### Phase 6: Full-Screen TUI Mode (Stretch)
+### Phase 6: Full-Screen TUI Mode (Stretch) — **[DEPRECATED / ARCHIVED]**
 
-**Goal**: Optional alternate-screen layout for power users.
+**Status (2026-04)**: This phase targeted a **Rust + `ratatui`** alternate-screen application. That direction is **not pursued**. The **`src/tui/`** tree under `rusty-claude-cli` has been **removed**; **`ratatui`** and related crates were **never adopted** as the shipping path for Scream Code 2.0.
+
+**Goal (historical)**: Optional alternate-screen layout for power users.
 
 | Task | Description | Effort |
 |---|---|---|
-| 6.1 | **Add `ratatui` dependency** — Introduce `ratatui` (terminal UI framework) as an optional dependency for the full-screen mode | S |
-| 6.2 | **Split-pane layout** — Top pane: conversation with scrollback; Bottom pane: input area; Right sidebar (optional): tool status/todo list | XL |
-| 6.3 | **Scrollable conversation view** — Navigate past messages with PgUp/PgDn, search within conversation | L |
-| 6.4 | **Keyboard shortcuts panel** — Show `?` help overlay with all keybindings | M |
-| 6.5 | **Mouse support** — Click to expand tool results, scroll conversation, select text for copy | L |
+| 6.1 | ~~**Add `ratatui` dependency**~~ **→ Superseded.** Full-screen or richer layouts, if ever needed, would follow a **`prompt_toolkit`-centric** Python application pattern (or similar), not a heavy Rust TUI framework in-tree. **No `ratatui` task.** | — |
+| 6.2 | **Split-pane layout** — (Archived) Would have been top: conversation; bottom: input; optional sidebar | XL |
+| 6.3 | **Scrollable conversation view** — (Archived) | L |
+| 6.4 | **Keyboard shortcuts panel** — (Archived) | M |
+| 6.5 | **Mouse support** — (Archived) | L |
+
+**Rationale**: The **interactive Python REPL** (streaming assistant panels, bottom toolbar, `patch_stdout` avoided, `Live` + final panel) already delivers a **strong compromise**—polished visuals without pulling in a **large Rust full-screen TUI stack**. Re-introducing `ratatui` for the default experience is **explicitly out of scope** for the current architecture.
+
+---
 
 ---
 
@@ -167,42 +181,50 @@ This plan covers a comprehensive analysis of the current terminal user interface
 
 ### Longer-Term
 
-9. **Phase 5** — Color themes (user demand-driven).
-10. **Phase 4.2–4.6** — Enhanced navigation and commands.
-11. **Phase 6** — Full-screen mode (major undertaking, evaluate after earlier phases ship).
+9. **Phase 5** — Color themes (user demand-driven); may apply to Python TUI / Rich themes or Rust line-REPL separately.
+10. **Phase 4.2–4.6** — Enhanced navigation and commands (partially addressed in Python; remainder backlog).
+11. ~~**Phase 6**~~ — **Archived** (see Phase 6 section). Full-screen Rust TUI is not on the roadmap.
 
 ---
 
 ## 4. Architecture Recommendations
 
-### Module Structure After Phase 0
+### Current split (2026-04): Rust launcher + Python TUI
+
+**Primary interactive UI** lives in the repo root Python package:
+
+- `src/tui_app.py` — `prompt_toolkit` session, bottom toolbar, welcome/status styling, slash completer
+- `src/replLauncher.py` — streaming turn (`rich.Live`), `console.status` thinking line, bridge to engine
+- `src/repl_ui_render.py` — tool op panels, `Syntax` diff/Markdown, final assistant `Panel`
+- `src/repl_slash_commands.py` — `/diff`, `/sessions`, etc. with Rich tables/panels
+
+**Rust `scream-cli`** (`crates/rusty-claude-cli/src/`):
+
+- `main.rs` — Parses args; **default REPL** spawns Python TUI; **`--line-repl`** uses classic **rustyline** loop
+- `render.rs` — Markdown + **Spinner** (**`crossterm`**) for the **Rust line REPL** only
+- **`tui/`** — **Removed** (no `ratatui` module in-tree)
+
+### Module structure (Rust) — historical target vs. actual
+
+The tree below was the **Phase 0 aspiration** for a Rust-only TUI module layout. **Actual shipping layout**: no `tui/` directory; TUI features are implemented in **Python** as above.
 
 ```
 crates/rusty-claude-cli/src/
-├── main.rs              # Entrypoint, arg dispatch only (~100 lines)
-├── args.rs              # CLI argument parsing (consolidate existing two parsers)
-├── app.rs               # LiveCli struct, REPL loop, turn execution
-├── format.rs            # All report formatting (status, cost, model, permissions, etc.)
-├── session_mgr.rs       # Session CRUD: create, resume, list, switch, persist
-├── init.rs              # Repo initialization (unchanged)
-├── input.rs             # Line editor (unchanged, minor extensions)
-├── render.rs            # TerminalRenderer, Spinner (extended)
-└── tui/
-    ├── mod.rs           # TUI module root
-    ├── status_bar.rs    # Persistent bottom status line
-    ├── tool_panel.rs    # Tool call visualization (boxes, timelines, collapsible)
-    ├── diff_view.rs     # Colored diff rendering
-    ├── pager.rs         # Internal pager for long outputs
-    └── theme.rs         # Color theme definitions and selection
+├── main.rs              # Entrypoint: Python TUI launch, or run() for full CLI / line REPL
+├── init.rs
+├── input.rs             # rustyline (classic `--line-repl`)
+├── llm_config.rs
+├── render.rs            # TerminalRenderer, Spinner (crossterm) — line REPL / markdown
+└── (no tui/ — deleted)
 ```
 
 ### Key Design Principles
 
-1. **Keep the inline REPL as the default** — Full-screen TUI should be opt-in (`--tui` flag)
-2. **Everything testable without a terminal** — All formatting functions take `&mut impl Write`, never assume stdout directly
-3. **Streaming-first** — Rendering should work incrementally, not buffering the entire response
-4. **Respect `crossterm` for all terminal control** — Don't mix raw ANSI escape codes with crossterm (the current codebase does this in the startup banner)
-5. **Feature-gate heavy dependencies** — `ratatui` should be behind a `full-tui` feature flag
+1. **Default UX is Python TUI** — `scream` / `scream repl` → Python `rich` + `prompt_toolkit`; Rust full-screen TUI is **not** the product direction.
+2. **Rust + Python decoupling** — Launcher sets cwd, env (UTF-8, locale, color), and stdio; **no terminal mode hacks** before spawning Python TUI.
+3. **Streaming-first (Python path)** — `Live` for deltas, transient + final `Panel` for scrollback hygiene; thinking line via `console.status`.
+4. **Respect `crossterm` on the Rust line-REPL path only** — Spinner and related sequences stay inside **`run_turn_line_repl`** / line REPL, not the Python spawn path.
+5. ~~**Feature-gate heavy dependencies (`ratatui`)**~~ **OBSOLETE.** **Do not** re-add `ratatui` for the default stack. Any future full-screen experiment should align with **Python `prompt_toolkit`** (or a separate tool), not a second heavyweight Rust TUI framework in `rusty-claude-cli`.
 
 ---
 
@@ -213,9 +235,10 @@ crates/rusty-claude-cli/src/
 | Breaking the working REPL during refactor | Phase 0 is pure restructuring with existing test coverage as safety net |
 | Terminal compatibility issues (tmux, SSH, Windows) | Rely on crossterm's abstraction; test in degraded environments |
 | Performance regression with rich rendering | Profile before/after; keep the fast path (raw streaming) always available |
-| Scope creep into Phase 6 | Ship Phases 0–3 as a coherent release before starting Phase 6 |
+| Scope creep into Phase 6 | **Phase 6 archived**; prefer extending Python TUI if new UX is needed |
 | `app.rs` vs `main.rs` confusion | Phase 0.2 explicitly resolves this by removing the legacy `CliApp` |
 
 ---
 
-*Generated: 2026-03-31 | Workspace: `rust/` | Branch: `dev/rust`*
+*Generated: 2026-03-31 | Workspace: `rust/` | Branch: `dev/rust`*  
+*Last architecture note: 2026-04 — Python TUI canonical; Rust `tui/` removed; Phase 6 archived.*

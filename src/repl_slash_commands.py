@@ -173,6 +173,8 @@ def _print_help(console: Any | None) -> None:
                 '/cost — 本会话 Token 与粗略费用账单',
                 '/diff — 当前 Git 工作区改动（git diff --stat）',
                 '/status — 沙箱权限、工具数、模型、.claw.json、项目记忆',
+                '/config — 以高亮 JSON 格式查看当前大模型详细配置 (llm_config.json)',
+                '/skills — 以表格形式查看当前挂载的所有技能 (Skill) 与插件 (Plugin)',
             ],
         ),
         (
@@ -405,6 +407,10 @@ def _print_cost(console: Any | None, engine: QueryEnginePort) -> None:
 
 
 def _print_git_diff(console: Any | None) -> None:
+    from rich import box
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+
     root = Path.cwd()
     try:
         st = subprocess.run(
@@ -414,7 +420,7 @@ def _print_git_diff(console: Any | None) -> None:
             text=True,
             timeout=30,
         )
-        df = subprocess.run(
+        full_diff = subprocess.run(
             ['git', 'diff', '--stat'],
             cwd=root,
             capture_output=True,
@@ -425,15 +431,74 @@ def _print_git_diff(console: Any | None) -> None:
         _msg(console, f'git 调用失败: {exc}', style='red')
         return
 
-    out_status = (st.stdout or '').strip() or '（无改动或未跟踪文件）'
-    out_diff = (df.stdout or '').strip() or '（无 diff）'
     if st.returncode != 0 and st.stderr:
         _msg(console, st.stderr.strip(), style='yellow')
-    if df.returncode != 0 and df.stderr:
-        _msg(console, df.stderr.strip(), style='yellow')
+    if full_diff.returncode != 0 and full_diff.stderr:
+        _msg(console, full_diff.stderr.strip(), style='yellow')
 
-    block = f'## git status --short\n```\n{out_status}\n```\n\n## git diff --stat\n```\n{out_diff}\n```'
-    _print_markdown_block(console, block, title='/diff · 工作区')
+    out_status = (st.stdout or '').strip()
+    stat_lines = (full_diff.stdout or '').strip()
+
+    # 用 monokai 渲染 diff stat；无改动时给友好提示
+    stat_body: Any
+    if stat_lines:
+        stat_body = Syntax(
+            stat_lines[:200_000],
+            lexer='diff',
+            theme='monokai',
+            background_color='#09090B',
+            word_wrap=True,
+        )
+    else:
+        from rich.text import Text
+
+        stat_body = Text('（无 diff — 工作区干净）', style='dim')
+
+    panels: list[Any] = []
+    if out_status:
+        status_body = Syntax(
+            out_status[:200_000],
+            lexer='bash',
+            theme='monokai',
+            background_color='#09090B',
+            word_wrap=True,
+        )
+        panels.append(
+            Panel(
+                status_body,
+                title='git status --short',
+                border_style='dim',
+                box=box.ROUNDED,
+                padding=(0, 1),
+                expand=True,
+            )
+        )
+    panels.append(
+        Panel(
+            stat_body,
+            title='git diff --stat',
+            border_style='cyan',
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True,
+        )
+    )
+
+    if console is not None:
+        from rich.console import Group
+
+        console.print(
+            Panel(
+                Group(*panels),
+                title='[bold cyan]/diff · 工作区[/bold cyan]',
+                border_style='cyan',
+                box=box.ROUNDED,
+                expand=True,
+            )
+        )
+    else:
+        for p in panels:
+            print(p)
 
 
 def _print_status(console: Any | None, engine: QueryEnginePort) -> None:
@@ -485,20 +550,27 @@ def _print_status(console: Any | None, engine: QueryEnginePort) -> None:
 def _print_sessions(console: Any | None) -> None:
     entries = list_saved_session_entries(limit=80)
     if console is not None:
+        from rich import box
+        from rich.panel import Panel
         from rich.table import Table
 
         if not entries:
             console.print('[dim]尚无已落盘会话（.port_sessions/）。[/dim]')
-        else:
-            t = Table(title='本地会话历史', show_lines=True)
-            t.add_column('session_id', style='green', no_wrap=True, overflow='fold')
-            t.add_column('消息数', justify='right')
-            t.add_column('in/out', justify='right', style='dim')
-            t.add_column('更新时间', style='dim')
-            for sid, n, it, ot, path in entries:
-                ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(path.stat().st_mtime))
-                t.add_row(sid, str(n), f'{it}/{ot}', ts)
-            console.print(t)
+            return
+        t = Table(
+            title='/sessions · 本地会话历史',
+            box=box.ROUNDED,
+            show_lines=True,
+            expand=True,
+        )
+        t.add_column('会话 ID', style='bold cyan', no_wrap=True, overflow='fold')
+        t.add_column('消息数', justify='right', style='white')
+        t.add_column('↑入 / ↓出', justify='right', style='dim')
+        t.add_column('更新时间', style='dim')
+        for sid, n, it, ot, path in entries:
+            ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(path.stat().st_mtime))
+            t.add_row(sid, str(n), f'{it}/{ot}', ts)
+        console.print(Panel(t, border_style='cyan', box=box.ROUNDED))
         console.print('[dim]恢复上下文: [bold]/load <session_id>[/bold][/dim]')
     else:
         if not entries:
@@ -664,6 +736,63 @@ def dispatch_repl_slash_command(
 
     if cmd == '/graph':
         _print_graph(console)
+        return True, None
+
+    if cmd == '/config':
+        from . import model_manager
+
+        raw = model_manager.read_persisted_config_raw()
+        if raw is None:
+            _msg(
+                console,
+                '未找到有效的 llm_config.json（文件不存在或 JSON 无法解析）。',
+                style='yellow',
+            )
+        elif console is not None:
+            from rich.json import JSON
+            from rich.panel import Panel
+
+            console.print(
+                Panel(
+                    JSON(json.dumps(raw, ensure_ascii=False, indent=2)),
+                    title='[bold]/config · llm_config.json[/bold]',
+                    border_style='blue',
+                )
+            )
+        else:
+            print(json.dumps(raw, ensure_ascii=False, indent=2))
+        _msg(
+            console,
+            '💡 提示：若需交互式修改配置，请在新终端运行 `scream config`。',
+            style='dim',
+        )
+        return True, None
+
+    if cmd == '/skills':
+        from rich import box
+        from rich.panel import Panel
+        from rich.table import Table
+
+        cg = build_command_graph()
+        table = Table(
+            title='[bold cyan]/skills · 已加载的扩展能力[/bold cyan]',
+            box=box.ROUNDED,
+            show_lines=True,
+        )
+        table.add_column('名称', style='green')
+        table.add_column('类型', style='cyan')
+        for m in cg.skill_like:
+            table.add_row(m.name, 'Skill (技能)')
+        for m in cg.plugin_like:
+            table.add_row(m.name, 'Plugin (插件)')
+        if console is not None:
+            console.print(Panel(table, border_style='green'))
+        else:
+            print('/skills · 已加载的扩展能力')
+            for m in cg.skill_like:
+                print(f'  {m.name}\tSkill (技能)')
+            for m in cg.plugin_like:
+                print(f'  {m.name}\tPlugin (插件)')
         return True, None
 
     if cmd == '/doctor':

@@ -3,7 +3,7 @@
 
 - **流式 + 代码高亮**：``_run_streaming_turn`` 中 ``Live`` 仅裸 ``ScreamMarkdown``（``transient=True``），
   定稿为固定靛紫 ``Panel``；首包前 ``console.status`` 思考动画；**不用** ``patch_stdout``。
-- **视觉**：靛紫品牌色、欢迎 Panel、助手区深色底与圆角 Panel（运行时增强 ``assistant_panel``）。
+- **视觉**：靛紫品牌色、欢迎 Panel；协议/模式/模型与 Token 费用固定在 prompt **底部工具栏**，不污染 scrollback。
 - **斜杠补全**：输入 ``/`` 后弹出指令补全菜单（紫色选中项）。
 - **PTY 断开**：主输入循环捕获 ``EOFError`` 后直接 ``sys.exit(0)``，不做复杂清理，避免死循环占满 CPU。
 """
@@ -43,6 +43,8 @@ SLASH_COMMANDS: tuple[str, ...] = (
     '/report',
     '/subsystems',
     '/graph',
+    '/config',
+    '/skills',
     '/clear',
 )
 
@@ -65,6 +67,8 @@ SLASH_COMMAND_META: dict[str, str] = {
     '/report': '环境与启动体检报告',
     '/subsystems': '顶层 Python 子系统模块',
     '/graph': '命令与引导关系树状图',
+    '/config': '查看当前大模型与 API 配置 (JSON)',
+    '/skills': '查看当前挂载的扩展技能与插件',
     '/clear': '清屏（原生桥接未实现时请用 /help）',
 }
 
@@ -113,6 +117,7 @@ def _prompt_toolkit_style() -> Any:
             'completion-menu.meta.completion.current': f'bg:{_BRAND_HEX} fg:#a5b4fc',
             # 光标行与提示
             '': f'fg:#e2e8f0',
+            'bottom-toolbar': 'bg:#1e1e2e fg:#e2e8f0',
         }
     )
 
@@ -294,48 +299,6 @@ def _tui_engine_autoresume() -> Any:
         return QueryEnginePort.from_workspace()
 
 
-def _status_mode_cell(engine: Any) -> Any:
-    """群狼 / 单人模式（随 ``/team`` 与 ``engine`` 引用更新而刷新）。"""
-    from rich.text import Text
-
-    use_team = bool(getattr(engine, 'repl_team_mode', False))
-    if use_team:
-        return Text.from_markup('[bold #f59e0b]🐺 群狼模式[/bold #f59e0b]')
-    return Text.from_markup('[dim]👤 单人模式[/dim]')
-
-
-def _print_status_bar(console: Any, engine: Any) -> None:
-    """协议 | 模式 | 模型 | Token 累计（输入/输出）。"""
-    from rich import box
-    from rich.table import Table
-
-    u = getattr(engine, 'total_usage', None)
-    inp = int(getattr(u, 'input_tokens', 0) or 0) if u is not None else 0
-    outp = int(getattr(u, 'output_tokens', 0) or 0) if u is not None else 0
-    total = inp + outp
-
-    table = Table(
-        box=box.ROUNDED,
-        show_header=True,
-        header_style=f'bold {_BRAND_SOFT}',
-        border_style=_BRAND_MUTED,
-        style=f'on {_ASSISTANT_SURFACE}',
-        expand=True,
-        padding=(0, 1),
-    )
-    table.add_column('协议', justify='left', style=f'bold {_USER_ACCENT}', no_wrap=True)
-    table.add_column('模式', justify='left', no_wrap=True)
-    table.add_column('模型', justify='left', style='white')
-    table.add_column('Token 消耗', justify='right', style='dim')
-    table.add_row(
-        _infer_protocol_label(),
-        _status_mode_cell(engine),
-        _status_model(engine),
-        f'Σ {total:,}  (↑ {inp:,} / ↓ {outp:,})',
-    )
-    console.print(table)
-
-
 def _print_user_message(console: Any, text: str) -> None:
     from rich import box
     from rich.markup import escape
@@ -351,6 +314,52 @@ def _print_user_message(console: Any, text: str) -> None:
             padding=(0, 1),
             style='on #1a1825',
         )
+    )
+
+
+def _get_bottom_toolbar(engine: Any) -> Any:
+    from prompt_toolkit.formatted_text import HTML
+    import html
+
+    # 1. 协议
+    try:
+        from .llm_settings import read_llm_connection_settings
+        c = read_llm_connection_settings()
+        proto = (c.api_protocol or '').strip().lower()
+        if proto == 'anthropic':
+            protocol = 'Anthropic'
+        elif proto == 'openai':
+            protocol = 'OpenAI-compat'
+        else:
+            protocol = 'Custom'
+    except Exception:
+        protocol = '—'
+
+    # 2. 模型
+    cfg = getattr(engine, 'config', None)
+    raw_model = (getattr(cfg, 'llm_model', None) or '').strip()
+    model = raw_model if raw_model else '(default)'
+
+    # 3. 消耗
+    u = getattr(engine, 'total_usage', None)
+    inp = int(getattr(u, 'input_tokens', 0) or 0) if u is not None else 0
+    outp = int(getattr(u, 'output_tokens', 0) or 0) if u is not None else 0
+    total = inp + outp
+    usd = (inp * 3.0 + outp * 15.0) / 1_000_000.0
+    usd_s = f'{usd:.4f}' if usd >= 0.0001 else f'{usd:.6f}'
+
+    # 4. 模式
+    use_team = bool(getattr(engine, 'repl_team_mode', False))
+    if use_team:
+        mode_html = '<ansiyellow><b>🐺 群狼模式</b></ansiyellow>'
+    else:
+        mode_html = '<ansigray><b>👤 单人模式</b></ansigray>'
+
+    return HTML(
+        f'  <ansicyan><b>协议:</b></ansicyan> {html.escape(protocol)}  <ansiblue>│</ansiblue>  '
+        f'{mode_html}  <ansiblue>│</ansiblue>  '
+        f'<ansicyan><b>模型:</b></ansicyan> {html.escape(model)}  <ansiblue>│</ansiblue>  '
+        f'<ansicyan><b>消耗:</b></ansicyan> Σ {total} (↑{inp} ↓{outp}) ≈ ${usd_s}  '
     )
 
 
@@ -420,11 +429,11 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
     prompt_html = HTML(f'<style fg="{_BRAND_HEX}"><b>尖叫&gt; </b></style>')
 
     while True:
-        # 状态栏 ↔ 输入区：仅一层留白
-        _print_status_bar(console, engine)
-        console.print()
         try:
-            line = session.prompt(prompt_html).strip()
+            line = session.prompt(
+                prompt_html,
+                bottom_toolbar=lambda: _get_bottom_toolbar(engine),
+            ).strip()
         except (EOFError, KeyboardInterrupt) as exc:
             if isinstance(exc, EOFError):
                 sys.exit(0)

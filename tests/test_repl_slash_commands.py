@@ -4,8 +4,13 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
+import pytest
+
+from src.command_graph import CommandGraph
+from src.models import PortingModule
 from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEngineConfig, QueryEnginePort
 from src.repl_slash_commands import dispatch_repl_slash_command
@@ -223,6 +228,55 @@ class ReplSlashCommandsTests(unittest.TestCase):
                 self.assertIn('偏好 TS', Path(tmp, 'SCREAM.md').read_text(encoding='utf-8'))
         finally:
             os.chdir(old)
+
+
+def test_dispatch_config_no_console(
+    capsys: pytest.CaptureFixture[str],
+    mocker: Any,
+) -> None:
+    mocker.patch('src.model_manager.read_persisted_config_raw', return_value={'active': 'test-model'})
+    eng = QueryEnginePort(build_port_manifest())
+    h, ne = dispatch_repl_slash_command('/config', console=None, engine=eng)
+    assert h is True
+    assert ne is None
+    out = capsys.readouterr().out
+    assert 'test-model' in out
+    assert 'scream config' in out
+
+
+def test_dispatch_skills_no_console(
+    capsys: pytest.CaptureFixture[str],
+    mocker: Any,
+) -> None:
+    fake_graph = CommandGraph(
+        builtins=(),
+        skill_like=(
+            PortingModule(
+                name='MockSkill',
+                responsibility='',
+                source_hint='skills',
+                status='planned',
+            ),
+        ),
+        plugin_like=(
+            PortingModule(
+                name='MockPlugin',
+                responsibility='',
+                source_hint='plugin',
+                status='planned',
+            ),
+        ),
+    )
+    mocker.patch('src.repl_slash_commands.build_command_graph', return_value=fake_graph)
+    eng = QueryEnginePort(build_port_manifest())
+    h, ne = dispatch_repl_slash_command('/skills', console=None, engine=eng)
+    assert h is True
+    assert ne is None
+    out = capsys.readouterr().out
+    assert 'MockSkill' in out
+    assert 'MockPlugin' in out
+    assert 'Skill (技能)' in out
+    assert 'Plugin (插件)' in out
 
 
 if __name__ == '__main__':

@@ -390,29 +390,6 @@ def _print_assistant_error(console: object, message: str) -> None:
     console.print()
 
 
-def _print_turn_usage_cost_line(console: Any, finished_ev: dict[str, Any]) -> None:
-    """
-    在 Live 已 stop、最终 Markdown 已落地后打印本轮/累计 token 与粗算美元价，
-    避免与 Rich Live 争用终端重绘（与 transient + 终稿 print 策略兼容）。
-    """
-    tin = int(finished_ev.get('turn_input_tokens') or 0)
-    tout = int(finished_ev.get('turn_output_tokens') or 0)
-    cin = int(finished_ev.get('cumulative_input_tokens') or 0)
-    cout = int(finished_ev.get('cumulative_output_tokens') or 0)
-    total = cin + cout
-    if tin == 0 and tout == 0 and total == 0:
-        return
-    per_m_in = 3.0
-    per_m_out = 15.0
-    usd = (cin * per_m_in + cout * per_m_out) / 1_000_000.0
-    usd_s = f'{usd:.4f}' if usd >= 0.0001 else f'{usd:.6f}'
-    console.print(
-        f'[dim cyan]📊 消耗统计 | 本轮: ↑{tin} ↓{tout} | '
-        f'累计: {total} tokens (↑{cin} ↓{cout}) | '
-        f'粗算约 ${usd_s} (入 $3/1M · 出 $15/1M)[/dim cyan]'
-    )
-
-
 # REPL 单行历史仅驻内存；限制条数避免极长会话下 list 膨胀拖慢 prompt_toolkit
 _REPL_HISTORY_MAX_ITEMS = 512
 
@@ -668,7 +645,6 @@ def _run_streaming_turn(
                     _print_assistant_output(console, buffer)
                 elif isinstance(out, str) and out.strip():
                     _print_assistant_output(console, out)
-                _print_turn_usage_cost_line(console, ev)
                 return
 
             pending = _poll(show_thinking_status=use_live and live is None)

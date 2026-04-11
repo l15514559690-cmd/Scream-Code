@@ -355,19 +355,16 @@ def build_api_tool_op_renderable(ev: dict[str, Any]) -> Any:
     # 通用：尝试从参数里找 diff 样结构（纯展示，不假定后端会传）
     diff_text = args.get('diff') or args.get('patch') or args.get('unified_diff')
     if isinstance(diff_text, str) and diff_text.strip():
-        lines = diff_text.splitlines()
-        styled = Text()
-        for line in lines[:500]:
-            if line.startswith('+') and not line.startswith('+++'):
-                styled.append(line + '\n', style='bold green')
-            elif line.startswith('-') and not line.startswith('---'):
-                styled.append(line + '\n', style='bold red')
-            elif line.startswith('@'):
-                styled.append(line + '\n', style='cyan')
-            else:
-                styled.append(line + '\n', style='dim')
+        # 使用 Rich 原生 diff lexer 渲染，避免手写拼接；超出 2000 行则截断
+        diff_body = Syntax(
+            diff_text[:400_000],
+            lexer='diff',
+            theme='monokai',
+            background_color='#09090B',
+            word_wrap=True,
+        )
         return Panel(
-            styled,
+            diff_body,
             title=f'[bold cyan]Diff 预览[/bold cyan] · {name}',
             box=box.ROUNDED,
             border_style='cyan',
