@@ -44,6 +44,8 @@ impl Default for ColorTheme {
     }
 }
 
+/// 行内进度指示：向 stdout 写入 crossterm 光标移动与清行序列。
+/// 仅应在经典 Rust 行 REPL（``run_turn_line_repl``）中使用，不得在启动 Python TUI 子进程之前调用。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Spinner {
     frame_index: usize,

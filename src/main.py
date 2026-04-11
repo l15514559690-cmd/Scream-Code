@@ -102,6 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='行协议 JSON stdio：供 Rust 全屏 TUI 等前端驱动；stdout 仅输出 JSON 行，stdin 每行一条 JSON 指令',
     )
+    repl_parser.add_argument(
+        '--python-tui',
+        action='store_true',
+        help='纯 Python 终端 UI（prompt_toolkit + rich 流式 Markdown），规避 macOS PTY/crossterm EOF 问题',
+    )
     subparsers.add_parser('config', help='交互式管理多模型配置（llm_config.json）')
     subparsers.add_parser('summary', help='以 Markdown 渲染 Python 移植工作区摘要')
     subparsers.add_parser('manifest', help='打印当前 Python 工作区清单')
@@ -230,6 +235,26 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 print(
                     f'[REPL json-stdio] {type(exc).__name__}: {exc}',
+                    flush=True,
+                    file=sys.stderr,
+                )
+                return 1
+        if getattr(args, 'python_tui', False):
+            from .tui_app import run_python_tui_repl
+
+            if args.llm:
+                from .llm_onboarding import ensure_llm_ready_interactive
+
+                if not ensure_llm_ready_interactive():
+                    return 1
+            try:
+                return run_python_tui_repl(llm_enabled=args.llm, route_limit=5)
+            except KeyboardInterrupt:
+                print('\n已中断。', flush=True)
+                return 130
+            except Exception as exc:
+                print(
+                    f'[REPL python-tui] {type(exc).__name__}: {exc}',
                     flush=True,
                     file=sys.stderr,
                 )

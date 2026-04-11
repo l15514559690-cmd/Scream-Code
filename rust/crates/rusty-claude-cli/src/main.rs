@@ -10,7 +10,6 @@ mod init;
 mod input;
 mod llm_config;
 mod render;
-mod tui;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -19,7 +18,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -96,7 +95,70 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
 
 type AllowedToolSet = BTreeSet<String>;
 
+/// 工作区根：须含 `src/main.py`（与 `.env` 同级）；`SCREAM_WORKSPACE_ROOT` 优先，否则自当前目录向上查找。
+fn scream_workspace_root() -> PathBuf {
+    if let Ok(raw) = env::var("SCREAM_WORKSPACE_ROOT") {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    if let Ok(cwd) = env::current_dir() {
+        let mut cur = Some(cwd.as_path());
+        while let Some(p) = cur {
+            if p.join("src").join("main.py").is_file() {
+                return p.to_path_buf();
+            }
+            cur = p.parent();
+        }
+        return cwd;
+    }
+    PathBuf::new()
+}
+
+fn scream_python_executable() -> &'static str {
+    if cfg!(windows) {
+        "python"
+    } else {
+        "python3"
+    }
+}
+
+/// 启动 Python 原生 TUI（`repl --python-tui`），继承 stdio；以子进程退出码退出（不返回）。
+fn launch_python_tui_repl() -> ! {
+    let status = Command::new(scream_python_executable())
+        .args(["-m", "src.main", "repl", "--python-tui"])
+        .envs(env::vars())
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("COLORTERM", "truecolor")
+        .env("FORCE_COLOR", "1")
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_ALL", "en_US.UTF-8")
+        .current_dir(scream_workspace_root())
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    match status {
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!(
+                "error: could not start Python TUI (`{} -m src.main repl --python-tui`): {e}",
+                scream_python_executable()
+            );
+            std::process::exit(127);
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    // Python TUI：在触碰 `.env` / `run()` / 任何可能间接写 stdout 的逻辑之前直接 exec Python；
+    // 不得在此路径上执行 crossterm（光标/清行等），以免污染子进程继承的终端状态。
+    if let Ok(CliAction::Repl { tui: true, .. }) = parse_args(&args) {
+        launch_python_tui_repl();
+    }
     load_dotenv_best_effort();
     if let Err(error) = run() {
         let message = error.to_string();
@@ -156,10 +218,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             tui,
         } => {
             if tui {
-                // 全屏 TUI：仅 UI；LLM 与斜杠指令由 Python `QueryEnginePort`（`repl --json-stdio`）执行。
-                tui::run_tui_repl()?;
-                // TUI 已显式杀掉 Python 进程组并恢复终端；直接退出，避免残留异步监视器等拖住进程。
-                std::process::exit(0);
+                // 正常由 `main` 在 `run()` 之前已 `launch`；此处兜底（测试等入口）。
+                launch_python_tui_repl();
             } else {
                 ensure_any_llm_credentials_configured()?;
                 run_repl(model, allowed_tools, permission_mode)?;
@@ -1690,7 +1750,7 @@ fn run_repl(
                     }
                 }
                 editor.push_history(input);
-                cli.run_turn(&trimmed)?;
+                cli.run_turn_line_repl(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -2260,7 +2320,7 @@ impl LiveCli {
             |path| path.display().to_string(),
         );
         format!(
-            "\x1b[1;38;5;45mScream\x1b[0m \x1b[1;38;5;201mCode\x1b[0m — full-screen TUI (run `{CLI_BIN}`; use `{CLI_BIN} --line-repl` for classic line mode)\n\n\
+            "\x1b[1;38;5;45mScream\x1b[0m \x1b[1;38;5;201mCode\x1b[0m — Python TUI (run `{CLI_BIN}`; use `{CLI_BIN} --line-repl` for classic line mode)\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
@@ -2347,26 +2407,48 @@ impl LiveCli {
         Ok(())
     }
 
+    /// 单次 Prompt / 非行 REPL 路径：不向 stdout 写入 crossterm 光标控制序列。
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_turn_inner(input, false)
+    }
+
+    /// 仅 ``CliAction::Repl`` 且 ``tui: false``（经典 Rust 行 REPL）：允许 crossterm 行内清屏/光标序列（Spinner）。
+    fn run_turn_line_repl(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_turn_inner(input, true)
+    }
+
+    fn run_turn_inner(
+        &mut self,
+        input: &str,
+        use_crossterm_line_spinner: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        let mut spinner = Spinner::new();
+        let mut spinner = if use_crossterm_line_spinner {
+            Some(Spinner::new())
+        } else {
+            None
+        };
         let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        if let Some(ref mut s) = spinner {
+            s.tick(
+                "🦀 Thinking...",
+                TerminalRenderer::new().color_theme(),
+                &mut stdout,
+            )?;
+        }
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                if let Some(ref mut s) = spinner {
+                    s.finish(
+                        "✨ Done",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                }
                 println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -2379,11 +2461,13 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                if let Some(ref mut s) = spinner {
+                    s.fail(
+                        "❌ Request failed",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                }
                 Err(Box::new(error))
             }
         }
@@ -6083,7 +6167,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "      Start Scream Code (full-screen TUI by default; --line-repl for classic REPL)"
+        "      Start Scream Code (Python TUI by default; --line-repl for classic Rust line REPL)"
     )?;
     writeln!(
         out,
@@ -6146,11 +6230,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --tui                      Force full-screen Scream Code TUI (default when no subcommand)"
+        "  --tui                      Force Python Scream Code TUI (default when no subcommand)"
     )?;
     writeln!(
         out,
-        "  --line-repl, --classic-repl  Classic line-based REPL instead of full-screen TUI"
+        "  --line-repl, --classic-repl  Classic Rust line REPL instead of Python TUI"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
@@ -6944,7 +7028,9 @@ mod tests {
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
-        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]]"));
+        assert!(help.contains(
+            "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+        ));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));

@@ -211,12 +211,13 @@ def _print_help(console: Any | None) -> None:
 def _print_markdown_block(console: Any | None, md: str, *, title: str) -> None:
     text = md.strip()
     if console is not None:
-        from rich.markdown import Markdown
         from rich.panel import Panel
+
+        from .repl_ui_render import ScreamMarkdown
 
         console.print(
             Panel(
-                Markdown(text, code_theme='monokai'),
+                ScreamMarkdown(text, code_theme='monokai'),
                 title=title,
                 border_style='green',
             )

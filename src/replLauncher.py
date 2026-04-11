@@ -36,8 +36,6 @@ REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA = 50_000
 REPL_MEMORY_WARN_REPEAT_TURN_DELTA = 10
 # 兼容旧名：默认 token 阈值
 TOKEN_WARNING_THRESHOLD = REPL_MEMORY_WARN_TOTAL_TOKENS
-# Live 等待脚注刷新下限：过密则每次全量重解析 Markdown，易占满 CPU 导致卡顿
-_LIVE_WAIT_FOOTER_REFRESH_MIN_S = 0.35
 # session_id -> (上次预警时的累计 tokens, 上次预警时的用户轮次数)
 _REPL_MEMORY_WARN_LAST: dict[str, tuple[int, int]] = {}
 
@@ -133,18 +131,16 @@ def _repl_poll_next_event(
     live: Any | None,
     use_live: bool,
     show_thinking_status: bool,
-    wait_footer_holder: list[float | None] | None = None,
     spin_interval: float = 0.1,
 ) -> dict[str, Any] | None:
     """
-    在独立线程中执行 ``next(gen)``，主线程以 ``spin_interval`` 轮询队列，
-    从而在阻塞期刷新思考 Status 或 Live 底部等待计时。
+    在独立线程中执行 ``next(gen)``，主线程以 ``spin_interval`` 轮询队列。
+    在首个 ``text_delta`` 之前（且将使用 Live 流式时），用 ``console.status`` 展示「深度思考中」；
+    收到事件后上下文结束，动画自动消失。
     """
     import queue
     import threading
-    import time
-
-    from .repl_ui_render import thinking_status_markup
+    from contextlib import nullcontext
 
     outq: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
 
@@ -157,38 +153,24 @@ def _repl_poll_next_event(
             outq.put(('err', exc))
 
     threading.Thread(target=_worker, daemon=True).start()
-    t0 = time.perf_counter()
-    last_live_footer_refresh_at = t0
-    thinking_st: Any = None
-    try:
-        if show_thinking_status and live is None and use_live:
-            thinking_st = console.status(
-                thinking_status_markup(0.0),
-                spinner='dots12',
-                spinner_style='cyan',
-            )
-            thinking_st.start()
 
-        while True:
-            try:
-                kind, payload = outq.get(timeout=spin_interval)
-                break
-            except queue.Empty:
-                elapsed = time.perf_counter() - t0
-                if thinking_st is not None:
-                    try:
-                        thinking_st.update(thinking_status_markup(elapsed))
-                    except BaseException:
-                        pass
-                if live is not None and wait_footer_holder is not None:
-                    wait_footer_holder[0] = elapsed
-                    now = time.perf_counter()
-                    if now - last_live_footer_refresh_at >= _LIVE_WAIT_FOOTER_REFRESH_MIN_S:
-                        last_live_footer_refresh_at = now
-                        try:
-                            live.refresh()
-                        except BaseException:
-                            pass
+    status_ctx: Any = (
+        console.status(
+            '[bold cyan]🧠 大模型深度思考中...[/bold cyan]',
+            spinner='dots',
+        )
+        if (show_thinking_status and live is None and use_live)
+        else nullcontext()
+    )
+
+    try:
+        with status_ctx:
+            while True:
+                try:
+                    kind, payload = outq.get(timeout=spin_interval)
+                    break
+                except queue.Empty:
+                    continue
 
         if kind == 'ok':
             return payload  # type: ignore[no-any-return]
@@ -207,14 +189,6 @@ def _repl_poll_next_event(
         except queue.Empty:
             pass
         raise
-    finally:
-        if wait_footer_holder is not None:
-            wait_footer_holder[0] = None
-        if thinking_st is not None:
-            try:
-                thinking_st.stop()
-            except BaseException:
-                pass
 
 
 def _token_warning_threshold_for_engine(engine: Any) -> int:
@@ -397,14 +371,13 @@ def print_repl_llm_driver_banner(*, console: Any | None) -> None:
 
 
 def _print_assistant_output(console: object, text: str) -> None:
-    from rich.markdown import Markdown
-
-    from .repl_ui_render import assistant_panel
+    from .repl_ui_render import final_assistant_markdown_panel
 
     stripped = text.strip()
     if not stripped:
         return
-    console.print(assistant_panel(Markdown(stripped, code_theme='monokai')))
+    # Live（transient）清场后，仅此一份完整 Panel 写入 scrollback
+    console.print(final_assistant_markdown_panel(stripped))
     console.print()
 
 
@@ -577,20 +550,13 @@ def _run_streaming_turn(
     route_limit: int,
     team: bool = False,
 ) -> None:
-    from contextlib import nullcontext
-
     from rich.live import Live
 
     from .repl_ui_render import (
         build_api_tool_op_renderable,
-        streaming_markdown_panel_with_wait_footer,
+        streaming_markdown_for_live,
         tool_execution_status_message,
     )
-
-    try:
-        from prompt_toolkit.patch_stdout import patch_stdout as _stdout_patch_cm
-    except ImportError:
-        _stdout_patch_cm = nullcontext
 
     use_live = bool(
         getattr(console, 'is_terminal', False) and console.is_terminal
@@ -600,11 +566,6 @@ def _run_streaming_turn(
     )
     buffer = ''
     live: Any = None
-    _md_wait: list[float | None] = [None]
-
-    def _live_renderable() -> Any:
-        # 每次刷新按当前 console 宽度重排 Markdown，减轻终端缩放后的错位感
-        return streaming_markdown_panel_with_wait_footer(buffer, _md_wait[0])
 
     def _stop_live() -> None:
         nonlocal live
@@ -614,7 +575,6 @@ def _run_streaming_turn(
             except BaseException:
                 pass
             live = None
-        _md_wait[0] = None
 
     def _poll(
         *,
@@ -626,101 +586,98 @@ def _run_streaming_turn(
             live=live,
             use_live=use_live,
             show_thinking_status=show_thinking_status,
-            wait_footer_holder=_md_wait if live is not None else None,
         )
 
-    with _stdout_patch_cm():
-        try:
-            pending: dict[str, Any] | None = _poll(
-                show_thinking_status=use_live and live is None,
-            )
-            while pending is not None:
-                ev = pending
-                pending = None
-                et = ev['type']
+    try:
+        pending: dict[str, Any] | None = _poll(
+            show_thinking_status=use_live and live is None,
+        )
+        while pending is not None:
+            ev = pending
+            pending = None
+            et = ev['type']
 
-                if et == 'blocked':
-                    _stop_live()
-                    _print_assistant_output(console, ev['output'])
-                    return
-                if et == 'llm_error':
-                    _stop_live()
-                    _print_assistant_error(console, ev['output'])
-                    return
-                if et == 'team_agent':
-                    _stop_live()
-                    agent = str(ev.get('agent', 'Agent'))
-                    styles = {
-                        'Planner': 'bold cyan',
-                        'Coder': 'bold green',
-                        'Reviewer': 'bold yellow',
-                    }
-                    st = styles.get(agent, 'bold white')
-                    console.print(f'[{st}]━━ {agent} ━━[/{st}]')
-                    pending = _poll(show_thinking_status=use_live and live is None)
-                    continue
-                if et == 'non_llm':
-                    _stop_live()
-                    _print_assistant_output(console, ev['output'])
-                    return
-                if et == 'tool_phase':
-                    _stop_live()
-                    label = ', '.join(ev['tools'])
-                    console.print(f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]')
-                    pending = _poll(show_thinking_status=use_live and live is None)
-                    continue
-                if et == 'api_tool_op':
-                    _stop_live()
-                    buffer = ''
-                    console.print(build_api_tool_op_renderable(ev))
-                    console.print()
-                    tool_name = str(ev.get('tool_name', 'tool'))
-                    # 下一次 next(gen) 会在 llm_client 内同步执行工具；用 Status 覆盖等待期
-                    with console.status(
-                        tool_execution_status_message(tool_name),
-                        spinner='dots12',
-                        spinner_style='cyan',
-                    ):
-                        pending = _poll(show_thinking_status=False)
-                    continue
-                if et == 'text_delta':
-                    piece = ev['text']
-                    buffer += piece
-                    if use_live:
-                        if live is None:
-                            # transient=True：停止 Live 时清屏，避免滚动回看时多帧残影叠在 scrollback
-                            live = Live(
-                                console=console,
-                                refresh_per_second=12,
-                                transient=True,
-                                vertical_overflow='visible',
-                                get_renderable=_live_renderable,
-                            )
-                            live.start()
-                        else:
-                            try:
-                                live.refresh()
-                            except BaseException:
-                                pass
-                    pending = _poll(show_thinking_status=False)
-                    continue
-                if et == 'finished':
-                    _stop_live()
-                    out = ev.get('output', '')
-                    if buffer.strip():
-                        _print_assistant_output(console, buffer)
-                    elif isinstance(out, str) and out.strip():
-                        _print_assistant_output(console, out)
-                    _print_turn_usage_cost_line(console, ev)
-                    return
-
+            if et == 'blocked':
+                _stop_live()
+                _print_assistant_output(console, ev['output'])
+                return
+            if et == 'llm_error':
+                _stop_live()
+                _print_assistant_error(console, ev['output'])
+                return
+            if et == 'team_agent':
+                _stop_live()
+                agent = str(ev.get('agent', 'Agent'))
+                styles = {
+                    'Planner': 'bold cyan',
+                    'Coder': 'bold green',
+                    'Reviewer': 'bold yellow',
+                }
+                st = styles.get(agent, 'bold white')
+                console.print(f'[{st}]━━ {agent} ━━[/{st}]')
                 pending = _poll(show_thinking_status=use_live and live is None)
-        except KeyboardInterrupt:
-            _safe_close_generator(gen)
-            _print_graceful_interrupt(console, use_rich=True)
-        finally:
-            _stop_live()
-            _repl_terminal_soft_reset(console)
+                continue
+            if et == 'non_llm':
+                _stop_live()
+                _print_assistant_output(console, ev['output'])
+                return
+            if et == 'tool_phase':
+                _stop_live()
+                label = ', '.join(ev['tools'])
+                console.print(f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]')
+                pending = _poll(show_thinking_status=use_live and live is None)
+                continue
+            if et == 'api_tool_op':
+                _stop_live()
+                buffer = ''
+                console.print(build_api_tool_op_renderable(ev))
+                console.print()
+                tool_name = str(ev.get('tool_name', 'tool'))
+                # 下一次 next(gen) 会在 llm_client 内同步执行工具；用 Status 覆盖等待期
+                with console.status(
+                    tool_execution_status_message(tool_name),
+                    spinner='dots12',
+                    spinner_style='cyan',
+                ):
+                    pending = _poll(show_thinking_status=False)
+                continue
+            if et == 'text_delta':
+                piece = ev['text']
+                buffer += piece
+                if use_live:
+                    md = streaming_markdown_for_live(buffer)
+                    if live is None:
+                        live = Live(
+                            md,
+                            console=console,
+                            refresh_per_second=15,
+                            transient=True,
+                        )
+                        live.start()
+                    else:
+                        try:
+                            live.update(md)
+                        except BaseException:
+                            pass
+                pending = _poll(show_thinking_status=False)
+                continue
+            if et == 'finished':
+                _stop_live()
+                out = ev.get('output', '')
+                if buffer.strip():
+                    _print_assistant_output(console, buffer)
+                elif isinstance(out, str) and out.strip():
+                    _print_assistant_output(console, out)
+                _print_turn_usage_cost_line(console, ev)
+                return
+
+            pending = _poll(show_thinking_status=use_live and live is None)
+    except KeyboardInterrupt:
+        _safe_close_generator(gen)
+        _print_graceful_interrupt(console, use_rich=True)
+    finally:
+        _stop_live()
+        _repl_terminal_soft_reset(console)
 
 
 def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int:
@@ -786,7 +743,7 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
             _try_persist_repl_session(engine)
 
     _ensure_stdio_utf8()
-    console = Console()
+    console = Console(force_terminal=True, color_system='truecolor')
     print_repl_llm_driver_banner(console=console)
     console.print(
         '[dim]大模型 REPL；exit / quit 退出；Ctrl+C 中断当前生成（保留已输出，REPL 不退出）。[/dim]'

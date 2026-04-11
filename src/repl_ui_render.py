@@ -1,6 +1,9 @@
 """
 REPL 纯展示层：工具调用面板、语法高亮、流式 Markdown 包装。
 不修改事件结构、不触碰工具执行逻辑。
+
+``ScreamMarkdown``：内联代码圆角感 + 大块 ``Syntax``；流式 ``Live`` 仅用裸 Markdown；
+助手回合定稿用 :func:`final_assistant_markdown_panel`（靛紫 ``Panel``）。工具事件等仍用 ``Panel``。
 """
 
 from __future__ import annotations
@@ -8,6 +11,121 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+
+import rich.markdown as _rich_markdown_mod
+from rich.markdown import CodeBlock, Markdown
+from rich.syntax import Syntax
+from rich.text import Text
+
+# TUI / 助手 Markdown 品牌与代码区（与 tui_app 靛紫系一致）
+_BRAND_BORDER_HEX = '#4F46E5'
+_INLINE_CODE_BG = '#2D2D39'
+_INLINE_CODE_FG = '#A5B4FC'
+_CODE_PANEL_BG = '#09090B'
+
+_StockMarkdownContext = _rich_markdown_mod.MarkdownContext
+
+
+def wrap_syntax_in_styled_panel(syntax: Syntax, lexer_name: str) -> Any:
+    """
+    将 ``Syntax`` 包进圆角 ``Panel``：极深底、靛紫边框、左上角语言标题（大写）。
+    """
+    from rich import box
+    from rich.panel import Panel
+
+    label = (lexer_name or 'text').strip().upper() or 'TEXT'
+    title = f'[bold {_BRAND_BORDER_HEX}]{label}[/bold {_BRAND_BORDER_HEX}]'
+    return Panel(
+        syntax,
+        title=title,
+        title_align='left',
+        border_style=_BRAND_BORDER_HEX,
+        box=box.ROUNDED,
+        style=f'on {_CODE_PANEL_BG}',
+        padding=(0, 1),
+        expand=True,
+    )
+
+
+class ScreamCodeBlock(CodeBlock):
+    """围栏代码块：``Syntax`` + ``wrap_syntax_in_styled_panel``。"""
+
+    def __rich_console__(self, console: Any, options: Any):
+        code = str(self.text).rstrip()
+        syntax = Syntax(
+            code,
+            self.lexer_name,
+            theme=self.theme,
+            word_wrap=True,
+            padding=(0, 1),
+            background_color=_CODE_PANEL_BG,
+        )
+        yield wrap_syntax_in_styled_panel(syntax, self.lexer_name)
+
+
+class ScreamMarkdownContext(_StockMarkdownContext):
+    """
+    内联 ``code_inline``：深紫灰底 + 淡紫字，两侧用 box 字符做微型「圆角」感。
+    """
+
+    def on_text(self, text: str, node_type: str) -> None:
+        if node_type == 'code_inline':
+            corner = f'bold {_BRAND_BORDER_HEX} on {_INLINE_CODE_BG}'
+            if self._syntax is not None:
+                highlight_text = self._syntax.highlight(text)
+                highlight_text.rstrip()
+                boxed = Text.assemble(
+                    Text('╭ ', style=corner),
+                    highlight_text,
+                    Text(' ╮', style=corner),
+                )
+                self.stack.top.on_text(self, boxed)
+                return
+            boxed = Text.assemble(
+                Text('╭ ', style=corner),
+                Text(text, style=f'on {_INLINE_CODE_BG} {_INLINE_CODE_FG}'),
+                Text(' ╮', style=corner),
+            )
+            self.stack.top.on_text(self, boxed)
+            return
+        super().on_text(text, node_type)
+
+
+_SCREAM_MD_DEPTH = 0
+
+
+class ScreamMarkdown(Markdown):
+    """
+    使用 ``ScreamMarkdownContext`` 与 ``ScreamCodeBlock``；嵌套渲染时重入安全地切换 Context。
+    """
+
+    elements = {
+        **Markdown.elements,
+        'fence': ScreamCodeBlock,
+        'code_block': ScreamCodeBlock,
+    }
+
+    def __init__(
+        self,
+        markup: str,
+        code_theme: str = 'monokai',
+        **kwargs: Any,
+    ) -> None:
+        # 默认关闭内联 Pygments，便于统一「药丸」底色与淡紫字；需要时可显式传入 lexer
+        kwargs.setdefault('inline_code_lexer', None)
+        super().__init__(markup, code_theme, **kwargs)
+
+    def __rich_console__(self, console: Any, options: Any):
+        global _SCREAM_MD_DEPTH
+        if _SCREAM_MD_DEPTH == 0:
+            _rich_markdown_mod.MarkdownContext = ScreamMarkdownContext
+        _SCREAM_MD_DEPTH += 1
+        try:
+            yield from Markdown.__rich_console__(self, console, options)
+        finally:
+            _SCREAM_MD_DEPTH -= 1
+            if _SCREAM_MD_DEPTH == 0:
+                _rich_markdown_mod.MarkdownContext = _StockMarkdownContext
 
 
 def build_token_warning_panel(current_tokens: int, threshold: int) -> Any:
@@ -61,6 +179,26 @@ def assistant_panel(inner: Any) -> Any:
         inner,
         title=assistant_panel_title(),
         border_style='cyan',
+        box=box.ROUNDED,
+        expand=True,
+        padding=(1, 2),
+    )
+
+
+def final_assistant_markdown_panel(markdown: str) -> Any:
+    """
+    Live（``transient=True``）停止后写入 scrollback 的**唯一**定稿：靛紫圆角卡片，不经过
+    ``assistant_panel`` monkeypatch，样式固定以免与流式阶段混淆。
+    调用方须保证 ``markdown.strip()`` 非空。
+    """
+    from rich import box
+    from rich.panel import Panel
+
+    stripped = (markdown or '').strip()
+    return Panel(
+        ScreamMarkdown(stripped, code_theme='monokai'),
+        title='◆ ASSISTANT',
+        border_style='#4F46E5',
         box=box.ROUNDED,
         expand=True,
         padding=(1, 2),
@@ -121,7 +259,6 @@ def build_api_tool_op_renderable(ev: dict[str, Any]) -> Any:
     仅消费 ev 中已有字段：tool_name, arguments。
     """
     from rich import box
-    from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.syntax import Syntax
     from rich.text import Text
@@ -202,7 +339,7 @@ def build_api_tool_op_renderable(ev: dict[str, Any]) -> Any:
         )
 
     if name in _SKILL_TOOLS:
-        inner = Markdown(
+        inner = ScreamMarkdown(
             f'```json\n{_truncate(raw_args, max_len=6000)}\n```',
             code_theme='monokai',
         )
@@ -238,7 +375,7 @@ def build_api_tool_op_renderable(ev: dict[str, Any]) -> Any:
             expand=True,
         )
 
-    inner = Markdown(
+    inner = ScreamMarkdown(
         f'**工具** `{name}`\n\n```json\n{_truncate(raw_args, max_len=12000)}\n```',
         code_theme='monokai',
     )
@@ -252,24 +389,15 @@ def build_api_tool_op_renderable(ev: dict[str, Any]) -> Any:
     )
 
 
-def thinking_status_markup(elapsed_s: float) -> str:
-    """阻塞等待下一事件时 Rich Status 的 Markup 文案（由展示层定时刷新）。"""
-    return f'[cyan]🧠 大模型深度思考中... (已等待: {elapsed_s:.1f}s)[/cyan]'
-
-
 # Live 内全量 Markdown 重排过频时易 CPU 顶满；超长缓冲也提高解析失败概率
 _STREAMING_MARKDOWN_SOFT_CAP = 600_000
 
 
-def streaming_markdown_panel_with_wait_footer(
-    buffer: str, wait_elapsed_s: float | None
-) -> Any:
+def streaming_markdown_for_live(buffer: str) -> Any:
     """
-    Live 流式面板；``wait_elapsed_s`` 非空时在底部显示等待计时（主线程无 next() 阻塞时刷新）。
-    渲染失败时降级为纯文本，避免未捕获异常打断 REPL（无法防御终端层原生崩溃）。
+    **仅**供 ``rich.Live`` 使用：裸 ``ScreamMarkdown``，禁止 ``Panel``。
+    定稿请用 :func:`final_assistant_markdown_panel`。
     """
-    from rich.console import Group
-    from rich.markdown import Markdown
     from rich.text import Text
 
     buf = buffer or ''
@@ -277,25 +405,12 @@ def streaming_markdown_panel_with_wait_footer(
         buf = buf[: _STREAMING_MARKDOWN_SOFT_CAP - 120] + '\n\n…(流式缓冲过长，Live 内仅展示前段；完整内容在回合结束后可见)…\n'
 
     try:
-        panel = assistant_panel(
-            Markdown(buf, code_theme='monokai', inline_code_lexer='python')
-        )
+        return ScreamMarkdown(buf, code_theme='monokai')
     except Exception as exc:
-        panel = assistant_panel(
-            Text(
-                f'[dim]Markdown 渲染跳过（{type(exc).__name__}），已缓冲 {len(buffer or "")} 字符。[/dim]',
-                overflow='ignore',
-            )
+        return Text(
+            f'[dim]Markdown 渲染跳过（{type(exc).__name__}），已缓冲 {len(buffer or "")} 字符。[/dim]',
+            overflow='ignore',
         )
-    if wait_elapsed_s is None:
-        return panel
-    try:
-        footer = Text.from_markup(
-            f'[dim cyan]⏳ 等待模型响应… {wait_elapsed_s:.1f}s[/dim cyan]'
-        )
-    except Exception:
-        footer = Text(f'⏳ 等待模型响应… {wait_elapsed_s:.1f}s', style='dim cyan')
-    return Group(panel, footer)
 
 
 def tool_execution_status_message(tool_name: str) -> str:
@@ -310,9 +425,5 @@ def tool_execution_status_message(tool_name: str) -> str:
 
 
 def streaming_markdown_panel(buffer: str) -> Any:
-    """流式阶段 Live 用的整页渲染（与定稿面板风格一致）。"""
-    from rich.markdown import Markdown
-
-    return assistant_panel(
-        Markdown(buffer, code_theme='monokai', inline_code_lexer='python')
-    )
+    """兼容旧名：同 :func:`streaming_markdown_for_live`。"""
+    return streaming_markdown_for_live(buffer)
