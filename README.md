@@ -1,6 +1,8 @@
 # 尖叫 Code（Scream Code）
 
 终端里的中文 AI 编程助手。
+<img width="845" height="429" alt="image" src="https://github.com/user-attachments/assets/61e95b9f-b3aa-44ac-8682-25734b182f38" />
+
 
 ## 下载
 
