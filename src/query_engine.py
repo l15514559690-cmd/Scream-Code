@@ -17,12 +17,12 @@ from .transcript import TranscriptStore
 
 @dataclass(frozen=True)
 class QueryEngineConfig:
-    #: 用户轮次硬上限（1.0 默认 100；与工具闭环上限分轨，见 ``llm_client.agent_tool_iteration_cap``）
-    max_turns: int = 100
-    #: 累计 token 预算（默认 3M；产品线长上下文底线 ≥2M，勿与上游 stub 的 2k 级默认对齐）
-    max_budget_tokens: int = 3_000_000
+    #: 用户轮次硬上限（与工具闭环上限分轨，见 ``llm_client.agent_tool_iteration_cap``）
+    max_turns: int = 400
+    #: 累计 token 预算（默认 12M；长上下文扩容后与修剪阈值配套）
+    max_budget_tokens: int = 12_000_000
     #: 仅当 ``mutable_messages`` 条数超过此值时才做滑动裁剪；贴近 ``max_turns`` 以尽量保留原文
-    compact_after_turns: int = 99
+    compact_after_turns: int = 396
     structured_output: bool = False
     structured_retry_limit: int = 2
     #: 为 True 时通过 OpenAI SDK 兼容接口请求大模型（须配置 API_KEY）；默认关闭以保持离线测试稳定。
@@ -115,7 +115,7 @@ class QueryEnginePort:
     def _shrink_llm_conversation_if_huge(self) -> None:
         """内存侧防止 ``llm_conversation_messages`` 无限增长；发往模型前仍会经 ``prune_historical_messages``。"""
         msgs = self.llm_conversation_messages
-        max_keep = 800
+        max_keep = 3200
         if len(msgs) <= max_keep:
             return
         head_end = 0

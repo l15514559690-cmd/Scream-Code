@@ -3,7 +3,7 @@
 
 尖叫 Code 产品参数（勿用上游 claw-code Python stub 的保守默认覆盖本模块常量）：
 
-- 与 ``QueryEngineConfig.max_turns``（默认 100）及 ``max_budget_tokens``（默认 3_000_000，不低于 2_000_000
+- 与 ``QueryEngineConfig.max_turns``（默认 400）及 ``max_budget_tokens``（默认 12_000_000，不低于 8_000_000
   的长上下文底线）配套；折叠只减轻中间段**极长** tool 文本，触顶仍由引擎 token 预算与模型窗口兜底。
 - ``_TAIL_PRESERVE_COUNT`` / ``_TOOL_FOLD_THRESHOLD_CHARS`` 等为刻意放宽的熔断阈值，合并上游时须保留。
 """
@@ -15,11 +15,11 @@ import json
 from typing import Any
 
 # 仅压缩「中间段」里超过此长度的 tool 内容（字符数按统一文本化后计量；提高阈值以减少误折叠）
-_TOOL_FOLD_THRESHOLD_CHARS = 8_000
+_TOOL_FOLD_THRESHOLD_CHARS = 32_000
 # 折叠后展示的前缀长度
-_TOOL_FOLD_PREVIEW_CHARS = 600
+_TOOL_FOLD_PREVIEW_CHARS = 2400
 # 尾部原样保留的消息条数（不含头部 system 段）
-_TAIL_PRESERVE_COUNT = 64
+_TAIL_PRESERVE_COUNT = 256
 
 
 def _content_as_text(content: Any) -> str:
@@ -56,7 +56,7 @@ def prune_historical_messages(messages: list[dict[str, Any]]) -> list[dict[str, 
     对即将发往模型的消息列表做**内存副本**修剪：
 
     - 头部：从索引 0 起连续 ``role == 'system'`` 的消息原样保留；
-    - 尾部：紧接在头部之后的子数组中，**最后** ``_TAIL_PRESERVE_COUNT`` 条原样保留；
+    - 尾部：紧接在头部之后的子数组中，**最后** ``_TAIL_PRESERVE_COUNT``（默认 256）条原样保留；
     - 中间：其余消息里，若 ``role == 'tool'`` 且内容文本化后长度超过阈值，则折叠为短前缀说明。
 
     若中间段为空（总消息过少），则返回深拷贝后的原列表（无折叠）。

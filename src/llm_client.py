@@ -32,7 +32,7 @@ _DEFAULT_AGENT_TOOL_ROUNDS = 100
 
 # 兼容旧文档/外部引用：与 :func:`agent_tool_iteration_cap` 默认一致
 MAX_AGENT_TOOL_ROUNDS = _DEFAULT_AGENT_TOOL_ROUNDS
-ANTHROPIC_STREAM_MAX_TOKENS = 16_384
+ANTHROPIC_STREAM_MAX_TOKENS = 65_536
 
 
 def agent_tool_iteration_cap() -> int | None:
@@ -519,7 +519,7 @@ def iter_agent_executor_events(
 
     - 按 ``api_protocol`` 流式调用 OpenAI 或 Anthropic；
     - 解析 ``tool_calls``，经 **SkillsRegistry**（与 ``tool-pool`` 展示的运行时工具面同源）执行并写回 ``messages``；
-    - 向外产出 ``text_delta`` / ``api_tool_op`` / ``llm_error``，以及终结事件 ``executor_complete``。
+    - 向外产出 ``text_delta`` / ``tool_delta`` / ``api_tool_op`` / ``llm_error``，以及终结事件 ``executor_complete``。
 
     不负责：会话 transcript、路由摘要、Rich 渲染。调用方须传入已构造好的 ``messages``（含 system/user）。
     """
@@ -564,6 +564,8 @@ def iter_agent_executor_events(
                 if part.text_delta:
                     round_buf.append(part.text_delta)
                     yield {'type': 'text_delta', 'text': part.text_delta}
+                if part.tool_arguments_fragment:
+                    yield {'type': 'tool_delta', 'fragment': part.tool_arguments_fragment}
                 acc.consume(part)
                 if part.finish_reason:
                     finish_reason = part.finish_reason

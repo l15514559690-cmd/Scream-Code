@@ -139,74 +139,80 @@ def _confirm_store_summary(console: Any | None) -> bool:
 
 
 def _print_help(console: Any | None) -> None:
-    sections: list[tuple[str, list[str]]] = [
-        (
-            '时光机与记忆',
-            [
-                '/summary — 项目与会话摘要；可确认后写入长效记忆（SCREAM.md / CLAUDE.md）',
-                '/memo [要点] — 带文字时直接追加到 SCREAM.md；不带参数时用模型从会话提取要点',
-                '/new — 硬重置：清空对话、新 session_id、重置计数与展示层缓存（较 /flush 更彻底）',
-                '/flush — 清空本轮对话、重置 token 累计并落盘新会话',
-                '/sessions — 扫描 .port_sessions 下列出历史会话',
-                '/load <id> — 恢复指定会话 id（原生 load-session）',
-                '/stop — 中断当前轮工具链（长 bash、后续 tool 调用会收到 [User Interrupted Task]）',
-            ],
-        ),
-        (
-            '系统体检',
-            [
-                '/audit — 原生 parity-audit（与 TS 归档一致性）',
-                '/report — 原生 setup-report（环境与启动体检）',
-            ],
-        ),
-        (
-            '深度引擎',
-            [
-                '/subsystems — 原生 subsystems（顶层 Python 子系统模块）',
-                '/graph — bootstrap-graph + command-graph 树状总览',
-            ],
-        ),
-        (
-            '日常利器',
-            [
-                '/doctor — Python/依赖/路径/权限快速体检（绿通过/红建议）',
-                '/cost — 本会话 Token 与粗略费用账单',
-                '/diff — 当前 Git 工作区改动（git diff --stat）',
-                '/status — 沙箱权限、工具数、模型、.claw.json、项目记忆',
-                '/config — 以高亮 JSON 格式查看当前大模型详细配置 (llm_config.json)',
-                '/skills — 以表格形式查看当前挂载的所有技能 (Skill) 与插件 (Plugin)',
-            ],
-        ),
-        (
-            '多代理团队',
-            [
-                '/team — 开关多代理编排（Planner→Coder→Reviewer）',
-                '$team <提示> — 仅本条以团队模式处理（不改变开关）',
-            ],
-        ),
+    core_rows: list[tuple[str, str]] = [
+        ('/help', '本菜单'),
+        ('/clear', '清屏（TUI 补全可用）'),
+        ('exit · quit · q', '结束 REPL（非斜杠，与 Hermes/常见 CLI 一致）'),
     ]
+    memory_rows: list[tuple[str, str]] = [
+        ('/summary', '项目与会话摘要；可确认后写入长效记忆'),
+        ('/memo [要点]', '写入或模型提取 SCREAM.md 要点'),
+        ('/new', '硬重置对话、session、计数与展示层缓存'),
+        ('/flush', '清空本轮对话并重置 token 累计、落盘新会话'),
+        ('/sessions', '列出 .port_sessions 历史会话'),
+        ('/load <id>', '恢复指定会话'),
+        ('/stop', '中断当前工具链（bash / 后续 tool 收到中断标记）'),
+    ]
+    system_rows: list[tuple[str, str]] = [
+        ('/config', '当前大模型与 API 配置 (JSON)'),
+        ('/skills', '已挂载技能与插件表'),
+        ('/graph', 'bootstrap + command 图谱总览'),
+        ('/subsystems', '顶层 Python 子系统模块'),
+        ('/audit', 'parity-audit 归档一致性'),
+        ('/report', 'setup-report 环境体检'),
+        ('/doctor', '依赖 / 路径 / 权限快检'),
+        ('/cost', '本会话 Token 与粗略费用'),
+        ('/diff', 'Git 工作区改动 (git diff --stat)'),
+        ('/status', '沙箱、工具、模型、.claw.json、项目记忆'),
+        ('/team', '多代理编排开关（Planner→Coder→Reviewer）'),
+        ('$team <提示>', '仅本条走团队模式'),
+    ]
+
     if console is not None:
+        from rich import box
         from rich.console import Group
-        from rich.panel import Panel
         from rich.table import Table
         from rich.text import Text
 
-        blocks: list[Any] = [Text.from_markup('[bold cyan]尖叫 Code · 原生能力（斜杠指令）[/bold cyan]')]
-        for title, lines in sections:
-            t = Table(show_header=False, box=None, padding=(0, 1))
+        def _help_block(title_markup: str, rows: list[tuple[str, str]]) -> Table:
+            t = Table(
+                show_header=False,
+                box=box.SIMPLE,
+                show_edge=False,
+                padding=(0, 1),
+                pad_edge=False,
+            )
             t.add_column('cmd', style='bold green', no_wrap=True)
             t.add_column('说明', style='dim')
-            for line in lines:
-                seg = line.split(' — ', 1)
-                t.add_row(seg[0], seg[1] if len(seg) > 1 else '')
-            blocks.append(Panel(t, title=title, border_style='blue'))
-        console.print(Panel(Group(*blocks), border_style='cyan', title='[bold]/help[/bold]'))
+            for cmd, desc in rows:
+                t.add_row(cmd, desc)
+            return t
+
+        blocks: list[Any] = [
+            Text.from_markup('[bold cyan]尖叫 Code · 斜杠指令[/bold cyan]'),
+            Text(''),
+            Text.from_markup('[bold cyan]核心功能 (Core)[/bold cyan]'),
+            _help_block('', core_rows),
+            Text(''),
+            Text.from_markup('[bold magenta]上下文与记忆 (Memory)[/bold magenta]'),
+            _help_block('', memory_rows),
+            Text(''),
+            Text.from_markup('[bold yellow]系统与扩展 (System)[/bold yellow]'),
+            _help_block('', system_rows),
+        ]
+        console.print(Group(*blocks))
+        console.print()
     else:
-        print('\n=== 尖叫 Code · 斜杠指令 (/help) ===')
-        for title, lines in sections:
-            print(f'\n【{title}】')
-            for ln in lines:
-                print(f'  {ln}')
+        print('\n=== 尖叫 Code · /help ===\n')
+        print('【核心功能 (Core)】')
+        for cmd, desc in core_rows:
+            print(f'  {cmd} — {desc}')
+        print('\n【上下文与记忆 (Memory)】')
+        for cmd, desc in memory_rows:
+            print(f'  {cmd} — {desc}')
+        print('\n【系统与扩展 (System)】')
+        for cmd, desc in system_rows:
+            print(f'  {cmd} — {desc}')
         print()
 
 
@@ -215,11 +221,11 @@ def _print_markdown_block(console: Any | None, md: str, *, title: str) -> None:
     if console is not None:
         from rich.panel import Panel
 
-        from .repl_ui_render import ScreamMarkdown
+        from .repl_ui_render import STREAMING_CODE_THEME, ScreamMarkdown
 
         console.print(
             Panel(
-                ScreamMarkdown(text, code_theme='monokai'),
+                ScreamMarkdown(text, code_theme=STREAMING_CODE_THEME),
                 title=title,
                 border_style='green',
             )

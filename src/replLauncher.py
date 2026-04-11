@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import sys
+import time
 from typing import Any
 
 from .agent_cancel import reset_agent_cancel
+
+# 引入活泼的 ASCII / 全角颜文字作为思考动画（与 _poll 内 Status.update 联动）
+KAWAII_FRAMES = [
+    '(>_<)',
+    '(^_^;)',
+    '(＠_＠;)',
+    '(T_T)',
+    '(-_-;)',
+    '(~_~;)',
+    '(*_*)',
+    '(°_o)',
+    '(•_•)',
+    '(@_@)',
+    '(╯°□°）╯',
+]
+_kawaii_cycle = itertools.cycle(KAWAII_FRAMES)
 
 # Slant 风格 ASCII（用户指定，勿改字符结构）
 _SLANT_LOGO_LINES = (
@@ -30,10 +48,10 @@ def _logo_plain() -> str:
 
 
 # 记忆水位（仅 REPL 展示层；不截断请求、不改写历史）
-REPL_MEMORY_WARN_TOTAL_TOKENS = 200_000
-REPL_MEMORY_WARN_USER_TURNS = 50
-REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA = 50_000
-REPL_MEMORY_WARN_REPEAT_TURN_DELTA = 10
+REPL_MEMORY_WARN_TOTAL_TOKENS = 800_000
+REPL_MEMORY_WARN_USER_TURNS = 200
+REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA = 200_000
+REPL_MEMORY_WARN_REPEAT_TURN_DELTA = 40
 # 兼容旧名：默认 token 阈值
 TOKEN_WARNING_THRESHOLD = REPL_MEMORY_WARN_TOTAL_TOKENS
 # session_id -> (上次预警时的累计 tokens, 上次预警时的用户轮次数)
@@ -122,73 +140,6 @@ def _safe_close_generator(gen: Any) -> None:
         gen.close()
     except BaseException:
         pass
-
-
-def _repl_poll_next_event(
-    gen: Any,
-    console: Any,
-    *,
-    live: Any | None,
-    use_live: bool,
-    show_thinking_status: bool,
-    spin_interval: float = 0.1,
-) -> dict[str, Any] | None:
-    """
-    在独立线程中执行 ``next(gen)``，主线程以 ``spin_interval`` 轮询队列。
-    在首个 ``text_delta`` 之前（且将使用 Live 流式时），用 ``console.status`` 展示「深度思考中」；
-    收到事件后上下文结束，动画自动消失。
-    """
-    import queue
-    import threading
-    from contextlib import nullcontext
-
-    outq: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
-
-    def _worker() -> None:
-        try:
-            outq.put(('ok', next(gen)))
-        except StopIteration:
-            outq.put(('stop', None))
-        except BaseException as exc:
-            outq.put(('err', exc))
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-    status_ctx: Any = (
-        console.status(
-            '[bold cyan]🧠 大模型深度思考中...[/bold cyan]',
-            spinner='dots',
-        )
-        if (show_thinking_status and live is None and use_live)
-        else nullcontext()
-    )
-
-    try:
-        with status_ctx:
-            while True:
-                try:
-                    kind, payload = outq.get(timeout=spin_interval)
-                    break
-                except queue.Empty:
-                    continue
-
-        if kind == 'ok':
-            return payload  # type: ignore[no-any-return]
-        if kind == 'stop':
-            return None
-        if kind == 'err':
-            if isinstance(payload, GeneratorExit):
-                raise KeyboardInterrupt from None
-            raise payload
-        return None
-    except KeyboardInterrupt:
-        _safe_close_generator(gen)
-        try:
-            while True:
-                outq.get_nowait()
-        except queue.Empty:
-            pass
-        raise
 
 
 def _token_warning_threshold_for_engine(engine: Any) -> int:
@@ -531,18 +482,41 @@ def _run_streaming_turn(
 
     from .repl_ui_render import (
         build_api_tool_op_renderable,
+        print_cyber_turn_divider,
+        print_solidified_assistant_markdown,
         streaming_markdown_for_live,
         tool_execution_status_message,
+        tool_params_stream_collapsed_panel,
     )
 
-    use_live = bool(
-        getattr(console, 'is_terminal', False) and console.is_terminal
-    )
+    use_live = bool(getattr(console, 'is_terminal', False) and console.is_terminal)
     gen = engine.iter_repl_assistant_events_with_runtime(
         line, runtime=runtime, route_limit=route_limit, team=team
     )
+
+    import queue
+    import threading
+    from contextlib import nullcontext
+
+    outq: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=0)
+
+    def _worker() -> None:
+        try:
+            for ev in gen:
+                outq.put(('ok', ev))
+            outq.put(('stop', None))
+        except BaseException as exc:
+            outq.put(('err', exc))
+
+    threading.Thread(target=_worker, daemon=True).start()
+
     buffer = ''
+    tool_streaming_buffer = ''
     live: Any = None
+    round_saw_tool_json_stream = False
+
+    last_render_time = 0.0
+    RENDER_INTERVAL = 0.08  # 控制最大渲染帧率约 12-15 FPS
 
     def _stop_live() -> None:
         nonlocal live
@@ -553,19 +527,46 @@ def _run_streaming_turn(
                 pass
             live = None
 
-    def _poll(
-        *,
-        show_thinking_status: bool,
-    ) -> dict[str, Any] | None:
-        return _repl_poll_next_event(
-            gen,
-            console,
-            live=live,
-            use_live=use_live,
-            show_thinking_status=show_thinking_status,
-        )
+    def _poll(*, show_thinking_status: bool) -> dict[str, Any] | None:
+        status_obj: Any = None
+        if show_thinking_status and live is None and use_live:
+            status_obj = console.status(
+                f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]',
+                spinner='point',
+            )
+            status_ctx: Any = status_obj
+        else:
+            status_ctx = nullcontext()
+
+        with status_ctx:
+            last_status_anim = time.time()
+            while True:
+                if (
+                    status_obj is not None
+                    and use_live
+                    and (time.time() - last_status_anim > 0.3)
+                ):
+                    status_obj.update(
+                        f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]'
+                    )
+                    last_status_anim = time.time()
+
+                try:
+                    kind, payload = outq.get(timeout=0.1)
+                    if kind == 'ok':
+                        return payload
+                    if kind == 'stop':
+                        return None
+                    if kind == 'err':
+                        if isinstance(payload, GeneratorExit):
+                            raise KeyboardInterrupt from None
+                        raise payload
+                except queue.Empty:
+                    continue
 
     try:
+        if use_live:
+            print_cyber_turn_divider(console)
         pending: dict[str, Any] | None = _poll(
             show_thinking_status=use_live and live is None,
         )
@@ -606,7 +607,10 @@ def _run_streaming_turn(
                 continue
             if et == 'api_tool_op':
                 _stop_live()
+                if buffer.strip():
+                    _print_assistant_output(console, buffer)
                 buffer = ''
+                tool_streaming_buffer = ''
                 console.print(build_api_tool_op_renderable(ev))
                 console.print()
                 tool_name = str(ev.get('tool_name', 'tool'))
@@ -618,38 +622,96 @@ def _run_streaming_turn(
                 ):
                     pending = _poll(show_thinking_status=False)
                 continue
-            if et == 'text_delta':
-                piece = ev['text']
-                buffer += piece
-                if use_live:
-                    md = streaming_markdown_for_live(buffer)
-                    if live is None:
-                        live = Live(
-                            md,
-                            console=console,
-                            refresh_per_second=15,
-                            transient=True,
-                        )
-                        live.start()
-                    else:
-                        try:
-                            live.update(md)
-                        except BaseException:
-                            pass
+            if et in ('text_delta', 'tool_delta'):
+                if et == 'text_delta':
+                    buffer += ev.get('text', '')
+                else:
+                    tool_streaming_buffer += ev.get('fragment', '')
+                    round_saw_tool_json_stream = True
+
+                # 极限合并：一次性排空队列里所有立即可用的流事件
+                while not outq.empty():
+                    try:
+                        kind, payload = outq.queue[0]
+                        if kind == 'ok' and payload.get('type') in ('text_delta', 'tool_delta'):
+                            outq.get_nowait()
+                            if payload['type'] == 'text_delta':
+                                buffer += payload.get('text', '')
+                            else:
+                                tool_streaming_buffer += payload.get('fragment', '')
+                                round_saw_tool_json_stream = True
+                        else:
+                            break
+                    except Exception:
+                        break
+
+                # O(N^2) 渲染节流阀：限制 Markdown 解析的 CPU 开销
+                now = time.time()
+                if now - last_render_time >= RENDER_INTERVAL or outq.empty():
+                    if use_live:
+                        display_text = buffer
+                        if tool_streaming_buffer:
+                            tool_lines = tool_streaming_buffer.splitlines()
+                            # 🛡️ 开启“矩阵滚动视窗”：如果 JSON 超过 15 行，只截取最后 15 行，防止撑爆屏幕高度导致历史记录污染
+                            if len(tool_lines) > 15:
+                                rolling_tool = '...\n' + '\n'.join(tool_lines[-15:])
+                            else:
+                                rolling_tool = tool_streaming_buffer
+                            display_text += (
+                                '\n\n> ⚙️ **正在编写代码与工具参数...**\n```json\n'
+                                f'{rolling_tool}\n```'
+                            )
+                        md = streaming_markdown_for_live(display_text)
+                        if live is None:
+                            live = Live(
+                                md,
+                                console=console,
+                                refresh_per_second=8,
+                                transient=True,
+                                vertical_overflow='ellipsis',
+                            )
+                            live.start()
+                        else:
+                            try:
+                                live.update(md)
+                            except BaseException:
+                                pass
+                    last_render_time = now
+
                 pending = _poll(show_thinking_status=False)
                 continue
             if et == 'finished':
                 _stop_live()
                 out = ev.get('output', '')
+                show_tool_collapse = round_saw_tool_json_stream or bool(
+                    tool_streaming_buffer.strip()
+                )
+                body = ''
                 if buffer.strip():
-                    _print_assistant_output(console, buffer)
+                    body = buffer.strip()
                 elif isinstance(out, str) and out.strip():
-                    _print_assistant_output(console, out)
+                    body = out.strip()
+                if body:
+                    print_solidified_assistant_markdown(console, body)
+                if show_tool_collapse:
+                    console.print(
+                        tool_params_stream_collapsed_panel(
+                            tool_streaming_buffer.strip() or None
+                        )
+                    )
+                if body or show_tool_collapse:
+                    console.print()
+                print_cyber_turn_divider(console)
                 return
 
             pending = _poll(show_thinking_status=use_live and live is None)
     except KeyboardInterrupt:
         _safe_close_generator(gen)
+        try:
+            while True:
+                outq.get_nowait()
+        except queue.Empty:
+            pass
         _print_graceful_interrupt(console, use_rich=True)
     finally:
         _stop_live()
@@ -741,7 +803,7 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
 
     while True:
         console.print()
-        console.print(Rule(style='dim'))
+        console.print(Rule(style='dim #334155'))
         console.print()
         line = _repl_read_line(
             pt_session=pt_session,

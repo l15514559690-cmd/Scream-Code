@@ -6,7 +6,7 @@ from pathlib import Path
 
 # 按优先级依次尝试（仅使用 Path.cwd() 下首个可读且非空白的文件）
 PROJECT_MEMORY_FILENAMES: tuple[str, ...] = ('SCREAM.md', 'CLAUDE.md', '.cursorrules')
-MAX_INJECT_CHARS = 80_000
+MAX_INJECT_CHARS = 320_000
 
 
 def project_memory_workspace_root() -> Path:
