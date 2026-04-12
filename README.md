@@ -1,146 +1,116 @@
-# 尖叫 Code · Scream-Code
 
-> **极其锋利、纯本地优先、高扩展性的 AI 编程终端。**  
-> 把大模型、工具链、记忆与视觉塞进同一条 REPL —— 像黑客电影里的控制台，但是真的能写代码。
+# 🚀 Scream-Code (尖叫Agent终端)
 
-<img width="845" height="429" alt="Scream-Code REPL" src="https://github.com/user-attachments/assets/61e95b9f-b3aa-44ac-8682-25734b182f38" />
+> **“让 AI 走出网页聊天框，真正接管你的本地生产力。”**
 
----
-
-## 四大核心引擎（The Four Pillars）
-
-四次架构演进，对应四类「基础设施级」能力 —— 不是插件堆砌，而是**可组合的运行时**。
-
-### 🔌 插件化技能树 · Skill Registry
-
-- **是什么**：基于 `BaseSkill` 的斜杠指令系统；`SkillsRegistry` 扫描 `src/skills/*.py` 与 **`~/.scream/skills/*.py`**，运行时装配，与 LLM 工具注册表正交。
-- **解决的痛点**：硬编码菜单、发版才能加指令、团队私有能力与上游冲突。
-- **价值**：**解耦**业务逻辑与 REPL 路由；用户目录技能可 **override** 包内同名技能；`/help` 与 **prompt_toolkit 补全** 均从注册表 **动态生成**。
-
-### 🛡️ 安全沙箱 · Docker Sandbox
-
-- **是什么**：`/sandbox on` 将 `execute_mac_bash` 等终端执行隔离到 **Docker** 容器（工作区挂载为 `/workspace`）。
-- **解决的痛点**：模型误删宿主文件、危险管道与包管理器命令。
-- **价值**：一键切换 **宿主 / 容器** 执行面；配合权限与越狱策略，形成纵深防御。
-
-### 🧠 长期项目记忆 · Core Memory
-
-- **双轨制**：
-  1. **项目文件**：`update_project_memory` 写入工作区 **`SCREAM.md`**（Markdown 叙事记忆）。
-  2. **结构化 SQLite**：`memorize_project_rule` / `forget_project_rule` 维护本机 **键值规则库**，注入系统提示词 —— 模型的「潜意识」。
-- **REPL 面**：`/memory list` · `set <key> <content>` · `drop <key>` 直接运维该库；`/memo`、`/summary` 负责会话级沉淀。
-- **价值**：跨会话、跨项目根目录切换时仍能保持 **可审计、可版本化** 的长期约束。
-
-### 👁️ 浏览器视觉 · Playwright Vision
-
-- **是什么**：`/look <url> [说明…]` —— **Playwright Chromium** 无头整页截图，**OpenAI/Anthropic 多模态** 注入当前对话，并可 **自动触发** 后续模型轮次做 UI 诊断。
-- **解决的痛点**：「帮我看页面为啥歪了」只能口述、无法像素级对齐。
-- **价值**：**首次调用懒安装**：缺失 `playwright` 或 Chromium 内核时，用当前 `sys.executable` 自动 `pip install` + `playwright install chromium`，Rich **status** 反馈进度；失败时深色 **Fatal Panel** 兜底。
+**Scream-Code** 是一款专为极客、开发者和高效办公族打造的**纯本地、全能力 AI Agent 终端**。它不仅能通过文字回答问题，更拥有“手”（执行代码）、“眼”（网页视觉）和“脑”（长期记忆）。
 
 ---
 
-## 指令速查手册（Cheatsheet）
+## 🛠️ 第一步：保姆级一键安装指南 (The Magic Install)
 
-> 输入 **`/`** 触发补全；**完整分组列表以 REPL 内 `/help` 为准**。下表为高频核心指令。
+我们为所有用户（无论是小白还是大牛）准备了极其简单的安装流程，只需 3 分钟，即可完成部署。
 
-| 指令 | 用法摘要 |
-|------|-----------|
-| `/help` | 分组展示全部斜杠技能与说明（别名 `/?` 仍可用，但不进补全菜单） |
-| `/team` | 群狼多智能体编排开关；也可用 **`$team <提示>`** 仅单条走团队模式 |
-| `/look` | **`/look <url> [说明]`** — 截图 + 多模态注入；例：`/look http://localhost:3000 按钮未居中` |
-| `/sandbox` | `on` / `off` / `status` — Docker 沙箱 |
-| `/memory` | `list` · **`set <key> <content>`** · **`drop <key>`** — SQLite 核心规则 |
-| `/diff` | `git status --short` + `git diff --stat` 摘要 |
-| `/memo` | 无参：模型提炼写入记忆；有参：直接写入 `SCREAM.md` 块 |
-| `/summary` | 会话/工作区摘要，可选写入长效记忆 |
-| `/new` | 硬重置会话（新 `session_id`、清空对话与计数） |
-| `/flush` | 轻量清空本轮与 token 累计 |
-| `/sessions` | 列出 `.port_sessions` 历史 |
-| `/load <id>` | 恢复指定会话 |
-| `/stop` | 中断当前生成与工具链 |
-| `/cost` | 本会话 Token / 粗略费用 |
-| `/doctor` | 依赖、路径、权限快检 |
-| `/status` | 模型、沙箱、工具、`.claw.json`、记忆路径等 |
-| `/config` | 打印当前 LLM 配置（JSON） |
-| `/skills` | 命令图谱中的 Skill / Plugin 一览 |
-| `/audit` `/report` | 归档一致性 / 环境体检 |
-| `/subsystems` `/graph` | 子系统模块 / 引导关系图 |
-| `/clear` | 清屏（TUI 补全桥接） |
+### 1. 环境准备 (只需一次)
+在开始之前，请确保你的 Mac 或 Linux 电脑上安装了：
+* **Python 3.10+** (必选)
+* **Git** (必选，用于下载代码)
+* **Docker** (可选，若需开启“绝对安全沙箱”功能则必装)
 
----
-
-## 进阶极客玩法
-
-### 在 `~/.scream/skills/` 挂载自定义技能
-
-1. 确保目录存在：`mkdir -p ~/.scream/skills`
-2. 新建任意 `*.py`，定义 **`BaseSkill` 子类**（与包内技能相同契约：`name` / `description` / `category` / `execute` → `SkillOutcome`）。
-3. **重启 REPL** 后注册表会加载用户目录（同名技能 **覆盖** 包内默认）。
-
-极简示例（需与 `scream` 使用 **同一 Python 环境**，且能 `import src`）：
-
-```python
-# ~/.scream/skills/hello_skill.py
-from __future__ import annotations
-from typing import ClassVar
-
-from src.repl_slash_helpers import msg
-from src.skills.base_skill import BaseSkill, ReplSkillContext, SkillOutcome
-
-
-class HelloSkill(BaseSkill):
-    name: ClassVar[str] = 'hello'
-    description: ClassVar[str] = '打个招呼（示例技能）'
-    category: ClassVar[str] = 'system'
-
-    def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
-        msg(context.console, '👋 Scream-Code 自定义技能已加载。', style='cyan')
-        return SkillOutcome()
-```
-
-### Rich + prompt_toolkit：顺滑补全与「回车不提交」
-
-- **Rich** 负责流式 Markdown、Panel、token 水位与 `/look` 安装进度等 **深色极客风** UI。
-- **prompt_toolkit** 提供 **边输边补全**；补全菜单打开时，**Enter / Ctrl-M 仅确认补全并追加空格**，**不会**整行提交 —— 便于先选 `/look` 再输入 URL。
-- 无 `prompt_toolkit` 的降级路径仍使用纯 `input()`（无图形补全）。
-
----
-
-## 系统要求与依赖
-
-| 能力 | 依赖 | 说明 |
-|------|------|------|
-| **沙箱** | **Docker** 已安装且可拉取配置镜像 | `/sandbox on` 时生效；离线环境请保持 `off` |
-| **视觉** | **Playwright + Chromium** | 首次 `/look` 可 **自动** `pip install playwright` 与 `playwright install chromium`（需网络）；亦可手动预装 |
-| **大模型** | API Key / Base URL（`.env` 或配置） | 支持 OpenAI 兼容与 Anthropic 协议（见 `llm_config.json`） |
-
----
-
-## 快速开始
-
-**下载**：克隆本仓库或下载 ZIP 解压。
-
-**安装**（在项目根目录）：
+### 2. 下载并执行“一键部署脚本”
+打开你的终端（Terminal），依次输入以下三行命令：
 
 ```bash
+# 1. 下载代码库
+git clone https://github.com/LIUTod/Scream-Code.git
+
+# 2. 进入项目文件夹
+cd Scream-Code
+
+# 3. 运行全自动安装脚本
 bash install.sh
 ```
 
-**配置**：
+**☕ 这时脚本会自动完成以下动作：**
+* 🔍 **环境体检**：自动检查 Python 和 Pip 是否就绪。
+* 📦 **无污染安装**：创建一个隐藏的虚拟环境 (`.venv`)，绝不弄乱你电脑原本的 Python。
+* 👁️ **视觉内核下载**：静默下载 Playwright 浏览器引擎（AI 的眼睛）。
+* 📂 **私人空间创建**：在你的家目录生成 `~/.scream` 文件夹，用于存放你的 API 密钥和私人记忆。
 
-```bash
-cp .env.example .env
-# 编辑 .env 填入密钥与模型地址
-```
-
-**启动**（按安装脚本提示 `source` 对应 shell 配置后）：
-
-```bash
-scream
-```
-
-交互式修改模型也可使用 **`scream-config`**。
+### 3. 首次配置与唤醒
+安装完成后，脚本会自动弹出**配置向导**：
+1. 按照提示输入你的 **API Key** (推荐 Claude 3.5 或 OpenAI 系列)。
+2. 配置完成后，直接输入 `scream` 即可起飞！
 
 ---
 
-> **安全提示**：请勿将真实密钥提交到公开仓库。本项目基于 Claude Code 类工作流思路演进，仅供学习与研究；生产环境请自行审计依赖与网络出站策略。
+## 🎮 核心指令与使用姿势 (How to Play)
+
+Scream-Code 的交互分为三个维度：**系统入口**、**超能力指令**和**人话任务**。
+
+### 维度一：系统控制台 (CLI)
+在任何文件夹下，你都可以直接通过系统命令调用：
+* `scream` —— **启动终端**。一秒进入沉浸式 AI 交互界面。
+* `scream config` —— **设置中心**。随时修改模型型号或更换 API Key。
+* `scream help` —— **极客说明书**。查看更多进阶启动参数。
+
+### 维度二：TUI 内置超能力 (斜杠指令)
+进入 `scream` 终端后，输入 **`/`** 即可触发自动补全菜单：
+
+| 指令 | 能力描述 | 💡 白话文示例 |
+| :--- | :--- | :--- |
+| `/look <网址>` | **视觉洞察** | “帮我看看 `https://apple.com` 最近有什么新产品？” (AI 会截图并分析) |
+| `/sandbox on/off`| **物理沙箱** | “穿上防弹衣跑代码。” 开启后，AI 执行的所有危险命令都在 Docker 容器内，绝不伤及主机。 |
+| `/team` | **群狼模式** | “我要打群架！” 召唤 Planner（规划师）和 Coder（程序员）多个 Agent 协作完成复杂大项目。 |
+| `/memory` | **记忆管理** | “看看你记住了我什么偏好。” 查看、删除或清理 AI 学习到的私人开发规矩。 |
+| `/diff` | **代码审计** | “帮我看看我刚才改了啥。” 自动对比 Git 变动，并为你写好 Commit 信息。 |
+| `/clear` | **净化思绪** | “我们换个话题。” 清空当前会话的短期上下文，释放内存。 |
+
+### 维度三：自然语言下达任务
+**除了斜杠指令，你完全可以用“人话”吩咐它：**
+* *“帮我把下载文件夹里所有的 PDF 文件按日期重命名。”*
+* *“在我当前目录下建一个 FastAPI 的 Demo，并写好 Dockerfile。”*
+* *“以后你写代码时，必须使用 Google 的缩进规范，帮我记住这条。”* (它会自动永久保存进记忆库)
+
+---
+
+## 🌟 四大核心引擎：Scream-Code 为什么牛逼？
+
+1.  **🛡️ 绝对安全的 Docker 沙箱 (The Shield)**
+    AI 的代码执行能力是双刃剑。我们通过底层 `sandbox_env.py` 实现了一套镜像隔离系统。AI 在里面随便折腾，你的本地文件系统依然安全。
+2.  **👁️ 睁眼看世界的视觉引擎 (The Vision)**
+    基于 Playwright 深度定制。当 AI 遇到无法通过代码获取的网页信息时，它会主动通过视觉快照捕捉 DOM 结构和 UI 布局。
+3.  **🧠 越用越聪明的长期记忆 (The Brain)**
+    不同于普通的 Chat 机器人，我们内置了 SQLite 数据库。你的每一条反馈、每一个纠正，都会被转化为“潜意识”注入 System Prompt，实现真正的**个性化定制 AI**。
+4.  **⚡ 极速 TUI 交互 (The Interface)**
+    我们解决了终端渲染“抖动”的难题。通过 30fps 的流式缓冲和虚拟代码块闭合技术，让 AI 吐字像丝绸般顺滑，不再有屏幕狂闪的困扰。
+
+---
+
+## 👨‍💻 开发者进阶：定制你的专属 Skill
+
+你可以像堆乐高一样给 Scream-Code 加功能。只需在 `~/.scream/skills/` 目录下新建一个 Python 文件：
+
+```python
+from src.skills.base_skill import BaseSkill
+
+class MyCoolTool(BaseSkill):
+    name = "coffee"  # 指令词：/coffee
+    description = "帮我点一杯咖啡"
+    
+    def execute(self, flavor: str):
+        # 在这里写你的自动化逻辑
+        return f"已为你下单一杯 {flavor} 咖啡！"
+```
+
+**重启 `scream`，你的 AI 就瞬间进化了。**
+
+---
+
+## 📜 结语
+**Scream-Code** 不只是一个工具，它是你的**数字分身**。它在你的终端里静静待命，懂你的规矩，看你的屏幕，干你的苦活。
+
+*现在，可以尝试运行 `./install.sh`，感受本地 AI 的终极力量吧！*
+
+## ☀️ 关于
+**Scream-Code**  中的部分逻辑，参考了Claude、Claw、Hermes等Agent，并加以改进，强化了中文场景下的各类指令调用与工作流定制，本项目仅供学习参考，欢迎大家交流沟通
