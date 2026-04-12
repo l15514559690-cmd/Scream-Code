@@ -1,4 +1,4 @@
-# 🚀 Scream-Code (尖叫Agent终端)
+# 🚀 Scream-Code (尖叫Agent终端)v1,0
 
 <img width="1690" height="836" alt="image" src="https://github.com/user-attachments/assets/a8f5869d-e4cd-4de6-970a-67038894eff3" />
 
