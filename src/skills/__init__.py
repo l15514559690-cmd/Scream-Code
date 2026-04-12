@@ -1,14 +1,3 @@
-"""Python package placeholder for the archived `skills` subsystem."""
+"""REPL 斜杠技能模块目录；具体 ``BaseSkill`` 由 ``skills_registry`` 动态装载。"""
 
 from __future__ import annotations
-
-from src._archive_helper import load_archive_metadata
-
-_SNAPSHOT = load_archive_metadata("skills")
-
-ARCHIVE_NAME = _SNAPSHOT["archive_name"]
-MODULE_COUNT = _SNAPSHOT["module_count"]
-SAMPLE_FILES = tuple(_SNAPSHOT["sample_files"])
-PORTING_NOTE = f"Python placeholder package for '{ARCHIVE_NAME}' with {MODULE_COUNT} archived module references."
-
-__all__ = ["ARCHIVE_NAME", "MODULE_COUNT", "PORTING_NOTE", "SAMPLE_FILES"]

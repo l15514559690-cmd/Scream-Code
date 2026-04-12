@@ -4,7 +4,8 @@
 - **流式 + 代码高亮**：``_run_streaming_turn`` 中 ``Live`` 仅裸 ``ScreamMarkdown``（``transient=True``），
   定稿为固定靛紫 ``Panel``；首包前 ``console.status`` 思考动画；**不用** ``patch_stdout``。
 - **视觉**：靛紫品牌色、欢迎 Panel；协议/模式/模型与 Token 费用固定在 prompt **底部工具栏**，不污染 scrollback。
-- **斜杠补全**：输入 ``/`` 后弹出指令补全菜单（紫色选中项）。
+- **斜杠补全**：输入 ``/`` 后弹出指令补全菜单（紫色选中项；条目来自 ``skills_registry``）；
+  菜单打开时 **Enter** 仅确认补全并插入空格，不提交整行（见 ``repl_slash_helpers``）。
 - **PTY 断开**：主输入循环捕获 ``EOFError`` 后直接 ``sys.exit(0)``，不做复杂清理，避免死循环占满 CPU。
 """
 
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, ClassVar, Sequence
+from typing import Any
 
 # 品牌色（Tailwind Indigo / 紫系）
 _BRAND_HEX = '#4F46E5'
@@ -21,105 +22,12 @@ _BRAND_SOFT = '#A5B4FC'
 _ASSISTANT_SURFACE = '#161622'
 _USER_ACCENT = '#c4b5fd'
 
-# ---------------------------------------------------------------------------
-# 斜杠指令补全（prompt_toolkit 悬浮菜单）
-# ---------------------------------------------------------------------------
-
-SLASH_COMMANDS: tuple[str, ...] = (
-    '/team',
-    '/memo',
-    '/summary',
-    '/stop',
-    '/new',
-    '/flush',
-    '/help',
-    '/cost',
-    '/status',
-    '/diff',
-    '/sessions',
-    '/load',
-    '/doctor',
-    '/audit',
-    '/report',
-    '/subsystems',
-    '/graph',
-    '/config',
-    '/skills',
-    '/clear',
-)
-
-# 悬浮补全菜单右侧 meta（与 SLASH_COMMANDS 一一对应；缺键时回退默认文案）
-SLASH_COMMAND_META: dict[str, str] = {
-    '/team': '群狼模式 (多智能体协作)',
-    '/memo': '项目记忆 (查看/编辑文档)',
-    '/summary': '总结并压缩当前上下文',
-    '/stop': '中断当前模型生成',
-    '/new': '开启全新对话 (清空上下文)',
-    '/flush': '清理底层缓存与临时文件',
-    '/help': '查看所有指令帮助',
-    '/cost': '查看当前 Token 消耗与账单',
-    '/status': '沙箱、工具、模型与项目状态',
-    '/diff': 'Git 工作区改动一览',
-    '/sessions': '列出历史会话存档',
-    '/load': '恢复指定会话 id',
-    '/doctor': '依赖与路径快速体检',
-    '/audit': '归档与源码一致性审计',
-    '/report': '环境与启动体检报告',
-    '/subsystems': '顶层 Python 子系统模块',
-    '/graph': '命令与引导关系树状图',
-    '/config': '查看当前大模型与 API 配置 (JSON)',
-    '/skills': '查看当前挂载的扩展技能与插件',
-    '/clear': '清屏（原生桥接未实现时请用 /help）',
-}
-
-
-class SlashCommandCompleter:
-    """
-    当光标前文本从某处起以 ``/`` 为前缀时，按前缀过滤 ``SLASH_COMMANDS``。
-
-    实现 ``prompt_toolkit.completion.Completer`` 协议，供 ``ThreadedCompleter`` 包装。
-    """
-
-    commands: ClassVar[Sequence[str]] = SLASH_COMMANDS
-    meta: ClassVar[dict[str, str]] = SLASH_COMMAND_META
-
-    def get_completions(self, document: Any, complete_event: Any):
-        from prompt_toolkit.completion import Completion
-
-        text = document.text_before_cursor
-        slash = text.rfind('/')
-        if slash < 0:
-            return
-        fragment = text[slash:]
-        if not fragment.startswith('/'):
-            return
-        for cmd in self.commands:
-            if cmd.startswith(fragment):
-                yield Completion(
-                    cmd,
-                    start_position=-len(fragment),
-                    display_meta=self.meta.get(cmd, '斜杠指令'),
-                )
-
 
 def _prompt_toolkit_style() -> Any:
-    """补全菜单：选中行紫底白字。"""
-    from prompt_toolkit.styles import Style
+    """补全菜单：选中行紫底白字（与 ``repl_slash_helpers.prompt_toolkit_scream_slash_style`` 同源）。"""
+    from .repl_slash_helpers import prompt_toolkit_scream_slash_style
 
-    return Style.from_dict(
-        {
-            # 菜单底色
-            'completion-menu': f'bg:{_ASSISTANT_SURFACE}',
-            'completion-menu.completion': f'bg:{_ASSISTANT_SURFACE} fg:#e2e8f0',
-            'completion-menu.completion.current': f'bg:{_BRAND_HEX} fg:#ffffff bold',
-            # meta 略暗，突出左侧命令主体；选中行保持靛紫底
-            'completion-menu.meta.completion': 'fg:#64748b',
-            'completion-menu.meta.completion.current': f'bg:{_BRAND_HEX} fg:#a5b4fc',
-            # 光标行与提示
-            '': f'fg:#e2e8f0',
-            'bottom-toolbar': 'bg:#1e1e2e fg:#e2e8f0',
-        }
-    )
+    return prompt_toolkit_scream_slash_style()
 
 
 def _build_tui_prompt_session() -> Any:
@@ -132,6 +40,11 @@ def _build_tui_prompt_session() -> Any:
         from prompt_toolkit.history import InMemoryHistory
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError('需要安装 prompt_toolkit（见 requirements.txt）') from exc
+
+    from .repl_slash_helpers import (
+        SlashCommandCompleter,
+        prompt_toolkit_slash_completion_enter_bindings,
+    )
 
     try:
         from prompt_toolkit.input.defaults import create_input
@@ -163,6 +76,7 @@ def _build_tui_prompt_session() -> Any:
         'mouse_support': False,
         'enable_suspend': False,
         'style': _prompt_toolkit_style(),
+        'key_bindings': prompt_toolkit_slash_completion_enter_bindings(),
     }
     if create_input is not None and create_output is not None:
         kw['input'] = create_input()
@@ -446,10 +360,39 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
             console.print('[dim]再见。[/dim]')
             return 0
 
-        handled, new_eng = dispatch_repl_slash_command(line, console=console, engine=engine)
+        handled, new_eng, slash_outcome = dispatch_repl_slash_command(
+            line, console=console, engine=engine
+        )
+        if new_eng is not None:
+            engine = new_eng
         if handled:
-            if new_eng is not None:
-                engine = new_eng
+            want_follow = (
+                slash_outcome is not None
+                and slash_outcome.trigger_llm_followup
+                and (slash_outcome.followup_prompt or '').strip()
+            )
+            if want_follow:
+                reset_agent_cancel()
+                fp = slash_outcome.followup_prompt.strip()
+                use_team = bool(engine.repl_team_mode)
+                console.print('[dim grey42]↪ 视觉快照已注入，正在请求模型分析…[/dim grey42]')
+                console.print(Rule(style=_BRAND_MUTED))
+                try:
+                    _run_streaming_turn(
+                        engine, runtime, fp, console, route_limit=route_limit, team=use_team
+                    )
+                except KeyboardInterrupt:
+                    _print_graceful_interrupt(console, use_rich=True)
+                except Exception as exc:
+                    try:
+                        console.print(
+                            f'[bold red]本回合展示层异常: {type(exc).__name__}: {exc}[/bold red]'
+                        )
+                    except Exception:
+                        print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
+                _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
+                _try_persist_repl_session(engine)
+                console.print()
             continue
 
         use_team = bool(engine.repl_team_mode)

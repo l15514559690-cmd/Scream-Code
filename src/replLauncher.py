@@ -348,12 +348,19 @@ _REPL_HISTORY_MAX_ITEMS = 512
 def _build_prompt_session() -> Any | None:
     try:
         from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import ThreadedCompleter
         from prompt_toolkit.history import InMemoryHistory
     except ImportError:
         return None
 
     if not sys.stdin.isatty():
         return None
+
+    from .repl_slash_helpers import (
+        SlashCommandCompleter,
+        prompt_toolkit_scream_slash_style,
+        prompt_toolkit_slash_completion_enter_bindings,
+    )
 
     class _BoundedInMemoryHistory(InMemoryHistory):
         """不启用 FileHistory；超限时丢弃最旧条目，避免历史列表无限增长。"""
@@ -379,15 +386,18 @@ def _build_prompt_session() -> Any | None:
 
     kw: dict[str, Any] = {
         'history': history,
-        'complete_while_typing': False,
+        'completer': ThreadedCompleter(SlashCommandCompleter()),
+        'complete_while_typing': True,
         'validate_while_typing': False,
         'mouse_support': False,
         'enable_suspend': False,
+        'style': prompt_toolkit_scream_slash_style(),
+        'key_bindings': prompt_toolkit_slash_completion_enter_bindings(),
     }
     if create_input is not None and create_output is not None:
         kw['input'] = create_input()
         kw['output'] = create_output()
-    # 显式关闭边输边补全/校验；mouse/suspend 与 Rich 全屏控件交替时易争用终端
+    # 斜杠指令：边输边弹出补全（与 ``tui_app`` 一致）；mouse/suspend 仍关闭以免与 Rich 争用终端
     return PromptSession(**kw)
 
 
@@ -761,10 +771,26 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
             if line.lower() in ('exit', 'quit', 'q'):
                 print('再见。')
                 return 0
-            handled, new_eng = dispatch_repl_slash_command(line, console=None, engine=engine)
+            handled, new_eng, slash_outcome = dispatch_repl_slash_command(
+                line, console=None, engine=engine
+            )
+            if new_eng is not None:
+                engine = new_eng
             if handled:
-                if new_eng is not None:
-                    engine = new_eng
+                want_follow = (
+                    slash_outcome is not None
+                    and slash_outcome.trigger_llm_followup
+                    and (slash_outcome.followup_prompt or '').strip()
+                )
+                if want_follow:
+                    reset_agent_cancel()
+                    fp = slash_outcome.followup_prompt.strip()
+                    use_team = bool(engine.repl_team_mode)
+                    _consume_llm_events_plain(
+                        engine, runtime, fp, route_limit=route_limit, team=use_team
+                    )
+                    _maybe_print_repl_memory_load_warning(None, engine, use_rich=False)
+                    _try_persist_repl_session(engine)
                 continue
             use_team = bool(engine.repl_team_mode)
             msg = line
@@ -819,10 +845,37 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
             console.print('[dim]再见。[/dim]')
             return 0
 
-        handled, new_eng = dispatch_repl_slash_command(line, console=console, engine=engine)
+        handled, new_eng, slash_outcome = dispatch_repl_slash_command(
+            line, console=console, engine=engine
+        )
+        if new_eng is not None:
+            engine = new_eng
         if handled:
-            if new_eng is not None:
-                engine = new_eng
+            want_follow = (
+                slash_outcome is not None
+                and slash_outcome.trigger_llm_followup
+                and (slash_outcome.followup_prompt or '').strip()
+            )
+            if want_follow:
+                reset_agent_cancel()
+                fp = slash_outcome.followup_prompt.strip()
+                use_team = bool(engine.repl_team_mode)
+                try:
+                    _run_streaming_turn(
+                        engine, runtime, fp, console, route_limit=route_limit, team=use_team
+                    )
+                except KeyboardInterrupt:
+                    _print_graceful_interrupt(console, use_rich=True)
+                except Exception as exc:
+                    try:
+                        console.print(
+                            f'[bold red]本回合展示层异常（已释放 Live/Status）: '
+                            f'{type(exc).__name__}: {exc}[/bold red]'
+                        )
+                    except Exception:
+                        print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
+                _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
+                _try_persist_repl_session(engine)
             continue
 
         use_team = bool(engine.repl_team_mode)
@@ -1010,7 +1063,8 @@ def run_repl_json_stdio_loop(*, llm_enabled: bool, route_limit: int = 5) -> int:
 
         capture.seek(0)
         capture.truncate(0)
-        handled, new_eng = dispatch_repl_slash_command(
+        followup_from_slash = False
+        handled, new_eng, slash_outcome = dispatch_repl_slash_command(
             text, console=cap_console, engine=engine
         )
         if new_eng is not None:
@@ -1018,19 +1072,30 @@ def run_repl_json_stdio_loop(*, llm_enabled: bool, route_limit: int = 5) -> int:
             engine.config = replace(engine.config, llm_enabled=llm_enabled)
 
         if handled:
+            followup_from_slash = (
+                slash_outcome is not None
+                and slash_outcome.trigger_llm_followup
+                and llm_enabled
+                and (slash_outcome.followup_prompt or '').strip()
+            )
             out = capture.getvalue().strip()
             if out:
                 _emit({'type': 'system', 'text': out})
-            _try_persist_repl_session(engine)
-            _emit_state()
-            _emit({'type': 'turn_done'})
-            continue
+            if not followup_from_slash:
+                _try_persist_repl_session(engine)
+                _emit_state()
+                _emit({'type': 'turn_done'})
+                continue
 
         use_team = bool(engine.repl_team_mode)
-        msg = text
-        if msg.startswith('$team'):
-            msg = msg[5:].strip()
-            use_team = True
+        if followup_from_slash:
+            assert slash_outcome is not None
+            msg = slash_outcome.followup_prompt.strip()
+        else:
+            msg = text
+            if msg.startswith('$team'):
+                msg = msg[5:].strip()
+                use_team = True
         if not msg:
             _emit({'type': 'turn_done'})
             continue

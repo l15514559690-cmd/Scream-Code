@@ -116,7 +116,8 @@ def execute_mac_bash(command: str) -> str:
     在本地通过 ``/bin/bash -lc`` 执行一条 shell 命令，合并 stdout/stderr 后返回文本。
 
     需要系统存在 ``/bin/bash``；用于让大模型运行构建、测试、git 等命令。
-    沙箱模式下在工作区根目录下执行；全局越狱模式下在用户主目录下执行。超时 120 秒。
+    若 ``SandboxManager.is_sandbox_enabled`` 为 True，则改为在 Docker 容器内执行（挂载工作区根到 ``/workspace``）。
+    否则：沙箱路径策略下在工作区根目录执行；全局越狱模式下在用户主目录下执行。超时 120 秒。
     请勿用于交互式或长期驻留进程。
 
     Args:
@@ -126,9 +127,14 @@ def execute_mac_bash(command: str) -> str:
         进程退出码与输出摘要；若退出码非 0，返回内容中仍会包含 stderr 以便排错。
 
     Raises:
-        subprocess.TimeoutExpired: 超时。
-        OSError: 无法启动子进程。
+        subprocess.TimeoutExpired: 超时（仅宿主机 bash 分支；Docker 分支在内部吞掉并返回字符串）。
+        OSError: 无法启动子进程（仅宿主机 bash 分支）。
     """
+    from .sandbox_env import SandboxManager
+
+    if SandboxManager.instance().is_sandbox_enabled:
+        return SandboxManager.instance().execute_in_sandbox(command, str(_workspace_root()))
+
     bash = Path('/bin/bash')
     if not bash.is_file():
         return f'[错误] 未找到 /bin/bash（当前平台 {sys.platform}）。'
@@ -273,22 +279,43 @@ def install_local_skill(file_path: str) -> str:
         shutil.copy2(src, dest)
     except OSError as exc:
         return f'[错误] 复制失败: {exc}'
-    from .skills_registry import get_skills_registry
+    from .tools_registry import get_tools_registry
 
-    get_skills_registry().reload_all()
-    return f'已安装技能 {name} 至 {dest}，并已热重载 SkillsRegistry。'
+    get_tools_registry().reload_all()
+    return f'已安装技能 {name} 至 {dest}，并已热重载 ToolsRegistry。'
+
+
+def memorize_project_rule(key_name: str, content: str) -> str:
+    """
+    将架构决策、开发规范、用户代码习惯等写入本机长期记忆库（SQLite，``~/.scream/memory.db``）。
+
+    与 ``update_project_memory``（SCREAM.md）互补：本工具按 **键** 结构化存储，便于后续注入系统提示词。
+    """
+    from .memory_store import memorize_core_rule
+
+    return memorize_core_rule(key_name, content)
+
+
+def forget_project_rule(key_name: str) -> str:
+    """从长期记忆库删除指定键；过时规则应主动清理。"""
+    from .memory_store import forget_core_rule
+
+    return forget_core_rule(key_name)
 
 
 def run_agent_tool(function_name: str, arguments_json: str) -> str:
     """调度技能注册表；兼容测试与旧调用点。"""
-    from .skills_registry import get_skills_registry
+    from .tools_registry import get_tools_registry
 
-    return get_skills_registry().execute_tool(function_name, arguments_json)
+    return get_tools_registry().execute_tool(function_name, arguments_json)
 
 
 def builtin_openai_tools_schema() -> list[dict[str, object]]:
     """OpenAI Chat Completions ``tools`` 参数所需的 JSON Schema 列表（随沙箱/越狱配置变化）。"""
+    from .sandbox_env import SandboxManager
+
     jail = _allow_global_access()
+    docker_sandbox = SandboxManager.instance().is_sandbox_enabled
     if jail:
         read_desc = (
             '读取本地文本文件（UTF-8）。当前为全局模式：可使用任意绝对路径或相对路径，'
@@ -304,6 +331,11 @@ def builtin_openai_tools_schema() -> list[dict[str, object]]:
             '在 macOS 上通过 bash 执行一条命令（在用户主目录下启动 shell，超时 120s）。'
             '可组合命令完成系统级任务（如截图、系统工具等）。'
         )
+        if docker_sandbox:
+            bash_desc = (
+                '在 Docker 容器内通过 bash 执行命令（工作区根挂载为 /workspace，超时 120s）。'
+                '需要本机已安装 Docker；适合隔离执行构建/脚本。'
+            )
     else:
         read_desc = (
             '读取工作区内的文本文件（UTF-8）。路径相对于工作区根；'
@@ -319,6 +351,11 @@ def builtin_openai_tools_schema() -> list[dict[str, object]]:
             '在 macOS 上通过 bash 执行一条命令（工作区根为 cwd，超时 120s）。'
             '适合运行测试、构建、git 等非交互命令；无法用于工作区外的系统级操作。'
         )
+        if docker_sandbox:
+            bash_desc = (
+                '在 Docker 容器内通过 bash 执行命令（工作区根挂载为 /workspace，超时 120s）。'
+                '需要本机已安装 Docker；命令仅在容器环境内生效。'
+            )
     return [
         {
             'type': 'function',
@@ -419,6 +456,55 @@ def builtin_openai_tools_schema() -> list[dict[str, object]]:
                         },
                     },
                     'required': ['content'],
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'memorize_project_rule',
+                'description': (
+                    '**强烈建议**：在对话中一旦发现用户有稳定的代码风格、命名习惯、技术栈偏好、'
+                    '或项目级架构/目录/测试/发布等**长期有效**的约定，应主动调用本工具写入长期记忆库（按 key 存储，'
+                    '后续会自动进入系统上下文）。不要等到用户说「请记住」才写入；对重复出现或明确拍板的规则尤应记录。'
+                    '与 update_project_memory（SCREAM.md 叙述型记忆）可同时使用；本工具适合可检索的短键值规则。'
+                ),
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'key_name': {
+                            'type': 'string',
+                            'description': (
+                                '唯一键，建议点分或 snake_case，例如 rust.edition、api.base_url、'
+                                'style.no_any。同一键再次写入会覆盖更新。'
+                            ),
+                        },
+                        'content': {
+                            'type': 'string',
+                            'description': '该规则下的完整说明（可含多行），应具体可执行、避免空泛套话。',
+                        },
+                    },
+                    'required': ['key_name', 'content'],
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'forget_project_rule',
+                'description': (
+                    '当某条长期规则已被用户否定、架构已迁移或内容已过时，调用本工具按 key 从长期记忆库删除，'
+                    '避免错误信息持续注入上下文。删除前请确认用户意图或对话中已明确废弃该规则。'
+                ),
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'key_name': {
+                            'type': 'string',
+                            'description': '要删除的规则键名，须与当初 memorize_project_rule 使用的 key_name 一致。',
+                        },
+                    },
+                    'required': ['key_name'],
                 },
             },
         },

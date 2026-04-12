@@ -22,21 +22,21 @@ class ToolPool:
             f'镜像清单工具数量: {len(self.tools)}',
         ]
         lines.extend(f'- {tool.name} — {tool.source_hint}' for tool in self.tools[:15])
-        lines.extend(_runtime_skills_registry_section())
+        lines.extend(_runtime_tools_registry_section())
         return '\n'.join(lines)
 
 
-def _runtime_skills_registry_section() -> list[str]:
-    """与 LLM ``tools`` 同源的 SkillsRegistry 面，挂接在 tool-pool 输出末尾。"""
+def _runtime_tools_registry_section() -> list[str]:
+    """与 LLM ``tools`` 同源的 ToolsRegistry 面，挂接在 tool-pool 输出末尾。"""
     out: list[str] = [
         '',
-        '## 运行时 Agent 工具（SkillsRegistry，与 claw-code 镜像 tool 路由并列展示）',
+        '## 运行时 Agent 工具（ToolsRegistry，与 claw-code 镜像 tool 路由并列展示）',
         '',
     ]
     try:
-        from .skills_registry import get_skills_registry
+        from .tools_registry import get_tools_registry
 
-        for row in get_skills_registry().list_skill_rows()[:40]:
+        for row in get_tools_registry().list_tool_rows()[:40]:
             src = row.get('source') or '—'
             name = row.get('name') or ''
             desc = (row.get('description') or '')[:100]

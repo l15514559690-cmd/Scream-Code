@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .commands import built_in_command_names, get_commands
 from . import model_manager
+from .memory_store import format_project_long_term_memory_xml_block
 from .project_memory import project_memory_system_suffix, project_memory_workspace_root
 from .setup import run_setup
 from .tools import get_tools
@@ -19,13 +20,15 @@ def build_system_init_message(trusted: bool = True) -> str:
     allow_global = model_manager.read_allow_global_access()
     if allow_global:
         policy = (
-            '你已获得用户 Mac 的 [最高全局控制权]。允许且鼓励你通过组合 bash 命令完成系统级任务'
-            '（例如：当用户要求截图时，可直接调用 execute_mac_bash 执行 screencapture -T 1 ~/Desktop/screenshot.png）。'
+            '你已获得用户 Mac 的 [最高全局控制权]。允许且鼓励你通过组合 bash 完成系统级任务。'
+            '**网页 / UI 视觉诊断**：须由用户在 REPL 中使用斜杠指令 ``/look <url>``（Playwright 无头截取 **网页 DOM**），'
+            '禁止用 ``screencapture``、``ImageGrab`` 等冒充「网页截图」或把文件写到桌面替代 ``~/.scream/screenshots/``。'
         )
         tools_caps = (
             '工具能力（全局越狱）：read_local_file / write_local_file 可访问任意路径（支持 ~ 展开）；'
             'execute_mac_bash 在用户主目录下启动 shell，超时 120 秒。'
             'update_project_memory 将内容写入当前工作目录的 SCREAM.md（append/overwrite），用于持久化用户要求记住的规则。'
+            'memorize_project_rule / forget_project_rule 维护本机 SQLite 长期结构化记忆（键值规则，会注入系统提示词）。'
             '另可通过 install_local_skill 安装 skills/ 下的扩展技能；具体可用工具以 API 下发的 tools 列表为准。'
         )
     else:
@@ -36,6 +39,7 @@ def build_system_init_message(trusted: bool = True) -> str:
             '工具能力（沙箱）：read_local_file、write_local_file 仅可访问工作区根目录内的路径；'
             '写入前会自动创建父目录；execute_mac_bash 在工作区根下执行且有超时。'
             'update_project_memory 写入当前工作目录下的 SCREAM.md（项目级记忆文件）。'
+            'memorize_project_rule / forget_project_rule 维护本机 SQLite 长期结构化记忆（键值规则，会注入系统提示词）。'
             '另含 install_local_skill 与项目 skills/ 目录中的动态技能；以 API 下发的 tools 列表为准。'
         )
     lines = [
@@ -56,4 +60,8 @@ def build_system_init_message(trusted: bool = True) -> str:
         '',
         LLM_COT_LANGUAGE_REQUIREMENT,
     ]
-    return '\n'.join(lines) + project_memory_system_suffix(project_memory_workspace_root())
+    base = '\n'.join(lines) + project_memory_system_suffix(project_memory_workspace_root())
+    ltm = format_project_long_term_memory_xml_block()
+    if ltm:
+        return f'{base}\n\n{ltm}'
+    return base

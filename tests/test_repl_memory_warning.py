@@ -49,8 +49,9 @@ class ReplMemoryWarningTests(unittest.TestCase):
         buf = io.StringIO()
         Console(file=buf, force_terminal=True, width=80).print(p)
         out = buf.getvalue()
-        self.assertIn('记忆负载过高', out)
-        self.assertIn('Token 水位', out)
+        self.assertIn('警告', out)
+        self.assertIn('模型极限', out)
+        self.assertIn('80,000', out)
 
     def test_no_warning_below_threshold(self) -> None:
         buf = io.StringIO()
@@ -65,7 +66,7 @@ class ReplMemoryWarningTests(unittest.TestCase):
         t = REPL_MEMORY_WARN_TOTAL_TOKENS + 1
         eng = self._engine(inp=t, outp=0)
         _maybe_print_repl_memory_load_warning(c, eng, use_rich=True)
-        self.assertIn('记忆负载过高', buf.getvalue())
+        self.assertIn('模型极限', buf.getvalue())
         buf.seek(0)
         buf.truncate(0)
         _maybe_print_repl_memory_load_warning(c, eng, use_rich=True)
@@ -81,7 +82,7 @@ class ReplMemoryWarningTests(unittest.TestCase):
         buf.truncate(0)
         eng_b = self._engine(inp=t, outp=0, sid='b')
         _maybe_print_repl_memory_load_warning(c, eng_b, use_rich=True)
-        self.assertIn('记忆负载过高', buf.getvalue())
+        self.assertIn('模型极限', buf.getvalue())
 
     def test_falling_below_threshold_clears_flag(self) -> None:
         buf = io.StringIO()
@@ -98,21 +99,21 @@ class ReplMemoryWarningTests(unittest.TestCase):
         self.assertNotIn('same', _REPL_MEMORY_WARN_LAST)
         eng.total_usage = UsageSummary(t, 0)
         _maybe_print_repl_memory_load_warning(c, eng, use_rich=True)
-        self.assertIn('记忆负载过高', buf.getvalue())
+        self.assertIn('模型极限', buf.getvalue())
 
     def test_at_threshold_exactly_warns(self) -> None:
         buf = io.StringIO()
         c = Console(file=buf, force_terminal=True, width=80)
         eng = self._engine(inp=REPL_MEMORY_WARN_TOTAL_TOKENS, outp=0)
         _maybe_print_repl_memory_load_warning(c, eng, use_rich=True)
-        self.assertIn('记忆负载过高', buf.getvalue())
+        self.assertIn('模型极限', buf.getvalue())
 
     def test_warns_when_user_turns_reached(self) -> None:
         buf = io.StringIO()
         c = Console(file=buf, force_terminal=True, width=80)
         eng = self._engine(inp=0, outp=0, n_user_turns=REPL_MEMORY_WARN_USER_TURNS)
         _maybe_print_repl_memory_load_warning(c, eng, use_rich=True)
-        self.assertIn('记忆负载过高', buf.getvalue())
+        self.assertIn('模型极限', buf.getvalue())
 
     def test_repeats_after_token_delta(self) -> None:
         buf = io.StringIO()
@@ -129,7 +130,7 @@ class ReplMemoryWarningTests(unittest.TestCase):
         buf.truncate(0)
         eng.total_usage = UsageSummary(base + REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA, 0)
         _maybe_print_repl_memory_load_warning(c, eng, use_rich=True)
-        self.assertIn('记忆负载过高', buf.getvalue())
+        self.assertIn('模型极限', buf.getvalue())
 
     def test_config_override_threshold(self) -> None:
         buf = io.StringIO()
@@ -137,7 +138,7 @@ class ReplMemoryWarningTests(unittest.TestCase):
         eng = self._engine(inp=5001, outp=0, token_warning_threshold=5000)
         _maybe_print_repl_memory_load_warning(c, eng, use_rich=True)
         out = buf.getvalue()
-        self.assertIn('记忆负载过高', out)
+        self.assertIn('模型极限', out)
         self.assertTrue('5000' in out.replace(',', '') or '5,000' in out)
 
 

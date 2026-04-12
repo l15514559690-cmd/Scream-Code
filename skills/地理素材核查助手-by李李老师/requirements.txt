@@ -1,0 +1,9 @@
+# 地理素材核查助手 - 依赖文件
+# Windows / macOS / Linux 通用
+
+# 核心依赖：DuckDuckGo 搜索
+ddgs>=3.2.0
+
+# 如果 ddgs 安装失败，可选替代方案（自动降级使用）
+# requests>=2.28.0
+# beautifulsoup4>=4.11.0

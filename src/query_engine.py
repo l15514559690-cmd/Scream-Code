@@ -17,7 +17,7 @@ from .transcript import TranscriptStore
 
 @dataclass(frozen=True)
 class QueryEngineConfig:
-    #: 用户轮次硬上限（与工具闭环上限分轨，见 ``llm_client.agent_tool_iteration_cap``）
+    #: 用户轮次上限：超出时滑动裁剪 ``mutable_messages``，**不**在框架层阻断发往模型的请求
     max_turns: int = 400
     #: 累计 token 预算（默认 12M；长上下文扩容后与修剪阈值配套）
     max_budget_tokens: int = 12_000_000
@@ -98,19 +98,41 @@ class QueryEnginePort:
 
     def _coerce_turn_capacity_before_turn(self) -> None:
         """
-        在判定轮次上限前，将 ``mutable_messages`` 压到 ``compact_after_turns`` 以内，
-        并收缩过大的 ``llm_conversation_messages``，避免长会话直接 blocked。
+        在追加本轮 user 前压缩 ``mutable_messages``（``compact_after_turns`` / ``max_turns``），
+        并收缩过大的 ``llm_conversation_messages``。仅滑动裁剪，**不**因轮次触达上限而阻断请求。
         """
         cap = self.config.max_turns
         soft = self.config.compact_after_turns
         if len(self.mutable_messages) < cap:
             self._shrink_llm_conversation_if_huge()
-            return
-        keep = soft if soft < cap else max(cap - 1, 1)
-        keep = max(keep, 1)
-        if len(self.mutable_messages) > keep:
-            self.mutable_messages[:] = self.mutable_messages[-keep:]
-        self._shrink_llm_conversation_if_huge()
+        else:
+            keep = soft if soft < cap else max(cap - 1, 1)
+            keep = max(keep, 1)
+            if len(self.mutable_messages) > keep:
+                self.mutable_messages[:] = self.mutable_messages[-keep:]
+            self._shrink_llm_conversation_if_huge()
+
+        # ``max_turns==1`` 等边界下上一轮可能仍占满额度；为本轮 user 腾出空位，避免框架硬停。
+        if cap > 0 and len(self.mutable_messages) >= cap:
+            free = max(cap - 1, 0)
+            self.mutable_messages[:] = (
+                self.mutable_messages[-free:] if free > 0 else []
+            )
+
+    def _emit_pre_llm_context_soft_warning(self) -> None:
+        """
+        在**发往模型前**打印记忆水位软警告（Rich 或纯文本），不修改会话、不拦截请求。
+        去重与重复节奏与 ``replLauncher._maybe_print_repl_memory_load_warning`` 一致。
+        """
+        from .replLauncher import _maybe_print_repl_memory_load_warning
+
+        console = self.ui_console
+        use_rich = bool(
+            console is not None
+            and getattr(console, 'is_terminal', False)
+            and bool(console.is_terminal)
+        )
+        _maybe_print_repl_memory_load_warning(console, self, use_rich=use_rich)
 
     def _shrink_llm_conversation_if_huge(self) -> None:
         """内存侧防止 ``llm_conversation_messages`` 无限增长；发往模型前仍会经 ``prune_historical_messages``。"""
@@ -138,17 +160,6 @@ class QueryEnginePort:
         denied_tools: tuple[PermissionDenial, ...] = (),
     ) -> TurnResult:
         self._coerce_turn_capacity_before_turn()
-        if len(self.mutable_messages) >= self.config.max_turns:
-            output = f'在处理该提示前已达到最大对话轮次上限: {prompt}'
-            return TurnResult(
-                prompt=prompt,
-                output=output,
-                matched_commands=matched_commands,
-                matched_tools=matched_tools,
-                permission_denials=denied_tools,
-                usage=self.total_usage,
-                stop_reason='max_turns_reached',
-            )
 
         summary_lines = self._router_summary_lines(
             prompt, matched_commands, matched_tools, denied_tools
@@ -309,6 +320,7 @@ class QueryEnginePort:
         from .llm_client import LlmClientError, chat_completion
         from .llm_settings import read_llm_connection_settings
 
+        self._emit_pre_llm_context_soft_warning()
         messages = self._assemble_messages_for_llm_turn(
             prompt, matched_commands, matched_tools, denied_tools
         )
@@ -362,12 +374,6 @@ class QueryEnginePort:
         from .llm_settings import read_llm_connection_settings
 
         self._coerce_turn_capacity_before_turn()
-        if len(self.mutable_messages) >= self.config.max_turns:
-            yield {
-                'type': 'blocked',
-                'output': f'在处理该提示前已达到最大对话轮次上限: {prompt}',
-            }
-            return
 
         summary_lines = self._router_summary_lines(
             prompt, matched_commands, matched_tools, denied_tools
@@ -392,6 +398,7 @@ class QueryEnginePort:
         messages: list[dict[str, Any]] = self._assemble_messages_for_llm_turn(
             prompt, matched_commands, matched_tools, denied_tools
         )
+        self._emit_pre_llm_context_soft_warning()
         try:
             settings = read_llm_connection_settings()
         except Exception as exc:
@@ -481,12 +488,6 @@ class QueryEnginePort:
         from .llm_settings import read_llm_connection_settings
 
         self._coerce_turn_capacity_before_turn()
-        if len(self.mutable_messages) >= self.config.max_turns:
-            yield {
-                'type': 'blocked',
-                'output': f'在处理该提示前已达到最大对话轮次上限: {prompt}',
-            }
-            return
 
         if not self.config.llm_enabled:
             yield from self.iter_repl_assistant_events(
@@ -510,6 +511,8 @@ class QueryEnginePort:
             return
         raw_override = (self.config.llm_model or '').strip()
         model_override = raw_override or None
+
+        self._emit_pre_llm_context_soft_warning()
 
         phases: tuple[tuple[str, str, bool], ...] = (
             (

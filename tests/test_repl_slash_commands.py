@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import tempfile
 import unittest
@@ -15,30 +16,48 @@ from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEngineConfig, QueryEnginePort
 from src.repl_slash_commands import dispatch_repl_slash_command
 from src.session_store import StoredSession, save_session
+from src.skills_registry import get_skills_registry, reset_skills_registry_for_tests
 
 
 class ReplSlashCommandsTests(unittest.TestCase):
+    def test_slash_completion_includes_look_from_registry(self) -> None:
+        reset_skills_registry_for_tests()
+        reg = get_skills_registry()
+        cmds = [c for c, _ in reg.iter_slash_completion_items()]
+        self.assertIn('/look', cmds)
+        names = {d['name'] for d in reg.list_skills()}
+        self.assertIn('look', names)
+
+    def test_slash_completion_excludes_question_mark_alias(self) -> None:
+        """help 的 ``?`` 别名不应出现在补全中（避免出现无规范说明的 ``/?``）。"""
+        reset_skills_registry_for_tests()
+        reg = get_skills_registry()
+        cmds = [c for c, _ in reg.iter_slash_completion_items()]
+        self.assertNotIn('/?', cmds)
+        self.assertIn('/help', cmds)
+
     def test_non_slash_passthrough(self) -> None:
         eng = QueryEnginePort(build_port_manifest())
-        h, ne = dispatch_repl_slash_command('hello', console=None, engine=eng)
+        h, ne, out = dispatch_repl_slash_command('hello', console=None, engine=eng)
         self.assertFalse(h)
         self.assertIsNone(ne)
+        self.assertIsNone(out)
 
     def test_team_toggle_slash(self) -> None:
         eng = QueryEnginePort(build_port_manifest())
         self.assertFalse(eng.repl_team_mode)
         with patch('builtins.print'):
-            h, _ = dispatch_repl_slash_command('/team', console=None, engine=eng)
+            h, _, _ = dispatch_repl_slash_command('/team', console=None, engine=eng)
         self.assertTrue(h)
         self.assertTrue(eng.repl_team_mode)
         with patch('builtins.print'):
-            dispatch_repl_slash_command('/team', console=None, engine=eng)
+            _, _, _ = dispatch_repl_slash_command('/team', console=None, engine=eng)
         self.assertFalse(eng.repl_team_mode)
 
     def test_unknown_slash_intercepted(self) -> None:
         eng = QueryEnginePort(build_port_manifest())
         with patch('builtins.print'):
-            h, ne = dispatch_repl_slash_command('/nope', console=None, engine=eng)
+            h, ne, _ = dispatch_repl_slash_command('/nope', console=None, engine=eng)
         self.assertTrue(h)
         self.assertIsNone(ne)
 
@@ -46,17 +65,22 @@ class ReplSlashCommandsTests(unittest.TestCase):
         old = os.getcwd()
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp).resolve()
                 os.chdir(tmp)
                 eng = QueryEnginePort(
                     build_port_manifest(),
                     config=QueryEngineConfig(llm_enabled=False),
                 )
                 with patch('builtins.print'):
-                    h, ne = dispatch_repl_slash_command(
-                        '/memo 记住当前使用 Rust 2021 edition',
-                        console=None,
-                        engine=eng,
-                    )
+                    with patch(
+                        'src.project_memory.project_memory_workspace_root',
+                        return_value=tmp_path,
+                    ):
+                        h, ne, _ = dispatch_repl_slash_command(
+                            '/memo 记住当前使用 Rust 2021 edition',
+                            console=None,
+                            engine=eng,
+                        )
                 self.assertTrue(h)
                 self.assertIsNone(ne)
                 text = Path(tmp, 'SCREAM.md').read_text(encoding='utf-8')
@@ -75,7 +99,7 @@ class ReplSlashCommandsTests(unittest.TestCase):
         eng.total_usage = eng.total_usage.add_turn('a', 'b')
         old_sid = eng.session_id
         with patch('builtins.print'):
-            h, ne = dispatch_repl_slash_command('/flush', console=None, engine=eng)
+            h, ne, _ = dispatch_repl_slash_command('/flush', console=None, engine=eng)
         self.assertTrue(h)
         self.assertIsNone(ne)
         self.assertEqual(eng.mutable_messages, [])
@@ -105,7 +129,7 @@ class ReplSlashCommandsTests(unittest.TestCase):
                 )
                 eng.repl_team_mode = True
                 with patch('builtins.print'):
-                    h, new_eng = dispatch_repl_slash_command(
+                    h, new_eng, _ = dispatch_repl_slash_command(
                         f'/load {sid}',
                         console=None,
                         engine=eng,
@@ -129,7 +153,7 @@ class ReplSlashCommandsTests(unittest.TestCase):
                 Path(tmp, '.port_sessions', 'bad.json').write_text('{', encoding='utf-8')
                 eng = QueryEnginePort(build_port_manifest())
                 with patch('builtins.print'):
-                    h, ne = dispatch_repl_slash_command('/load bad', console=None, engine=eng)
+                    h, ne, _ = dispatch_repl_slash_command('/load bad', console=None, engine=eng)
                 self.assertTrue(h)
                 self.assertIsNone(ne)
         finally:
@@ -145,7 +169,7 @@ class ReplSlashCommandsTests(unittest.TestCase):
                 )
                 eng = QueryEnginePort(build_port_manifest())
                 with patch('builtins.print'):
-                    h, ne = dispatch_repl_slash_command('/sessions', console=None, engine=eng)
+                    h, ne, _ = dispatch_repl_slash_command('/sessions', console=None, engine=eng)
                 self.assertTrue(h)
                 self.assertIsNone(ne)
         finally:
@@ -162,7 +186,7 @@ class ReplSlashCommandsTests(unittest.TestCase):
         old_sid = eng.session_id
         with patch('builtins.print'):
             with patch('src.replLauncher.clear_all_repl_token_warnings') as clr:
-                h, ne = dispatch_repl_slash_command('/new', console=None, engine=eng)
+                h, ne, _ = dispatch_repl_slash_command('/new', console=None, engine=eng)
         self.assertTrue(h)
         self.assertIsNone(ne)
         clr.assert_called_once()
@@ -177,13 +201,18 @@ class ReplSlashCommandsTests(unittest.TestCase):
         old = os.getcwd()
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp).resolve()
                 os.chdir(tmp)
                 eng = QueryEnginePort(build_port_manifest())
                 with patch('builtins.print'):
                     with patch(
-                        'src.repl_slash_commands._confirm_store_summary', return_value=False
+                        'src.project_memory.project_memory_workspace_root',
+                        return_value=tmp_path,
                     ):
-                        h, ne = dispatch_repl_slash_command('/summary', console=None, engine=eng)
+                        with patch(
+                            'src.skills.builtin_repl.confirm_store_summary', return_value=False
+                        ):
+                            h, ne, _ = dispatch_repl_slash_command('/summary', console=None, engine=eng)
                 self.assertTrue(h)
                 self.assertFalse(Path(tmp, 'SCREAM.md').exists())
         finally:
@@ -193,13 +222,18 @@ class ReplSlashCommandsTests(unittest.TestCase):
         old = os.getcwd()
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp).resolve()
                 os.chdir(tmp)
                 eng = QueryEnginePort(build_port_manifest())
                 with patch('builtins.print'):
                     with patch(
-                        'src.repl_slash_commands._confirm_store_summary', return_value=True
+                        'src.project_memory.project_memory_workspace_root',
+                        return_value=tmp_path,
                     ):
-                        h, ne = dispatch_repl_slash_command('/summary', console=None, engine=eng)
+                        with patch(
+                            'src.skills.builtin_repl.confirm_store_summary', return_value=True
+                        ):
+                            h, ne, _ = dispatch_repl_slash_command('/summary', console=None, engine=eng)
                 self.assertTrue(h)
                 text = Path(tmp, 'SCREAM.md').read_text(encoding='utf-8')
                 self.assertIn('/summary', text)
@@ -211,6 +245,7 @@ class ReplSlashCommandsTests(unittest.TestCase):
         old = os.getcwd()
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp).resolve()
                 os.chdir(tmp)
                 eng = QueryEnginePort(
                     build_port_manifest(),
@@ -219,15 +254,125 @@ class ReplSlashCommandsTests(unittest.TestCase):
                 eng.mutable_messages.append('用户偏好：TypeScript')
                 with patch('builtins.print'):
                     with patch(
-                        'src.repl_slash_commands._memo_extract_via_llm',
-                        return_value=('- 偏好 TS', None),
+                        'src.project_memory.project_memory_workspace_root',
+                        return_value=tmp_path,
                     ):
-                        h, ne = dispatch_repl_slash_command('/memo', console=None, engine=eng)
+                        with patch(
+                            'src.skills.builtin_repl.memo_extract_via_llm',
+                            return_value=('- 偏好 TS', None),
+                        ):
+                            h, ne, _ = dispatch_repl_slash_command('/memo', console=None, engine=eng)
                 self.assertTrue(h)
                 self.assertIsNone(ne)
                 self.assertIn('偏好 TS', Path(tmp, 'SCREAM.md').read_text(encoding='utf-8'))
         finally:
             os.chdir(old)
+
+    def test_memory_slash_set_list_drop(self) -> None:
+        from src import memory_store
+        from src.skills_registry import reset_skills_registry_for_tests
+
+        fd, path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        old_env = os.environ.get('SCREAM_MEMORY_DB')
+        eng = QueryEnginePort(build_port_manifest())
+        try:
+            os.environ['SCREAM_MEMORY_DB'] = path
+            reset_skills_registry_for_tests()
+            with patch('builtins.print'):
+                h, ne, _ = dispatch_repl_slash_command(
+                    '/memory set cli.demo hello world',
+                    console=None,
+                    engine=eng,
+                )
+            self.assertTrue(h)
+            self.assertIsNone(ne)
+            rows = memory_store.list_core_rules()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['key_name'], 'cli.demo')
+            self.assertEqual(rows[0]['content'], 'hello world')
+            with patch('builtins.print'):
+                h2, ne2, _ = dispatch_repl_slash_command(
+                    '/memory drop cli.demo',
+                    console=None,
+                    engine=eng,
+                )
+            self.assertTrue(h2)
+            self.assertIsNone(ne2)
+            self.assertEqual(memory_store.list_core_rules(), [])
+        finally:
+            if old_env is None:
+                os.environ.pop('SCREAM_MEMORY_DB', None)
+            else:
+                os.environ['SCREAM_MEMORY_DB'] = old_env
+            Path(path).unlink(missing_ok=True)
+            reset_skills_registry_for_tests()
+
+    def test_look_appends_multimodal_user_message(self) -> None:
+        from src.skills_registry import reset_skills_registry_for_tests
+
+        reset_skills_registry_for_tests()
+        raw_png = base64.b64decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+        )
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as tmp:
+            png_path = str(Path(tmp) / 'cap.png')
+            Path(png_path).write_bytes(raw_png)
+            eng = QueryEnginePort(
+                build_port_manifest(),
+                config=QueryEngineConfig(llm_enabled=True),
+            )
+            with patch('builtins.print'):
+                # reload_all 会 importlib.reload look_skill，勿 patch 该模块内的别名。
+                with patch('src.browser_vision.BrowserVisionEngine') as mock_cls:
+                    mock_cls.return_value.capture_page.return_value = png_path
+                    h, ne, out = dispatch_repl_slash_command(
+                        '/look https://example.com 看看布局',
+                        console=None,
+                        engine=eng,
+                    )
+            self.assertTrue(h)
+            self.assertIsNone(ne)
+            self.assertIsNotNone(out)
+            self.assertTrue(out.trigger_llm_followup)
+            self.assertEqual(out.followup_prompt.strip(), '看看布局')
+            llm_msgs = eng.llm_conversation_messages
+            self.assertEqual(len(llm_msgs), 1)
+            self.assertEqual(llm_msgs[0].get('role'), 'user')
+            content = llm_msgs[0].get('content')
+            self.assertIsInstance(content, list)
+            kinds = {p.get('type') for p in content if isinstance(p, dict)}
+            self.assertIn('text', kinds)
+            self.assertIn('image_url', kinds)
+        reset_skills_registry_for_tests()
+
+    def test_look_suppresses_followup_when_llm_disabled(self) -> None:
+        from src.skills_registry import reset_skills_registry_for_tests
+
+        reset_skills_registry_for_tests()
+        raw_png = base64.b64decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+        )
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as tmp:
+            png_path = str(Path(tmp) / 'cap.png')
+            Path(png_path).write_bytes(raw_png)
+            eng = QueryEnginePort(
+                build_port_manifest(),
+                config=QueryEngineConfig(llm_enabled=False),
+            )
+            with patch('builtins.print'):
+                # reload_all 会 importlib.reload look_skill，勿 patch 该模块内的别名。
+                with patch('src.browser_vision.BrowserVisionEngine') as mock_cls:
+                    mock_cls.return_value.capture_page.return_value = png_path
+                    h, ne, out = dispatch_repl_slash_command(
+                        '/look https://example.com',
+                        console=None,
+                        engine=eng,
+                    )
+            self.assertTrue(h)
+            self.assertFalse(out.trigger_llm_followup)
+            self.assertEqual(len(eng.llm_conversation_messages), 1)
+        reset_skills_registry_for_tests()
 
 
 def test_dispatch_config_no_console(
@@ -236,7 +381,7 @@ def test_dispatch_config_no_console(
 ) -> None:
     mocker.patch('src.model_manager.read_persisted_config_raw', return_value={'active': 'test-model'})
     eng = QueryEnginePort(build_port_manifest())
-    h, ne = dispatch_repl_slash_command('/config', console=None, engine=eng)
+    h, ne, _ = dispatch_repl_slash_command('/config', console=None, engine=eng)
     assert h is True
     assert ne is None
     out = capsys.readouterr().out
@@ -267,9 +412,9 @@ def test_dispatch_skills_no_console(
             ),
         ),
     )
-    mocker.patch('src.repl_slash_commands.build_command_graph', return_value=fake_graph)
+    mocker.patch('src.repl_slash_helpers.build_command_graph', return_value=fake_graph)
     eng = QueryEnginePort(build_port_manifest())
-    h, ne = dispatch_repl_slash_command('/skills', console=None, engine=eng)
+    h, ne, _ = dispatch_repl_slash_command('/skills', console=None, engine=eng)
     assert h is True
     assert ne is None
     out = capsys.readouterr().out

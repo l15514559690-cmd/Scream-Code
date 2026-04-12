@@ -4,7 +4,11 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-from src.llm_client import agent_tool_iteration_cap, max_agent_tool_rounds
+from src.llm_client import (
+    agent_tool_iteration_cap,
+    max_agent_tool_rounds,
+    openai_user_content_to_anthropic,
+)
 from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEngineConfig, QueryEnginePort
 
@@ -106,6 +110,24 @@ class LlmClientTests(unittest.TestCase):
         fake_openai.assert_not_called()
         self.assertIn('[LLM]', result.output)
         self.assertIn('API_KEY', result.output)
+
+    def test_openai_user_content_to_anthropic_data_url_image(self) -> None:
+        tiny = (
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+        )
+        url = f'data:image/png;base64,{tiny}'
+        content = [
+            {'type': 'text', 'text': 'hi'},
+            {'type': 'image_url', 'image_url': {'url': url}},
+        ]
+        anth = openai_user_content_to_anthropic(content)
+        self.assertIsInstance(anth, list)
+        self.assertEqual(len(anth), 2)
+        self.assertEqual(anth[0]['type'], 'text')
+        self.assertEqual(anth[1]['type'], 'image')
+        self.assertEqual(anth[1]['source']['type'], 'base64')
+        self.assertEqual(anth[1]['source']['media_type'], 'image/png')
+        self.assertEqual(anth[1]['source']['data'], tiny)
 
 
 if __name__ == '__main__':

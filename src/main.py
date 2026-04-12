@@ -194,9 +194,9 @@ def _run_findskills_cli() -> None:
     from rich.console import Console
     from rich.table import Table
 
-    from .skills_registry import get_skills_registry
+    from .tools_registry import get_tools_registry
 
-    rows = get_skills_registry().list_skill_rows()
+    rows = get_tools_registry().list_tool_rows()
     table = Table(title='已加载技能（内置 + skills/）', show_lines=True)
     table.add_column('名称', style='cyan', no_wrap=True)
     table.add_column('描述')

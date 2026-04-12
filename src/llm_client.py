@@ -19,10 +19,10 @@ class LlmClientError(Exception):
 
 
 def get_openai_agent_tools() -> list[dict[str, Any]]:
-    """合并内置技能与 ``skills/`` 动态技能；每次调用刷新 schema（沙箱开关等即时生效）。"""
-    from .skills_registry import get_skills_registry
+    """合并内置 Agent 工具与项目 ``skills/*.py`` 动态插件；每次调用刷新 schema（沙箱开关等即时生效）。"""
+    from .tools_registry import get_tools_registry
 
-    return get_skills_registry().get_all_schemas()
+    return get_tools_registry().get_all_schemas()
 
 
 # 可选硬上限（防模型异常死循环）；默认 100 轮（1.0）；可用环境变量覆盖或关闭
@@ -205,6 +205,63 @@ def _parse_tool_arguments(raw: str | dict[str, Any] | None) -> dict[str, Any]:
         return {}
 
 
+def _parse_data_url_image(url: str) -> tuple[str | None, str | None]:
+    """解析 ``data:image/png;base64,...`` → ``(media_type, base64_payload)``。"""
+    if not isinstance(url, str) or not url.startswith('data:'):
+        return None, None
+    try:
+        meta, _, b64 = url.partition(',')
+        if 'base64' not in meta.lower():
+            return None, None
+        semi = meta.find(';')
+        mt = meta[5:semi].strip() if semi > 5 else 'image/png'
+        return mt, b64.strip()
+    except (ValueError, IndexError):
+        return None, None
+
+
+def openai_user_content_to_anthropic(content: Any) -> Any:
+    """
+    OpenAI Chat ``user`` 的 ``content``（字符串或多模态 part 列表）→ Anthropic ``content``。
+    支持 ``text`` 与 ``image_url``（仅处理 ``data:...;base64,...`` 形式）。
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or '')
+    blocks: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get('type')
+        if ptype == 'text':
+            blocks.append({'type': 'text', 'text': str(part.get('text', '') or '')})
+        elif ptype == 'image_url':
+            iu = part.get('image_url')
+            url = ''
+            if isinstance(iu, dict):
+                url = str(iu.get('url', '') or '')
+            elif isinstance(iu, str):
+                url = iu
+            mt, b64 = _parse_data_url_image(url)
+            if mt and b64:
+                blocks.append(
+                    {
+                        'type': 'image',
+                        'source': {
+                            'type': 'base64',
+                            'media_type': mt,
+                            'data': b64,
+                        },
+                    }
+                )
+    if not blocks:
+        return ''
+    if len(blocks) == 1 and blocks[0].get('type') == 'text':
+        return str(blocks[0].get('text', '') or '')
+    return blocks
+
+
 def openai_messages_to_anthropic_messages(
     messages: list[dict[str, Any]],
 ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -232,10 +289,7 @@ def openai_messages_to_anthropic_messages(
         role = m.get('role')
         if role == 'user':
             content = m.get('content')
-            if isinstance(content, str):
-                anth.append({'role': 'user', 'content': content})
-            else:
-                anth.append({'role': 'user', 'content': str(content or '')})
+            anth.append({'role': 'user', 'content': openai_user_content_to_anthropic(content)})
             i += 1
         elif role == 'assistant':
             blocks: list[dict[str, Any]] = []
@@ -518,14 +572,14 @@ def iter_agent_executor_events(
     职责边界（不可下沉到 REPL / 通道）：
 
     - 按 ``api_protocol`` 流式调用 OpenAI 或 Anthropic；
-    - 解析 ``tool_calls``，经 **SkillsRegistry**（与 ``tool-pool`` 展示的运行时工具面同源）执行并写回 ``messages``；
+    - 解析 ``tool_calls``，经 **ToolsRegistry**（与 ``tool-pool`` 展示的运行时工具面同源）执行并写回 ``messages``；
     - 向外产出 ``text_delta`` / ``tool_delta`` / ``api_tool_op`` / ``llm_error``，以及终结事件 ``executor_complete``。
 
     不负责：会话 transcript、路由摘要、Rich 渲染。调用方须传入已构造好的 ``messages``（含 system/user）。
     """
-    from .skills_registry import get_skills_registry
+    from .tools_registry import get_tools_registry
 
-    reg = get_skills_registry()
+    reg = get_tools_registry()
     use_tools = tools if tools is not None else get_openai_agent_tools()
     use_model = (model or settings.model).strip() or settings.model
     msgs = messages

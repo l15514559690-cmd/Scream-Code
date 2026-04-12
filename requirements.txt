@@ -8,3 +8,5 @@ questionary>=2.0.0,<3
 rich>=13.7.0,<14
 # rich.Syntax / Markdown 代码高亮依赖（建议显式安装，避免环境缺省）
 pygments>=2.15.0,<3
+# 无头浏览器截图（browser_vision）
+playwright>=1.40.0

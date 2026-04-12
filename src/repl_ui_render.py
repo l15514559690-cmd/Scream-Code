@@ -133,20 +133,20 @@ class ScreamMarkdown(Markdown):
 
 def build_token_warning_panel(current_tokens: int, threshold: int) -> Any:
     """
-    Token 水位软着陆提示（仅 UI）。不读取、不修改 engine 状态。
+    上下文压力软警告（仅 UI）：不拦截请求，由调用方在发往模型前按需触发。
     """
     from rich import box
     from rich.panel import Panel
     from rich.text import Text
 
     body = (
-        f'[yellow]⚠️ 记忆负载过高：当前会话已消耗约 {current_tokens:,} tokens '
-        f'(安全阈值: {threshold:,})。为防止模型响应变慢或超出最大上下文，'
-        '建议输入 /summary 提取摘要，或输入 /flush 清理历史。[/yellow]'
+        '[bold yellow][警告][/bold yellow] [yellow]当前会话 Token 已接近模型极限，'
+        'AI 回答可能会变慢或出现截断。建议任务完成后使用斜杠压缩类指令或清理上下文。[/yellow]\n'
+        f'[dim]（累计约 {current_tokens:,} tokens · 提示阈值 {threshold:,}）[/dim]'
     )
     return Panel(
         Text.from_markup(body),
-        title='[bold yellow]⚠️ Token 水位[/bold yellow]',
+        title='[bold yellow]上下文压力[/bold yellow]',
         border_style='yellow',
         box=box.ROUNDED,
         expand=True,
@@ -155,10 +155,11 @@ def build_token_warning_panel(current_tokens: int, threshold: int) -> Any:
 
 
 def format_token_warning_plain(current_tokens: int, threshold: int) -> str:
-    """无 Rich 时的同义纯文本一行版。"""
+    """无 Rich 时的同义纯文本版。"""
     return (
-        f'\n⚠️ 记忆负载过高：当前会话已消耗约 {current_tokens} tokens '
-        f'(安全阈值: {threshold})。建议 /summary 提取摘要或 /flush 清理历史。\n'
+        '\n[警告] 当前会话 Token 已接近模型极限，AI 回答可能会变慢或出现截断。'
+        '建议任务完成后使用斜杠压缩类指令或清理上下文。\n'
+        f'（累计约 {current_tokens} tokens · 提示阈值 {threshold}）\n'
     )
 
 # 与 skills / agent_tools 注册名一致（仅用于展示归类）
