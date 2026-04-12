@@ -23,6 +23,14 @@ class MemoryStoreTests(unittest.TestCase):
             os.environ['SCREAM_MEMORY_DB'] = self._old
         Path(self._path).unlink(missing_ok=True)
 
+    def test_count_core_memory_entries(self) -> None:
+        self.assertEqual(memory_store.count_core_memory_entries(), 0)
+        memory_store.memorize_core_rule('a', '1')
+        memory_store.memorize_core_rule('b', '2')
+        self.assertEqual(memory_store.count_core_memory_entries(), 2)
+        memory_store.forget_core_rule('a')
+        self.assertEqual(memory_store.count_core_memory_entries(), 1)
+
     def test_memorize_upsert_and_list(self) -> None:
         self.assertIn('已记入', memory_store.memorize_core_rule('rust.edition', '2021'))
         self.assertIn('已记入', memory_store.memorize_core_rule('rust.edition', '2024'))

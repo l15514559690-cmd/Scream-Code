@@ -2,9 +2,10 @@
 REPL 纯展示层：工具调用面板、语法高亮、流式 Markdown 包装。
 不修改事件结构、不触碰工具执行逻辑。
 
-``ScreamMarkdown``：内联代码圆角感 + 大块 ``Syntax``；流式 ``Live`` 仅用裸 Markdown；
-回合间分隔用 :func:`print_cyber_turn_divider`；流式结束定稿用 :func:`print_solidified_assistant_markdown`；
-其它定稿仍可用 :func:`final_assistant_markdown_panel`（靛紫 ``Panel``）。工具事件等仍用 ``Panel``。
+``ScreamMarkdown``：内联代码圆角感 + 大块 ``Syntax``；流式 ``Live`` 只用裸 Markdown（禁止外层 ``Panel``，
+以免每帧重绘整张卡片）。:func:`prepare_streaming_live_buffer` 负责视口尾部裁剪 + 围栏虚拟闭合；
+:func:`streaming_markdown_for_live` 供节流后的帧调用。回合间分隔 :func:`print_cyber_turn_divider`；
+流式结束定稿 :func:`print_solidified_assistant_markdown` / :func:`final_assistant_markdown_panel`。
 """
 
 from __future__ import annotations
@@ -22,6 +23,13 @@ from rich.text import Text
 _BRAND_BORDER_HEX = '#4F46E5'
 # 流式定稿与 Live 内代码块统一使用同一暗色 Pygments 主题（可改为 "dracula" 等）
 STREAMING_CODE_THEME = 'monokai'
+
+# ── Live 神经帧调度：与 refresh_per_second≈30 对齐；过小会每 token 全量 Markdown 重排烧 CPU ──
+STREAM_LIVE_MIN_INTERVAL_SEC = 1.0 / 30.0
+STREAM_LIVE_MIN_CHAR_DELTA = 12
+# 视口：按终端高度裁尾部行，把「滚动」锁在 Live 区域内，scrollback 不乱跳
+STREAM_LIVE_VIEWPORT_RESERVE_LINES = 8  # 状态栏 / Rule / 系统边距
+STREAM_LIVE_VIEWPORT_MIN_LINES = 12  # 再矮的 PTY 也保留可读高度
 _INLINE_CODE_BG = '#2D2D39'
 _INLINE_CODE_FG = '#A5B4FC'
 _CODE_PANEL_BG = '#09090B'
@@ -450,17 +458,95 @@ def build_api_tool_op_renderable(ev: dict[str, Any]) -> Any:
 _STREAMING_MARKDOWN_SOFT_CAP = 600_000
 
 
-def streaming_markdown_for_live(buffer: str) -> Any:
+def _fence_language_if_open_at_end(text: str) -> str | None:
     """
-    **仅**供 ``rich.Live`` 使用：裸 ``ScreamMarkdown``，禁止 ``Panel``。
-    定稿请用 :func:`final_assistant_markdown_panel`。
+    扫描至 ``text`` 末尾：若停在未闭合的围栏代码块内，返回该块声明的语言标识（无则 ``text``）。
+    """
+    in_fence = False
+    lang = 'text'
+    for line in text.split('\n'):
+        s = line.lstrip()
+        if not s.startswith('```'):
+            continue
+        rest = s[3:].strip()
+        if not in_fence:
+            in_fence = True
+            lang = rest if rest else 'text'
+        else:
+            in_fence = False
+    return lang if in_fence else None
+
+
+def stabilize_streaming_markdown_fences(buf: str) -> str:
+    """
+    流式中途围栏 `` ``` `` 常不成对，CommonMark 会把后续全文当代码吃掉。
+    在缓冲末尾**虚拟闭合**一层围栏，让 Pygments 与段落结构保持稳定；定稿打印仍用原始全文。
+    """
+    if not buf:
+        return buf
+    in_fence = False
+    for line in buf.split('\n'):
+        s = line.lstrip()
+        if s.startswith('```'):
+            in_fence = not in_fence
+    if in_fence:
+        return buf + '\n```\n'
+    return buf
+
+
+def _live_viewport_tail(text: str, *, console: Any) -> str:
+    """
+    只把尾部若干行送进 Live：视口高度跟终端走，旧行在缓冲区里退场而不是顶爆 scrollback。
+    若裁剪点落在围栏内，在片段首补一行 `` ```lang`` 续写语义，再经 :func:`stabilize_streaming_markdown_fences` 闭合。
+    """
+    try:
+        height = int(getattr(getattr(console, 'size', None), 'height', 0) or 0)
+    except (TypeError, ValueError):
+        height = 0
+    if height <= 0:
+        height = 24
+    max_lines = max(
+        STREAM_LIVE_VIEWPORT_MIN_LINES, height - STREAM_LIVE_VIEWPORT_RESERVE_LINES
+    )
+    lines = text.split('\n')
+    if len(lines) <= max_lines:
+        return text
+    dropped = len(lines) - max_lines
+    head = '\n'.join(lines[:-max_lines])
+    tail = '\n'.join(lines[-max_lines:])
+    lang = _fence_language_if_open_at_end(head)
+    if lang is not None:
+        tail = f'```{lang}\n' + tail
+    ribbon = (
+        f'\n\n> ‥ *{dropped} lines above live fold* · *full transcript on freeze* ‥\n\n'
+    )
+    return ribbon + tail
+
+
+def prepare_streaming_live_buffer(buffer: str, *, console: Any | None = None) -> str:
+    """
+    Live 专用：软上限 → 视口尾部 → 围栏闭合。返回可直接喂给 ``ScreamMarkdown`` 的字符串。
+    """
+    buf = buffer or ''
+    if len(buf) > _STREAMING_MARKDOWN_SOFT_CAP:
+        buf = (
+            buf[: _STREAMING_MARKDOWN_SOFT_CAP - 120]
+            + '\n\n…(流式缓冲过长，Live 内仅展示前段；完整内容在回合结束后可见)…\n'
+        )
+    if console is not None:
+        buf = _live_viewport_tail(buf, console=console)
+    return stabilize_streaming_markdown_fences(buf)
+
+
+def streaming_markdown_for_live(buffer: str, *, console: Any | None = None) -> Any:
+    """
+    **仅**供 ``rich.Live`` 使用：裸 ``ScreamMarkdown``，禁止外层 ``Panel``（避免每 token 重绘一整张卡片）。
+    传入 ``console`` 时启用视口尾部裁剪，缓和全屏模式下终端滚动条抽搐。
+    定稿请用 :func:`final_assistant_markdown_panel` / :func:`print_solidified_assistant_markdown`。
     """
     from rich.text import Text
 
-    buf = buffer or ''
-    if len(buf) > _STREAMING_MARKDOWN_SOFT_CAP:
-        buf = buf[: _STREAMING_MARKDOWN_SOFT_CAP - 120] + '\n\n…(流式缓冲过长，Live 内仅展示前段；完整内容在回合结束后可见)…\n'
-
+    buf = prepare_streaming_live_buffer(buffer, console=console)
     try:
         return ScreamMarkdown(buf, code_theme=STREAMING_CODE_THEME)
     except Exception as exc:
@@ -481,6 +567,6 @@ def tool_execution_status_message(tool_name: str) -> str:
     return f'[bold cyan]Agent 正在执行工具[/bold cyan]: [white]{display}[/white] [dim]({tool_name})[/dim]…'
 
 
-def streaming_markdown_panel(buffer: str) -> Any:
+def streaming_markdown_panel(buffer: str, *, console: Any | None = None) -> Any:
     """兼容旧名：同 :func:`streaming_markdown_for_live`。"""
-    return streaming_markdown_for_live(buffer)
+    return streaming_markdown_for_live(buffer, console=console)

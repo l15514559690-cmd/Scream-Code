@@ -487,10 +487,13 @@ def _run_streaming_turn(
     *,
     route_limit: int,
     team: bool = False,
+    status_engine: Any | None = None,
 ) -> None:
     from rich.live import Live
 
     from .repl_ui_render import (
+        STREAM_LIVE_MIN_CHAR_DELTA,
+        STREAM_LIVE_MIN_INTERVAL_SEC,
         build_api_tool_op_renderable,
         print_cyber_turn_divider,
         print_solidified_assistant_markdown,
@@ -526,16 +529,103 @@ def _run_streaming_turn(
     round_saw_tool_json_stream = False
 
     last_render_time = 0.0
-    RENDER_INTERVAL = 0.08  # 控制最大渲染帧率约 12-15 FPS
+    last_painted_display_len = 0
+
+    def _streaming_display_payload() -> str:
+        display_text = buffer
+        if tool_streaming_buffer:
+            tool_lines = tool_streaming_buffer.splitlines()
+            if len(tool_lines) > 15:
+                rolling_tool = '...\n' + '\n'.join(tool_lines[-15:])
+            else:
+                rolling_tool = tool_streaming_buffer
+            display_text += (
+                '\n\n> ⚙️ **正在编写代码与工具参数...**\n```json\n'
+                f'{rolling_tool}\n```'
+            )
+        return display_text
+
+    def _live_frame_renderable(display_text: str) -> Any:
+        """Markdown 主区 + 可选神经底栏（TUI 流式时钉在 Live 视窗最底行）。"""
+        md = streaming_markdown_for_live(display_text, console=console)
+        if status_engine is None:
+            return md
+        from rich.console import Group
+        from rich.text import Text
+
+        from .tui_app import neural_status_stream_footer_markup
+
+        try:
+            w = int(getattr(getattr(console, 'size', None), 'width', None) or 80)
+        except (TypeError, ValueError):
+            w = 80
+        rule_w = max(24, min(max(w - 2, 24), 120))
+        rule = Text('▔' * rule_w, style='dim #0f172a')
+        # Rich 旧版：from_markup 不接受 overflow/no_wrap，须在实例上设置
+        foot = Text.from_markup(neural_status_stream_footer_markup(status_engine))
+        foot.overflow = 'ellipsis'
+        foot.no_wrap = True
+        return Group(md, rule, foot)
+
+    def _apply_streaming_live(*, force: bool, queue_quiet: bool) -> None:
+        """节流 + 批处理：在队列仍忙时按时间/字数合并 ``live.update``；``Live`` 用 ``auto_refresh`` 周期 refresh。"""
+        nonlocal live, last_render_time, last_painted_display_len
+        if not use_live:
+            return
+        display_text = _streaming_display_payload()
+        if not display_text.strip():
+            return
+        dlen = len(display_text)
+        now = time.time()
+        if not force:
+            if dlen == last_painted_display_len:
+                return
+            delta = dlen - last_painted_display_len
+            elapsed = now - last_render_time
+            # 尚未创建 Live 时不要按字数节流，否则首几字会一直攒不够 MIN_CHAR_DELTA、界面空白。
+            if live is not None:
+                if (
+                    delta < STREAM_LIVE_MIN_CHAR_DELTA
+                    and elapsed < STREAM_LIVE_MIN_INTERVAL_SEC
+                    and not queue_quiet
+                ):
+                    return
+        frame = _live_frame_renderable(display_text)
+        if live is None:
+            # Rich Live.update() 默认不 refresh；auto_refresh=False 时终端会一直停在首帧。
+            # 用后台刷新线程 + 首帧 start(refresh=True)，节流路径里仍 update 新 renderable。
+            live = Live(
+                frame,
+                console=console,
+                auto_refresh=True,
+                refresh_per_second=30,
+                transient=True,
+                vertical_overflow='ellipsis',
+            )
+            live.start(refresh=True)
+        else:
+            try:
+                live.update(frame)
+            except BaseException:
+                pass
+        last_render_time = now
+        last_painted_display_len = dlen
+
+    def _squash_live_for_halt() -> None:
+        if use_live and _streaming_display_payload().strip():
+            _apply_streaming_live(force=True, queue_quiet=True)
 
     def _stop_live() -> None:
-        nonlocal live
+        nonlocal live, last_render_time, last_painted_display_len
         if live is not None:
             try:
                 live.stop()
             except BaseException:
                 pass
             live = None
+        # 下一轮 Live 重新计时，避免工具间隙的「首包」被旧时间戳节流卡死
+        last_render_time = 0.0
+        last_painted_display_len = 0
 
     def _poll(*, show_thinking_status: bool) -> dict[str, Any] | None:
         status_obj: Any = None
@@ -586,14 +676,17 @@ def _run_streaming_turn(
             et = ev['type']
 
             if et == 'blocked':
+                _squash_live_for_halt()
                 _stop_live()
                 _print_assistant_output(console, ev['output'])
                 return
             if et == 'llm_error':
+                _squash_live_for_halt()
                 _stop_live()
                 _print_assistant_error(console, ev['output'])
                 return
             if et == 'team_agent':
+                _squash_live_for_halt()
                 _stop_live()
                 agent = str(ev.get('agent', 'Agent'))
                 styles = {
@@ -606,16 +699,19 @@ def _run_streaming_turn(
                 pending = _poll(show_thinking_status=use_live and live is None)
                 continue
             if et == 'non_llm':
+                _squash_live_for_halt()
                 _stop_live()
                 _print_assistant_output(console, ev['output'])
                 return
             if et == 'tool_phase':
+                _squash_live_for_halt()
                 _stop_live()
                 label = ', '.join(ev['tools'])
                 console.print(f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]')
                 pending = _poll(show_thinking_status=use_live and live is None)
                 continue
             if et == 'api_tool_op':
+                _squash_live_for_halt()
                 _stop_live()
                 if buffer.strip():
                     _print_assistant_output(console, buffer)
@@ -655,42 +751,14 @@ def _run_streaming_turn(
                     except Exception:
                         break
 
-                # O(N^2) 渲染节流阀：限制 Markdown 解析的 CPU 开销
-                now = time.time()
-                if now - last_render_time >= RENDER_INTERVAL or outq.empty():
-                    if use_live:
-                        display_text = buffer
-                        if tool_streaming_buffer:
-                            tool_lines = tool_streaming_buffer.splitlines()
-                            # 🛡️ 开启“矩阵滚动视窗”：如果 JSON 超过 15 行，只截取最后 15 行，防止撑爆屏幕高度导致历史记录污染
-                            if len(tool_lines) > 15:
-                                rolling_tool = '...\n' + '\n'.join(tool_lines[-15:])
-                            else:
-                                rolling_tool = tool_streaming_buffer
-                            display_text += (
-                                '\n\n> ⚙️ **正在编写代码与工具参数...**\n```json\n'
-                                f'{rolling_tool}\n```'
-                            )
-                        md = streaming_markdown_for_live(display_text)
-                        if live is None:
-                            live = Live(
-                                md,
-                                console=console,
-                                refresh_per_second=8,
-                                transient=True,
-                                vertical_overflow='ellipsis',
-                            )
-                            live.start()
-                        else:
-                            try:
-                                live.update(md)
-                            except BaseException:
-                                pass
-                    last_render_time = now
+                # 节流：~30Hz 时间片 + 小批次字形；队列静默时不过滤尾包
+                queue_quiet = outq.empty()
+                _apply_streaming_live(force=False, queue_quiet=queue_quiet)
 
                 pending = _poll(show_thinking_status=False)
                 continue
             if et == 'finished':
+                _squash_live_for_halt()
                 _stop_live()
                 out = ev.get('output', '')
                 show_tool_collapse = round_saw_tool_json_stream or bool(
@@ -722,6 +790,8 @@ def _run_streaming_turn(
                 outq.get_nowait()
         except queue.Empty:
             pass
+        _squash_live_for_halt()
+        _stop_live()
         _print_graceful_interrupt(console, use_rich=True)
     finally:
         _stop_live()

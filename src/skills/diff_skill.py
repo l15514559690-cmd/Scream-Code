@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ..repl_slash_helpers import msg
+from ..scream_theme import ScreamTheme, nested_skill_panel, skill_panel
 from .base_skill import BaseSkill, ReplSkillContext, SkillOutcome
 
 
@@ -16,8 +17,6 @@ class DiffSkill(BaseSkill):
     category: ClassVar[str] = 'system'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
-        from rich import box
-        from rich.panel import Panel
         from rich.syntax import Syntax
 
         console = context.console
@@ -73,23 +72,17 @@ class DiffSkill(BaseSkill):
                 word_wrap=True,
             )
             panels.append(
-                Panel(
+                nested_skill_panel(
                     status_body,
-                    title='git status --short',
-                    border_style='dim',
-                    box=box.ROUNDED,
-                    padding=(0, 1),
-                    expand=True,
+                    title=f'[{ScreamTheme.TEXT_MUTED}]git status --short[/{ScreamTheme.TEXT_MUTED}]',
+                    variant='neutral',
                 )
             )
         panels.append(
-            Panel(
+            nested_skill_panel(
                 stat_body,
-                title='git diff --stat',
-                border_style='cyan',
-                box=box.ROUNDED,
-                padding=(0, 1),
-                expand=True,
+                title=f'[{ScreamTheme.TEXT_INFO}]git diff --stat[/{ScreamTheme.TEXT_INFO}]',
+                variant='info',
             )
         )
 
@@ -97,12 +90,10 @@ class DiffSkill(BaseSkill):
             from rich.console import Group
 
             console.print(
-                Panel(
+                skill_panel(
                     Group(*panels),
-                    title='[bold cyan]/diff · 工作区[/bold cyan]',
-                    border_style='cyan',
-                    box=box.ROUNDED,
-                    expand=True,
+                    title=f'[{ScreamTheme.TEXT_INFO}]/diff · 工作区[/{ScreamTheme.TEXT_INFO}]',
+                    variant='info',
                 )
             )
         else:

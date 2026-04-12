@@ -7,7 +7,12 @@ import unittest
 
 from rich.console import Console
 
-from src.repl_ui_render import build_api_tool_op_renderable, tool_execution_status_message
+from src.repl_ui_render import (
+    build_api_tool_op_renderable,
+    prepare_streaming_live_buffer,
+    stabilize_streaming_markdown_fences,
+    tool_execution_status_message,
+)
 
 
 class ReplUiRenderTests(unittest.TestCase):
@@ -41,6 +46,23 @@ class ReplUiRenderTests(unittest.TestCase):
         c = Console(file=buf, force_terminal=True, width=60, record=True)
         c.print(r)
         self.assertIn('echo hi', c.export_text(clear=False))
+
+    def test_stabilize_closes_trailing_fence(self) -> None:
+        raw = '前言\n```python\nx = 1 +'
+        out = stabilize_streaming_markdown_fences(raw)
+        self.assertTrue(out.rstrip().endswith('```'))
+
+    def test_stabilize_balanced_fence_noop(self) -> None:
+        raw = '```python\npass\n```\nok'
+        self.assertEqual(stabilize_streaming_markdown_fences(raw), raw)
+
+    def test_prepare_viewport_shortens_tall_buffer(self) -> None:
+        lines = [f'L{i:04d}' for i in range(200)]
+        buf = '\n'.join(lines)
+        c = Console(force_terminal=True, width=100, height=24)
+        out = prepare_streaming_live_buffer(buf, console=c)
+        self.assertIn('live fold', out)
+        self.assertLess(out.count('\n'), buf.count('\n'))
 
 
 if __name__ == '__main__':

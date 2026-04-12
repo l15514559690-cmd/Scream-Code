@@ -1,12 +1,15 @@
 """
 纯 Python 终端 UI：``prompt_toolkit`` + ``rich``，替代 macOS 上易受 PTY EOF 影响的 crossterm 路径。
 
-- **流式 + 代码高亮**：``_run_streaming_turn`` 中 ``Live`` 仅裸 ``ScreamMarkdown``（``transient=True``），
-  定稿为固定靛紫 ``Panel``；首包前 ``console.status`` 思考动画；**不用** ``patch_stdout``。
-- **视觉**：靛紫品牌色、欢迎 Panel；协议/模式/模型与 Token 费用固定在 prompt **底部工具栏**，不污染 scrollback。
-- **斜杠补全**：输入 ``/`` 后弹出指令补全菜单（紫色选中项；条目来自 ``skills_registry``）；
-  菜单打开时 **Enter** 仅确认补全并插入空格，不提交整行（见 ``repl_slash_helpers``）。
-- **PTY 断开**：主输入循环捕获 ``EOFError`` 后直接 ``sys.exit(0)``，不做复杂清理，避免死循环占满 CPU。
+- **流式丝滑管线**（经 ``replLauncher._run_streaming_turn`` + ``repl_ui_render``）：
+  ``Live(auto_refresh=False)`` 仅在我们节流后的帧上 ``update``；15ms 时间片 + 字形批处理，
+  避免每 token 全量 Markdown 重排；终端高度绑定的**尾部视口**把滚动锁在 Live 区，scrollback 不乱跳；
+  未闭合 `` ``` `` 在解析前虚拟闭合，Pygments 结构不塌。
+- **定稿**：瞬态 Live 结束后靛紫 ``Panel`` / ``print_solidified_assistant_markdown`` 写入历史；首包前 ``console.status``；
+  **不用** ``patch_stdout``。
+- **神经底栏**：``prompt_toolkit`` 的 ``bottom_toolbar`` 全宽深色条 + 青/绿高亮；TUI 流式时在 ``Live`` 内用 ``Group`` 叠一行 Rich 页脚，与输入态信息同源（模型 / 沙箱 / 记忆条数 / Token%）。
+- **斜杠补全**：``/`` 菜单；**Enter** 在补全打开时只确认补全（见 ``repl_slash_helpers``）。
+- **PTY 断开**：``EOFError`` → ``sys.exit(0)``。
 """
 
 from __future__ import annotations
@@ -172,11 +175,66 @@ def _infer_protocol_label() -> str:
     return '—'
 
 
-def _status_model(engine: Any) -> str:
-    """状态栏模型名以 ``engine.config.llm_model`` 为准（由下方与项目配置同步）。"""
+def neural_status_fields(engine: Any) -> dict[str, Any]:
+    """
+    神经状态栏数据源：供 ``bottom_toolbar`` HTML 与 Rich 流式页脚共用。
+    Token% 相对 ``QueryEngineConfig.max_budget_tokens``（与引擎会话预算一致）。
+    """
+    from .memory_store import count_core_memory_entries
+    from .sandbox_env import SandboxManager
+
     cfg = getattr(engine, 'config', None)
-    raw = (getattr(cfg, 'llm_model', None) or '').strip()
-    return raw if raw else '(default)'
+    raw_model = (getattr(cfg, 'llm_model', None) or '').strip()
+    if not raw_model:
+        try:
+            from .llm_settings import read_llm_connection_settings
+
+            raw_model = (read_llm_connection_settings().model or '').strip()
+        except Exception:
+            raw_model = ''
+    model = raw_model or '(default)'
+
+    u = getattr(engine, 'total_usage', None)
+    inp = int(getattr(u, 'input_tokens', 0) or 0) if u is not None else 0
+    outp = int(getattr(u, 'output_tokens', 0) or 0) if u is not None else 0
+    total = inp + outp
+
+    try:
+        max_budget = int(getattr(cfg, 'max_budget_tokens', 12_000_000) or 12_000_000)
+    except (TypeError, ValueError):
+        max_budget = 12_000_000
+    if max_budget <= 0:
+        max_budget = 12_000_000
+    token_pct = min(100, max(0, (total * 100) // max_budget))
+
+    return {
+        'model': model,
+        'sandbox_on': bool(SandboxManager.instance().is_sandbox_enabled),
+        'memory_n': count_core_memory_entries(),
+        'token_pct': token_pct,
+        'total_tokens': total,
+        'team': bool(getattr(engine, 'repl_team_mode', False)),
+    }
+
+
+def neural_status_stream_footer_markup(engine: Any) -> str:
+    """Rich ``Text.from_markup`` 单行；与底栏语义对齐，嵌入 ``Live`` 底部。"""
+    f = neural_status_fields(engine)
+    sb_on = (
+        '[bold #4ade80]🛡️ 沙箱: ON[/bold #4ade80]'
+        if f['sandbox_on']
+        else '[bold #f87171]🔓 沙箱: OFF[/bold #f87171]'
+    )
+    team = '[bold #fbbf24]🐺 TEAM[/bold #fbbf24]' if f['team'] else '[dim]单人[/dim]'
+    pct = f['token_pct']
+    pct_style = '#fbbf24' if pct >= 85 else '#34d399' if pct < 50 else '#2dd4bf'
+    return (
+        f'[{_BRAND_HEX}]◈ NEURAL·BAR[/]  '
+        f'[bold #2dd4bf][{f["model"]}][/bold #2dd4bf]  ·  {sb_on}  ·  '
+        f'[bold #5eead4]🧠 记忆: {f["memory_n"]}条[/bold #5eead4]  ·  '
+        f'[bold {pct_style}]📊 Token: {pct}%[/bold {pct_style}] '
+        f'[dim](Σ {f["total_tokens"]})[/dim]  ·  {team}'
+    )
 
 
 def _tui_load_dotenv_layers() -> None:
@@ -232,48 +290,37 @@ def _print_user_message(console: Any, text: str) -> None:
 
 
 def _get_bottom_toolbar(engine: Any) -> Any:
+    """紧贴输入行下方、全宽持久渲染；由 ``Style`` 铺深蓝近黑底。"""
     from prompt_toolkit.formatted_text import HTML
-    import html
 
-    # 1. 协议
-    try:
-        from .llm_settings import read_llm_connection_settings
-        c = read_llm_connection_settings()
-        proto = (c.api_protocol or '').strip().lower()
-        if proto == 'anthropic':
-            protocol = 'Anthropic'
-        elif proto == 'openai':
-            protocol = 'OpenAI-compat'
-        else:
-            protocol = 'Custom'
-    except Exception:
-        protocol = '—'
+    import html as html_mod
 
-    # 2. 模型
-    cfg = getattr(engine, 'config', None)
-    raw_model = (getattr(cfg, 'llm_model', None) or '').strip()
-    model = raw_model if raw_model else '(default)'
-
-    # 3. 消耗
-    u = getattr(engine, 'total_usage', None)
-    inp = int(getattr(u, 'input_tokens', 0) or 0) if u is not None else 0
-    outp = int(getattr(u, 'output_tokens', 0) or 0) if u is not None else 0
-    total = inp + outp
-    usd = (inp * 3.0 + outp * 15.0) / 1_000_000.0
-    usd_s = f'{usd:.4f}' if usd >= 0.0001 else f'{usd:.6f}'
-
-    # 4. 模式
-    use_team = bool(getattr(engine, 'repl_team_mode', False))
-    if use_team:
-        mode_html = '<ansiyellow><b>🐺 群狼模式</b></ansiyellow>'
-    else:
-        mode_html = '<ansigray><b>👤 单人模式</b></ansigray>'
-
+    f = neural_status_fields(engine)
+    m = html_mod.escape(f['model'])
+    sb_txt = '🛡️ 沙箱: ON' if f['sandbox_on'] else '🔓 沙箱: OFF'
+    sb_cls = 'ansigreen' if f['sandbox_on'] else 'ansired'
+    pct = f['token_pct']
+    pct_cls = 'ansiyellow' if pct >= 85 else 'ansigreen' if pct < 50 else 'ansicyan'
+    team = (
+        '<ansiyellow><b>🐺 TEAM</b></ansiyellow>'
+        if f['team']
+        else '<ansibrightblack>单人</ansibrightblack>'
+    )
     return HTML(
-        f'  <ansicyan><b>协议:</b></ansicyan> {html.escape(protocol)}  <ansiblue>│</ansiblue>  '
-        f'{mode_html}  <ansiblue>│</ansiblue>  '
-        f'<ansicyan><b>模型:</b></ansicyan> {html.escape(model)}  <ansiblue>│</ansiblue>  '
-        f'<ansicyan><b>消耗:</b></ansicyan> Σ {total} (↑{inp} ↓{outp}) ≈ ${usd_s}  '
+        ' '
+        '<ansicyan><b>◈</b></ansicyan> '
+        f'<ansigreen><b>[{m}]</b></ansigreen>  '
+        '<ansiblue>│</ansiblue>  '
+        f'<{sb_cls}><b>{html_mod.escape(sb_txt)}</b></{sb_cls}>  '
+        '<ansiblue>│</ansiblue>  '
+        '<ansicyan><b>🧠 记忆</b></ansicyan> '
+        f'<ansigreen><b>{f["memory_n"]}条</b></ansigreen>  '
+        '<ansiblue>│</ansiblue>  '
+        '<ansicyan><b>📊 Token</b></ansicyan> '
+        f'<{pct_cls}><b>{pct}%</b></{pct_cls}>  '
+        f'<ansibrightblack>Σ {f["total_tokens"]}</ansibrightblack>  '
+        '<ansiblue>│</ansiblue>  '
+        f'{team}  '
     )
 
 
@@ -379,7 +426,13 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                 console.print(Rule(style=_BRAND_MUTED))
                 try:
                     _run_streaming_turn(
-                        engine, runtime, fp, console, route_limit=route_limit, team=use_team
+                        engine,
+                        runtime,
+                        fp,
+                        console,
+                        route_limit=route_limit,
+                        team=use_team,
+                        status_engine=engine,
                     )
                 except KeyboardInterrupt:
                     _print_graceful_interrupt(console, use_rich=True)
@@ -409,7 +462,13 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
         console.print(Rule(style=_BRAND_MUTED))
         try:
             _run_streaming_turn(
-                engine, runtime, msg, console, route_limit=route_limit, team=use_team
+                engine,
+                runtime,
+                msg,
+                console,
+                route_limit=route_limit,
+                team=use_team,
+                status_engine=engine,
             )
         except KeyboardInterrupt:
             _print_graceful_interrupt(console, use_rich=True)

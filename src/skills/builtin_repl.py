@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import ClassVar
 
 from ..query_engine import QueryEnginePort
+from ..scream_theme import ScreamTheme, Variant, skill_panel
 from ..repl_slash_helpers import (
     confirm_store_summary,
     flush_current_repl_session,
@@ -73,17 +74,16 @@ class MemoSkill(BaseSkill):
         if memo_direct:
             result = append_long_term_memory_block(memo_direct, source_tag='/memo')
             if context.console is not None:
-                from rich.panel import Panel
                 from rich.text import Text
 
                 ok = result.startswith('已安全')
-                st = 'bold green' if ok else 'yellow'
-                br = 'green' if ok else 'yellow'
+                st = ScreamTheme.TEXT_SUCCESS if ok else ScreamTheme.TEXT_WARNING
+                memo_var: Variant = 'success' if ok else 'warning'
                 context.console.print(
-                    Panel(
+                    skill_panel(
                         Text.from_markup(f'[{st}]{result}[/{st}]'),
-                        title='[bold]/memo · 长效记忆[/bold]',
-                        border_style=br,
+                        title=f'[{ScreamTheme.TEXT_INFO}]/memo · 长效记忆[/{ScreamTheme.TEXT_INFO}]',
+                        variant=memo_var,
                     )
                 )
             else:

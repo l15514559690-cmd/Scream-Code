@@ -136,6 +136,18 @@ def list_core_rules() -> list[dict[str, str]]:
     ]
 
 
+def count_core_memory_entries() -> int:
+    """``SELECT COUNT(*)``；读库失败时返回 ``0``（不抛）。"""
+    try:
+        with _connect() as conn:
+            row = conn.execute('SELECT COUNT(*) AS n FROM core_memory').fetchone()
+        if row is None:
+            return 0
+        return int(row['n'])
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return 0
+
+
 def format_project_long_term_memory_xml_block() -> str:
     """
     将 ``core_memory`` 全量格式化为 ``<Project_LongTerm_Memory>`` XML 块，供拼入系统提示词末尾。

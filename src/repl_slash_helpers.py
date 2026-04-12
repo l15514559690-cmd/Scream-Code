@@ -15,6 +15,7 @@ from .models import UsageSummary
 from .parity_audit import run_parity_audit
 from .project_memory import append_long_term_memory_block, read_first_available_project_memory
 from .query_engine import QueryEnginePort
+from .scream_theme import ScreamTheme, skill_panel
 from .session_store import list_saved_session_entries, load_session
 from .setup import run_setup
 from .skills.base_skill import SLASH_CATEGORY_ORDER, SLASH_CATEGORY_TITLE
@@ -140,7 +141,6 @@ def print_slash_help(console: Any | None, registry: Any) -> None:
     ]
 
     if console is not None:
-        from rich import box
         from rich.console import Group
         from rich.table import Table
         from rich.text import Text
@@ -148,18 +148,22 @@ def print_slash_help(console: Any | None, registry: Any) -> None:
         def block(rows: list[tuple[str, str]]) -> Table:
             t = Table(
                 show_header=False,
-                box=box.SIMPLE,
+                box=ScreamTheme.BOX_COMPACT,
                 show_edge=False,
                 padding=(0, 1),
                 pad_edge=False,
+                expand=True,
             )
-            t.add_column('cmd', style='bold green', no_wrap=True)
-            t.add_column('说明', style='dim')
+            t.add_column('cmd', style=ScreamTheme.TABLE_COL_CMD, no_wrap=True, overflow='fold')
+            t.add_column('说明', style=ScreamTheme.TABLE_COL_DESC, overflow='fold', ratio=1)
             for cmd, desc in rows:
                 t.add_row(cmd, desc)
             return t
 
-        parts: list[Any] = [Text.from_markup('[bold cyan]尖叫 Code · 斜杠指令[/bold cyan]'), Text('')]
+        parts: list[Any] = [
+            Text.from_markup(f'[{ScreamTheme.TEXT_INFO}]尖叫 Code · 斜杠指令[/{ScreamTheme.TEXT_INFO}]'),
+            Text(''),
+        ]
         for cat in SLASH_CATEGORY_ORDER:
             title = SLASH_CATEGORY_TITLE.get(cat, cat)
             rows: list[tuple[str, str]] = []
@@ -176,10 +180,17 @@ def print_slash_help(console: Any | None, registry: Any) -> None:
                 rows.extend(system_tail)
             if not rows:
                 continue
-            parts.append(Text.from_markup(f'[bold]{title}[/bold]'))
+            parts.append(Text.from_markup(f'[bold {ScreamTheme.BORDER_ACCENT}]{title}[/bold {ScreamTheme.BORDER_ACCENT}]'))
             parts.append(block(rows))
             parts.append(Text(''))
-        console.print(Group(*parts))
+        console.print(
+            skill_panel(
+                Group(*parts),
+                title=f'[{ScreamTheme.TEXT_ACCENT}]/help · 指令索引[/{ScreamTheme.TEXT_ACCENT}]',
+                variant='accent',
+                padding=(0, 1),
+            )
+        )
         console.print()
     else:
         print('\n=== 尖叫 Code · /help ===\n')
@@ -203,15 +214,13 @@ def print_slash_help(console: Any | None, registry: Any) -> None:
 def print_markdown_block(console: Any | None, md: str, *, title: str) -> None:
     text = md.strip()
     if console is not None:
-        from rich.panel import Panel
-
         from .repl_ui_render import STREAMING_CODE_THEME, ScreamMarkdown
 
         console.print(
-            Panel(
+            skill_panel(
                 ScreamMarkdown(text, code_theme=STREAMING_CODE_THEME),
                 title=title,
-                border_style='green',
+                variant='success',
             )
         )
     else:
@@ -221,34 +230,33 @@ def print_markdown_block(console: Any | None, md: str, *, title: str) -> None:
 def print_audit(console: Any | None) -> None:
     result = run_parity_audit()
     if console is not None:
-        from rich.panel import Panel
         from rich.table import Table
 
-        t = Table(title='parity-audit · 摘要', show_lines=True)
-        t.add_column('指标', style='cyan', no_wrap=True)
-        t.add_column('值', style='white')
+        t = Table(title='parity-audit · 摘要', show_lines=True, expand=True)
+        t.add_column('指标', style=ScreamTheme.TABLE_COL_KEY, no_wrap=True, overflow='fold')
+        t.add_column('值', style=ScreamTheme.TABLE_COL_VAL, overflow='fold')
         t.add_row('归档可用', '是' if result.archive_present else '否')
         t.add_row('根文件覆盖', f'{result.root_file_coverage[0]}/{result.root_file_coverage[1]}')
         t.add_row('目录覆盖', f'{result.directory_coverage[0]}/{result.directory_coverage[1]}')
         t.add_row('Python/TS 文件', f'{result.total_file_ratio[0]}/{result.total_file_ratio[1]}')
         t.add_row('命令条目', f'{result.command_entry_ratio[0]}/{result.command_entry_ratio[1]}')
         t.add_row('工具条目', f'{result.tool_entry_ratio[0]}/{result.tool_entry_ratio[1]}')
-        console.print(Panel(t, border_style='yellow', title='[/audit]'))
+        console.print(skill_panel(t, title='[/audit] · 摘要', variant='warning'))
 
         n_root = len(result.missing_root_targets)
         n_dir = len(result.missing_directory_targets)
         if n_root or n_dir:
-            miss = Table(title='缺失项（节选）', show_lines=True)
-            miss.add_column('类型', style='dim', no_wrap=True)
-            miss.add_column('名称', style='red')
+            miss = Table(title='缺失项（节选）', show_lines=True, expand=True)
+            miss.add_column('类型', style=ScreamTheme.TEXT_MUTED, no_wrap=True, overflow='fold')
+            miss.add_column('名称', style=ScreamTheme.TEXT_ERROR, overflow='fold')
             for x in result.missing_root_targets[:16]:
                 miss.add_row('根文件', x)
             for x in result.missing_directory_targets[:16]:
                 miss.add_row('目录', x)
             if n_root > 16 or n_dir > 16:
                 miss.add_row('…', f'另有 {max(0, n_root - 16) + max(0, n_dir - 16)} 条，见下方 Markdown')
-            console.print(miss)
-        print_markdown_block(console, result.to_markdown(), title='完整报告 (Markdown)')
+            console.print(skill_panel(miss, title='[/audit] · 缺失项', variant='error'))
+        print_markdown_block(console, result.to_markdown(), title='[/audit] · 完整报告 (Markdown)')
     else:
         print(result.to_markdown())
 
@@ -258,13 +266,13 @@ def print_subsystems(console: Any | None, engine: QueryEnginePort) -> None:
     if console is not None:
         from rich.table import Table
 
-        t = Table(title='subsystems · 顶层 Python 模块', show_lines=True)
-        t.add_column('模块', style='cyan', no_wrap=True)
-        t.add_column('文件数', justify='right', style='white')
-        t.add_column('备注', style='dim')
+        t = Table(title='subsystems · 顶层 Python 模块', show_lines=True, expand=True)
+        t.add_column('模块', style=ScreamTheme.TABLE_COL_KEY, no_wrap=True, overflow='fold')
+        t.add_column('文件数', justify='right', style=ScreamTheme.TABLE_COL_VAL)
+        t.add_column('备注', style=ScreamTheme.TABLE_COL_DESC, overflow='fold')
         for m in modules:
             t.add_row(m.name, str(m.file_count), (m.notes or '—')[:80])
-        console.print(t)
+        console.print(skill_panel(t, title='[/subsystems]', variant='info'))
     else:
         for m in modules:
             print(f'{m.name}\t{m.file_count}\t{m.notes}')
@@ -276,14 +284,15 @@ def print_graph(console: Any | None) -> None:
     bg = build_bootstrap_graph()
     cg = build_command_graph()
     if console is not None:
+        from rich.console import Group
+        from rich.text import Text
         from rich.tree import Tree
 
-        r1 = Tree('[bold magenta]bootstrap-graph · 引导/运行流[/bold magenta]')
+        r1 = Tree(f'[{ScreamTheme.TEXT_ACCENT}]bootstrap-graph · 引导/运行流[/{ScreamTheme.TEXT_ACCENT}]')
         for st in bg.stages:
             r1.add(escape(st))
-        console.print(r1)
 
-        r2 = Tree('[bold magenta]command-graph · 命令路由面[/bold magenta]')
+        r2 = Tree(f'[{ScreamTheme.TEXT_ACCENT}]command-graph · 命令路由面[/{ScreamTheme.TEXT_ACCENT}]')
         b = r2.add(f'内建命令 ({len(cg.builtins)})')
         for m in cg.builtins[:30]:
             b.add(escape(m.name))
@@ -301,7 +310,13 @@ def print_graph(console: Any | None) -> None:
             sk.add(escape(m.name))
         if len(cg.skill_like) > 20:
             sk.add('…')
-        console.print(r2)
+        console.print(
+            skill_panel(
+                Group(r1, Text(''), r2),
+                title=f'[{ScreamTheme.TEXT_ACCENT}]/graph · 拓扑[/{ScreamTheme.TEXT_ACCENT}]',
+                variant='accent',
+            )
+        )
     else:
         print('=== bootstrap-graph ===')
         for st in bg.stages:
@@ -352,15 +367,14 @@ def print_doctor(console: Any | None) -> None:
         )
 
     if console is not None:
-        from rich.panel import Panel
         from rich.table import Table
 
-        t = Table(title='/doctor · 系统体检', show_lines=True)
-        t.add_column('检查项', style='cyan')
-        t.add_column('结果')
+        t = Table(title='/doctor · 系统体检', show_lines=True, expand=True)
+        t.add_column('检查项', style=ScreamTheme.TABLE_COL_KEY, overflow='fold')
+        t.add_column('结果', overflow='fold')
         for name, val, st in rows:
             t.add_row(name, f'[{st}]{val}[/{st}]')
-        console.print(Panel(t, border_style='green'))
+        console.print(skill_panel(t, title='[/doctor]', variant='success'))
     else:
         for name, val, st in rows:
             print(f'{name}: {val}')
@@ -376,18 +390,17 @@ def print_cost(console: Any | None, engine: QueryEnginePort) -> None:
     extra_out = sum(x[3] for x in entries)
 
     if console is not None:
-        from rich.panel import Panel
         from rich.table import Table
 
-        t = Table(title='/cost · Token 与粗略费用（USD 估算）', show_lines=True)
-        t.add_column('项', style='cyan')
-        t.add_column('值', justify='right')
+        t = Table(title='/cost · Token 与粗略费用（USD 估算）', show_lines=True, expand=True)
+        t.add_column('项', style=ScreamTheme.TABLE_COL_KEY, overflow='fold')
+        t.add_column('值', justify='right', overflow='fold')
         t.add_row('本会话 input_tokens', str(u.input_tokens))
         t.add_row('本会话 output_tokens', str(u.output_tokens))
         t.add_row('估算费用（示意）', f'~${est:.6f}')
         t.add_row('最近落盘会话(前5) in 合计', str(extra_in))
         t.add_row('最近落盘会话(前5) out 合计', str(extra_out))
-        console.print(Panel(t, border_style='magenta'))
+        console.print(skill_panel(t, title='[/cost]', variant='accent'))
         console.print('[dim]费率仅为示意；以厂商账单为准。[/dim]')
     else:
         print(f'input={u.input_tokens} output={u.output_tokens} ~${est:.6f} (示意)')
@@ -425,15 +438,14 @@ def print_status(console: Any | None, engine: QueryEnginePort) -> None:
         ('团队模式', '开' if engine.repl_team_mode else '关'),
     ]
     if console is not None:
-        from rich.panel import Panel
         from rich.table import Table
 
-        t = Table(title='/status · Agent 与配置', show_lines=True)
-        t.add_column('项', style='cyan', no_wrap=True)
-        t.add_column('值', style='white')
+        t = Table(title='/status · Agent 与配置', show_lines=True, expand=True)
+        t.add_column('项', style=ScreamTheme.TABLE_COL_KEY, no_wrap=True, overflow='fold')
+        t.add_column('值', style=ScreamTheme.TABLE_COL_VAL, overflow='fold')
         for k, v in rows:
             t.add_row(k, v)
-        console.print(Panel(t, border_style='blue'))
+        console.print(skill_panel(t, title='[/status]', variant='accent'))
     else:
         for k, v in rows:
             print(f'{k}: {v}')
@@ -442,8 +454,6 @@ def print_status(console: Any | None, engine: QueryEnginePort) -> None:
 def print_sessions(console: Any | None) -> None:
     entries = list_saved_session_entries(limit=80)
     if console is not None:
-        from rich import box
-        from rich.panel import Panel
         from rich.table import Table
 
         if not entries:
@@ -451,18 +461,18 @@ def print_sessions(console: Any | None) -> None:
             return
         t = Table(
             title='/sessions · 本地会话历史',
-            box=box.ROUNDED,
+            box=ScreamTheme.BOX,
             show_lines=True,
             expand=True,
         )
-        t.add_column('会话 ID', style='bold cyan', no_wrap=True, overflow='fold')
-        t.add_column('消息数', justify='right', style='white')
-        t.add_column('↑入 / ↓出', justify='right', style='dim')
-        t.add_column('更新时间', style='dim')
+        t.add_column('会话 ID', style=ScreamTheme.TEXT_INFO, no_wrap=True, overflow='fold')
+        t.add_column('消息数', justify='right', style=ScreamTheme.TABLE_COL_VAL)
+        t.add_column('↑入 / ↓出', justify='right', style=ScreamTheme.TEXT_MUTED)
+        t.add_column('更新时间', style=ScreamTheme.TEXT_MUTED, overflow='fold')
         for sid, n, it, ot, path in entries:
             ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(path.stat().st_mtime))
             t.add_row(sid, str(n), f'{it}/{ot}', ts)
-        console.print(Panel(t, border_style='cyan', box=box.ROUNDED))
+        console.print(skill_panel(t, title='[/sessions]', variant='info'))
         console.print('[dim]恢复上下文: [bold]/load <session_id>[/bold][/dim]')
     else:
         if not entries:
@@ -481,24 +491,23 @@ def msg(console: Any | None, text: str, *, style: str = 'dim') -> None:
 
 
 def print_skills_table(console: Any | None) -> None:
-    from rich import box
-    from rich.panel import Panel
     from rich.table import Table
 
     cg = build_command_graph()
     table = Table(
-        title='[bold cyan]/skills · 已加载的扩展能力[/bold cyan]',
-        box=box.ROUNDED,
+        title=f'[{ScreamTheme.TEXT_ACCENT}]/skills · 已加载的扩展能力[/{ScreamTheme.TEXT_ACCENT}]',
+        box=ScreamTheme.BOX,
         show_lines=True,
+        expand=True,
     )
-    table.add_column('名称', style='green')
-    table.add_column('类型', style='cyan')
+    table.add_column('名称', style=ScreamTheme.TEXT_SUCCESS, overflow='fold')
+    table.add_column('类型', style=ScreamTheme.TABLE_COL_KEY, overflow='fold')
     for m in cg.skill_like:
         table.add_row(m.name, 'Skill (技能)')
     for m in cg.plugin_like:
         table.add_row(m.name, 'Plugin (插件)')
     if console is not None:
-        console.print(Panel(table, border_style='green'))
+        console.print(skill_panel(table, variant='success'))
     else:
         print('/skills · 已加载的扩展能力')
         for m in cg.skill_like:
@@ -520,13 +529,13 @@ def print_config_panel(console: Any | None) -> None:
         return
     if console is not None:
         from rich.json import JSON
-        from rich.panel import Panel
 
         console.print(
-            Panel(
+            skill_panel(
                 JSON(json.dumps(raw, ensure_ascii=False, indent=2)),
-                title='[bold]/config · llm_config.json[/bold]',
-                border_style='blue',
+                title=f'[{ScreamTheme.TEXT_ACCENT}]/config · llm_config.json[/{ScreamTheme.TEXT_ACCENT}]',
+                variant='accent',
+                padding=(1, 1),
             )
         )
     else:
@@ -554,7 +563,8 @@ def prompt_toolkit_scream_slash_style() -> Any:
             'completion-menu.meta.completion': 'fg:#64748b',
             'completion-menu.meta.completion.current': f'bg:{brand} fg:#a5b4fc',
             '': 'fg:#e2e8f0',
-            'bottom-toolbar': 'bg:#1e1e2e fg:#e2e8f0',
+            # 神经底栏：近黑底 + 默认灰字；高亮由 HTML 内 ansicyan / ansigreen 控制
+            'bottom-toolbar': 'bg:#020617 fg:#64748b noreverse',
         }
     )
 

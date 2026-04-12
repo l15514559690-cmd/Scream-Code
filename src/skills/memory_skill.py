@@ -4,6 +4,7 @@ from typing import ClassVar
 
 from ..memory_store import forget_core_rule, list_core_rules, memorize_core_rule, memory_db_path
 from ..repl_slash_helpers import msg
+from ..scream_theme import ScreamTheme, Variant, skill_panel
 from .base_skill import BaseSkill, ReplSkillContext, SkillOutcome
 
 
@@ -32,36 +33,36 @@ class MemorySkill(BaseSkill):
         rows = list_core_rules()
         db = memory_db_path()
         if console is not None:
-            from rich import box
-            from rich.panel import Panel
             from rich.table import Table
-            from rich.text import Text
 
             t = Table(
-                title='[bold magenta]◆ NEURAL_BUFFER[/bold magenta] [cyan]·[/cyan] [bold]core_memory[/bold]',
+                title='[bold cyan]◆ NEURAL_BUFFER · core_memory[/bold cyan]',
                 caption=f'[dim]sink: {db}  ·  {len(rows)} slot(s)[/dim]',
-                box=box.HEAVY_EDGE,
+                box=ScreamTheme.BOX,
                 show_header=True,
-                header_style='bold cyan',
-                border_style='bright_blue',
+                header_style=ScreamTheme.TABLE_HEADER,
+                border_style=ScreamTheme.border('info'),
                 expand=True,
                 show_lines=True,
             )
-            t.add_column('key_name', style='bold green', no_wrap=True, max_width=28, overflow='fold')
-            t.add_column('content', style='white', ratio=1, overflow='fold', max_width=72)
-            t.add_column('updated_at', style='dim', no_wrap=True, max_width=26, overflow='ellipsis')
+            t.add_column('key_name', style=ScreamTheme.TABLE_COL_CMD, no_wrap=True, overflow='fold', max_width=30)
+            t.add_column('content', style=ScreamTheme.TABLE_COL_VAL, ratio=1, overflow='fold')
+            t.add_column('updated_at', style=ScreamTheme.TEXT_MUTED, no_wrap=True, max_width=28, overflow='ellipsis')
             if not rows:
-                t.add_row('[dim]— empty —[/dim]', '[dim]尚无持久化规则；使用 /memory set 或工具 memorize_project_rule[/dim]', '—')
+                t.add_row(
+                    '[dim]— empty —[/dim]',
+                    '[dim]尚无持久化规则；使用 /memory set 或工具 memorize_project_rule[/dim]',
+                    '—',
+                )
             else:
                 for r in rows:
                     t.add_row(r['key_name'], r['content'], r['updated_at'])
             console.print(
-                Panel(
+                skill_panel(
                     t,
-                    title='[bold white on blue] LONG-TERM MEMORY [/bold white on blue]',
-                    subtitle='[dim]subconscious layer · injected into system prompt as XML[/dim]',
-                    border_style='magenta',
-                    box=box.DOUBLE,
+                    title=f'[{ScreamTheme.TEXT_ACCENT}]/memory · LONG-TERM[/{ScreamTheme.TEXT_ACCENT}]',
+                    subtitle=f'[{ScreamTheme.TEXT_MUTED}]injected into system prompt as XML[/{ScreamTheme.TEXT_MUTED}]',
+                    variant='accent',
                 )
             )
         else:
@@ -83,18 +84,15 @@ class MemorySkill(BaseSkill):
         result = memorize_core_rule(key, content)
         ok = result.startswith('已记入')
         if console is not None:
-            from rich import box
-            from rich.panel import Panel
             from rich.text import Text
 
-            st = 'bold green' if ok else 'bold red'
-            br = 'green' if ok else 'red'
+            st = ScreamTheme.TEXT_SUCCESS if ok else ScreamTheme.TEXT_ERROR
+            write_var: Variant = 'success' if ok else 'error'
             console.print(
-                Panel(
+                skill_panel(
                     Text.from_markup(f'[{st}]{result}[/{st}]'),
-                    title='[bold cyan]MEMORY · WRITE[/bold cyan]',
-                    border_style=br,
-                    box=box.ROUNDED,
+                    title=f'[{ScreamTheme.TEXT_INFO}]/memory · WRITE[/{ScreamTheme.TEXT_INFO}]',
+                    variant=write_var,
                 )
             )
         else:
@@ -109,18 +107,15 @@ class MemorySkill(BaseSkill):
         result = forget_core_rule(key)
         ok = result.startswith('已从长期记忆库删除')
         if console is not None:
-            from rich import box
-            from rich.panel import Panel
             from rich.text import Text
 
-            st = 'bold green' if ok else 'yellow'
-            br = 'red' if ok else 'yellow'
+            st = ScreamTheme.TEXT_SUCCESS if ok else ScreamTheme.TEXT_WARNING
+            purge_var: Variant = 'success' if ok else 'warning'
             console.print(
-                Panel(
+                skill_panel(
                     Text.from_markup(f'[{st}]{result}[/{st}]'),
-                    title='[bold cyan]MEMORY · PURGE[/bold cyan]',
-                    border_style=br,
-                    box=box.ROUNDED,
+                    title=f'[{ScreamTheme.TEXT_INFO}]/memory · PURGE[/{ScreamTheme.TEXT_INFO}]',
+                    variant=purge_var,
                 )
             )
         else:
@@ -135,6 +130,12 @@ class MemorySkill(BaseSkill):
         if console is not None:
             from rich.text import Text
 
-            console.print(Text.from_markup(hint))
+            console.print(
+                skill_panel(
+                    Text.from_markup(hint),
+                    title=f'[{ScreamTheme.TEXT_WARNING}]/memory · 用法[/{ScreamTheme.TEXT_WARNING}]',
+                    variant='warning',
+                )
+            )
         else:
             msg(console, f'未知子命令 {token!r}。用法: list | set | drop', style='yellow')

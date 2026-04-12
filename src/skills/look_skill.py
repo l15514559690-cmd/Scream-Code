@@ -10,6 +10,7 @@ from ..browser_vision import (
     BrowserVisionError,
     BrowserVisionFatalInstallError,
 )
+from ..scream_theme import ScreamTheme, skill_panel
 from .base_skill import BaseSkill, ReplSkillContext, SkillOutcome
 
 _DEFAULT_FOLLOWUP = (
@@ -123,19 +124,15 @@ class LookSkill(BaseSkill):
             '  [grey62]/look https://example.com[/grey62]\n'
             '  [grey62]/look localhost:3000 按钮没有垂直居中，请结合截图分析原因[/grey62]'
         )
-        title = '[bold #7c3aed]SCREAM · LOOK · VISION[/bold #7c3aed]'
+        title = f'[{ScreamTheme.TEXT_ACCENT}]/look · VISION[/{ScreamTheme.TEXT_ACCENT}]'
         if console is not None:
-            from rich import box
-            from rich.panel import Panel
             from rich.text import Text
 
             console.print(
-                Panel(
+                skill_panel(
                     Text.from_markup(body),
                     title=title,
-                    border_style='grey39',
-                    box=box.ROUNDED,
-                    padding=(1, 2),
+                    variant='accent',
                 )
             )
         else:
@@ -159,19 +156,15 @@ class LookSkill(BaseSkill):
             f'[dim]{message}[/dim]\n\n'
             f'[dim]说明：/look 仅截取远程网页，不会使用 screencapture 或桌面截屏。[/dim]'
         )
-        title = '[bold #94a3b8]BROWSER · VISION · WEB[/bold #94a3b8]'
+        title = f'[{ScreamTheme.TEXT_ERROR}]/look · WEB · FAIL[/{ScreamTheme.TEXT_ERROR}]'
         if console is not None:
-            from rich import box
-            from rich.panel import Panel
             from rich.text import Text
 
             console.print(
-                Panel(
+                skill_panel(
                     Text.from_markup(body),
                     title=title,
-                    border_style='red',
-                    box=box.ROUNDED,
-                    padding=(1, 2),
+                    variant='error',
                 )
             )
         else:

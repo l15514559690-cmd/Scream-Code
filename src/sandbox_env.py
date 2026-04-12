@@ -23,6 +23,7 @@ class SandboxManager:
     """
     Docker 容器内执行 shell（工作区目录 rw 挂载到容器内 ``/workspace``，便于构建与测试）。
     ``is_sandbox_enabled`` 为 True 时，``agent_tools.execute_mac_bash`` 走容器而非宿主机 bash。
+    TUI 神经底栏通过单例读取该开关，与 ``/sandbox`` 技能同步。
     """
 
     _instance: ClassVar[SandboxManager | None] = None

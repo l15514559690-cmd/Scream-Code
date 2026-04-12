@@ -5,6 +5,7 @@ from typing import ClassVar
 
 from ..repl_slash_helpers import msg
 from ..sandbox_env import SANDBOX_DOCKER_IMAGE_DEFAULT, SandboxManager
+from ..scream_theme import ScreamTheme, skill_panel
 from .base_skill import BaseSkill, ReplSkillContext, SkillOutcome
 
 
@@ -43,19 +44,15 @@ class SandboxSkill(BaseSkill):
             f'[dim red]警告：[/dim red][dim] 请确保本机已安装 Docker 且可拉取镜像 '
             f'[cyan]{img}[/cyan]；容器环境与宿主机不一致可能导致命令行为差异。[/dim]'
         )
-        title = '[bold cyan]SCREAM · SANDBOX[/bold cyan]'
+        title = f'[{ScreamTheme.TEXT_INFO}]/sandbox · ON[/{ScreamTheme.TEXT_INFO}]'
         if console is not None:
-            from rich import box
-            from rich.panel import Panel
             from rich.text import Text
 
             console.print(
-                Panel(
+                skill_panel(
                     Text.from_markup(body),
                     title=title,
-                    border_style='yellow',
-                    box=box.DOUBLE,
-                    padding=(1, 2),
+                    variant='warning',
                 )
             )
         else:
@@ -70,19 +67,15 @@ class SandboxSkill(BaseSkill):
             '[bold green]🔓 沙箱模式已关闭[/bold green]\n\n'
             '[white]终端命令恢复在[bold] 宿主机 [/bold]上通过 bash 执行（仍受工作区 / 越狱策略约束）。[/white]'
         )
-        title = '[bold cyan]SCREAM · SANDBOX[/bold cyan]'
+        title = f'[{ScreamTheme.TEXT_INFO}]/sandbox · OFF[/{ScreamTheme.TEXT_INFO}]'
         if console is not None:
-            from rich import box
-            from rich.panel import Panel
             from rich.text import Text
 
             console.print(
-                Panel(
+                skill_panel(
                     Text.from_markup(body),
                     title=title,
-                    border_style='green',
-                    box=box.ROUNDED,
-                    padding=(1, 2),
+                    variant='success',
                 )
             )
         else:
@@ -97,19 +90,15 @@ class SandboxSkill(BaseSkill):
             f'当前沙箱：{state}\n\n'
             f'[dim]镜像（环境变量 SCREAM_SANDBOX_IMAGE 可覆盖）：[/dim][cyan]{img}[/cyan]'
         )
-        title = '[bold cyan]SCREAM · SANDBOX · STATUS[/bold cyan]'
+        title = f'[{ScreamTheme.TEXT_INFO}]/sandbox · STATUS[/{ScreamTheme.TEXT_INFO}]'
         if console is not None:
-            from rich import box
-            from rich.panel import Panel
             from rich.text import Text
 
             console.print(
-                Panel(
+                skill_panel(
                     Text.from_markup(body),
                     title=title,
-                    border_style='cyan',
-                    box=box.SIMPLE,
-                    padding=(1, 2),
+                    variant='info',
                 )
             )
         else:
@@ -126,6 +115,12 @@ class SandboxSkill(BaseSkill):
         if console is not None:
             from rich.text import Text
 
-            console.print(Text.from_markup(hint))
+            console.print(
+                skill_panel(
+                    Text.from_markup(hint),
+                    title=f'[{ScreamTheme.TEXT_WARNING}]/sandbox · 用法[/{ScreamTheme.TEXT_WARNING}]',
+                    variant='warning',
+                )
+            )
         else:
             msg(console, f'未知子命令 {bad!r}。用法: /sandbox | status | on | off', style='yellow')
