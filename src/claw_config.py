@@ -38,3 +38,13 @@ def load_project_claw_json(*, force_reload: bool = False) -> dict[str, Any]:
 def reload_project_claw_json() -> dict[str, Any]:
     """强制重新从磁盘加载 ``.claw.json``。"""
     return load_project_claw_json(force_reload=True)
+
+
+def is_product_session_ready() -> bool:
+    """
+    产品入口用：大模型侧（API Key 等）是否已就绪。
+    项目根 ``.claw.json`` 为可选增强配置，不阻断启动。
+    """
+    from .llm_onboarding import is_llm_runtime_configured
+
+    return is_llm_runtime_configured()

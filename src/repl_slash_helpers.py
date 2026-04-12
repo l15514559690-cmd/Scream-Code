@@ -523,7 +523,7 @@ def print_config_panel(console: Any | None) -> None:
     if raw is None:
         msg(
             console,
-            '未找到有效的 llm_config.json（文件不存在或 JSON 无法解析）。',
+            '未找到有效的 ~/.scream/llm_config.json（文件不存在或 JSON 无法解析）。',
             style='yellow',
         )
         return
@@ -533,7 +533,7 @@ def print_config_panel(console: Any | None) -> None:
         console.print(
             skill_panel(
                 JSON(json.dumps(raw, ensure_ascii=False, indent=2)),
-                title=f'[{ScreamTheme.TEXT_ACCENT}]/config · llm_config.json[/{ScreamTheme.TEXT_ACCENT}]',
+                title=f'[{ScreamTheme.TEXT_ACCENT}]/config · ~/.scream[/{ScreamTheme.TEXT_ACCENT}]',
                 variant='accent',
                 padding=(1, 1),
             )

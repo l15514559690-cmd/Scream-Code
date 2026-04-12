@@ -39,11 +39,19 @@ def main() -> int:
     block = f'''{marker}
 scream() {{
     local SCREAM_PATH="{scream_path}"
-    if [[ -x "$SCREAM_PATH/venv/bin/python3" ]]; then
+    local _bin="$SCREAM_PATH/.venv/bin/scream"
+    if [[ -x "$_bin" ]]; then
+        ( cd "$SCREAM_PATH" && "$_bin" "$@" )
+    elif [[ -x "$SCREAM_PATH/.venv/bin/python3" ]]; then
+        PYTHONPATH="$SCREAM_PATH" "$SCREAM_PATH/.venv/bin/python3" -m src.main "$@"
+    elif [[ -x "$SCREAM_PATH/venv/bin/python3" ]]; then
         PYTHONPATH="$SCREAM_PATH" "$SCREAM_PATH/venv/bin/python3" -m src.main "$@"
     else
         PYTHONPATH="$SCREAM_PATH" python3 -m src.main "$@"
     fi
+}}
+scream-config() {{
+    scream config "$@"
 }}
 '''
 
@@ -84,8 +92,9 @@ scream() {{
         Panel.fit(
             '[bold green]安装成功！[/bold green]\n\n'
             '请在终端中执行 [bold cyan]source ~/.zshrc[/bold cyan] 让配置立刻生效。\n\n'
-            '之后可在任意目录使用 [bold]scream[/bold]，例如：[bold]scream summary[/bold]、[bold]scream repl[/bold]（默认进入大模型对话）。\n\n'
-            '[dim]若已创建项目内 venv，将优先使用 [bold]venv/bin/python3[/bold]；否则使用当前 PATH 中的 python3。[/dim]',
+            '之后可在任意目录使用 [bold]scream[/bold]（TUI）、[bold]scream config[/bold]（模型配置）。\n'
+            '[dim]请先在该仓库执行 [bold]pip install -e .[/bold] 生成 .venv/bin/scream；'
+            '另可用 [bold]python3 -m src.main[/bold] 调用移植镜像子命令。[/dim]',
             title='Scream Code',
             border_style='green',
         )

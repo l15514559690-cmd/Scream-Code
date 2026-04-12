@@ -104,22 +104,42 @@ def _try_persist_repl_session(engine: Any) -> None:
         pass
 
 
+def repl_stdin_flush_pending_if_tty() -> None:
+    """
+    丢弃内核里已为 stdin 排队、但本进程尚未读取的字节。
+
+    在**成功从磁盘恢复会话之后**、首次 ``prompt``/``input`` 之前调用，可避免终端或宿主
+    误注入的上行（例如残留换行）被当成用户主动提交的第一句话，从而意外触发 LLM 回合。
+    非 TTY（管道/重定向）下不操作。
+    """
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+    except ImportError:
+        return
+    try:
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except (OSError, AttributeError):
+        pass
+
+
 def _repl_engine_autoresume(console: Any | None, *, use_rich: bool) -> Any:
     """
-    若 ``.port_sessions/`` 下存在最近修改的会话 JSON，则 ``load_session`` 恢复；否则空会话。
+    若 ``.port_sessions/`` 下存在最近修改的会话 JSON，则 ``from_saved_session`` 恢复；否则空会话。
     不改变 ``session_store`` 的读写格式，仅组合现有 API。
     """
     from .query_engine import QueryEnginePort
-    from .session_store import load_session, most_recent_saved_session_id
+    from .session_store import most_recent_saved_session_id
 
     sid = most_recent_saved_session_id()
     if not sid:
         return QueryEnginePort.from_workspace()
     try:
-        load_session(sid)
         eng = QueryEnginePort.from_saved_session(sid)
     except (OSError, FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return QueryEnginePort.from_workspace()
+    repl_stdin_flush_pending_if_tty()
     if use_rich and console is not None:
         console.print(
             f'[dim]已自动恢复上次会话记忆 (ID: {sid})，如需开启全新对话请输出 /new[/dim]'
@@ -982,13 +1002,12 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
 def _repl_engine_json_resume() -> Any:
     """恢复最近会话但不打印横幅（供 Rust TUI 的 json-stdio 后端）。"""
     from .query_engine import QueryEnginePort
-    from .session_store import load_session, most_recent_saved_session_id
+    from .session_store import most_recent_saved_session_id
 
     sid = most_recent_saved_session_id()
     if not sid:
         return QueryEnginePort.from_workspace()
     try:
-        load_session(sid)
         return QueryEnginePort.from_saved_session(sid)
     except (OSError, FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return QueryEnginePort.from_workspace()

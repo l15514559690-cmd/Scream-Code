@@ -238,7 +238,7 @@ def neural_status_stream_footer_markup(engine: Any) -> str:
 
 
 def _tui_load_dotenv_layers() -> None:
-    """PromptSession 之前：项目根 `.env` + 当前工作目录 `.env`（不覆盖已注入变量）。"""
+    """PromptSession 之前：``load_project_dotenv``（含 ``~/.scream/.env``）+ cwd ``.env``（不覆盖已有变量）。"""
     from .llm_settings import load_project_dotenv
 
     load_project_dotenv()
@@ -255,20 +255,24 @@ def _tui_engine_autoresume() -> Any:
     """
     加载最近会话；损坏（JSON/XML/Expat 等）时重置为空会话并提示，不中断 TUI。
 
-    ``from_saved_session`` 内含 ``load_session`` 与记忆重建；任一步失败即放弃该快照。
+    仅恢复 ``mutable_messages`` / ``llm_conversation_messages`` 等到内存，**不会**在此路径调用
+    大模型；成功恢复后丢弃 TTY 上可能误排队的 stdin，避免残留上行被当成用户首条输入。
     """
     from .query_engine import QueryEnginePort
+    from .replLauncher import repl_stdin_flush_pending_if_tty
     from .session_store import most_recent_saved_session_id
 
     sid = most_recent_saved_session_id()
     if not sid:
         return QueryEnginePort.from_workspace()
     try:
-        return QueryEnginePort.from_saved_session(sid)
+        eng = QueryEnginePort.from_saved_session(sid)
     except Exception:
         # json.JSONDecodeError、xml.parsers.expat.ExpatError、KeyError 等一律视为损坏
         print('[!] 发现损坏的会话记录，已自动重置。', flush=True)
         return QueryEnginePort.from_workspace()
+    repl_stdin_flush_pending_if_tty()
+    return eng
 
 
 def _print_user_message(console: Any, text: str) -> None:

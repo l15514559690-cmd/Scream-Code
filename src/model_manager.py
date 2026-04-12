@@ -11,7 +11,24 @@ from typing import Any
 
 
 def config_file() -> Path:
-    return Path(__file__).resolve().parent.parent / 'llm_config.json'
+    from .llm_settings import scream_user_config_dir
+
+    return scream_user_config_dir() / 'llm_config.json'
+
+
+def _migrate_legacy_repo_llm_config_if_needed() -> None:
+    """若 ``~/.scream/llm_config.json`` 不存在而仓库根仍有旧文件，则迁移一次。"""
+    dst = config_file()
+    if dst.is_file():
+        return
+    legacy = Path(__file__).resolve().parent.parent / 'llm_config.json'
+    if not legacy.is_file():
+        return
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(legacy.read_text(encoding='utf-8'), encoding='utf-8')
+    except OSError:
+        pass
 
 
 def empty_config_payload() -> dict[str, Any]:
@@ -64,6 +81,7 @@ class ModelProfile:
 
 
 def ensure_default_config_file() -> None:
+    _migrate_legacy_repo_llm_config_if_needed()
     path = config_file()
     if path.is_file():
         return
@@ -82,6 +100,10 @@ def read_persisted_config_raw() -> dict[str, Any] | None:
 
 def save_config(data: dict[str, Any]) -> None:
     path = config_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 
 

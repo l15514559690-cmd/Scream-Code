@@ -13,6 +13,7 @@ from src.repl_ui_render import (
     stabilize_streaming_markdown_fences,
     tool_execution_status_message,
 )
+from src.scream_theme import skill_panel
 
 
 class ReplUiRenderTests(unittest.TestCase):
@@ -63,6 +64,13 @@ class ReplUiRenderTests(unittest.TestCase):
         out = prepare_streaming_live_buffer(buf, console=c)
         self.assertIn('live fold', out)
         self.assertLess(out.count('\n'), buf.count('\n'))
+
+    def test_skill_panel_slash_command_title_no_markup_error(self) -> None:
+        """``[/cost]`` 等标题若以 str 传入 Panel，Rich 会误解析为闭合标签。"""
+        buf = io.StringIO()
+        c = Console(file=buf, force_terminal=True, width=80, record=True)
+        c.print(skill_panel('ok', title='[/cost]', variant='accent'))
+        self.assertIn('/cost', c.export_text(clear=False))
 
 
 if __name__ == '__main__':

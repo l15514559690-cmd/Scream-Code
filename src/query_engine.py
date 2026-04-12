@@ -70,6 +70,9 @@ class QueryEnginePort:
         从 JSON 恢复 ``mutable_messages``、用量与（若存在）``llm_conversation_messages`` 快照。
         快照存在时恢复完整多轮 LLM 上下文；仅旧版文件时退化为仅用 ``mutable_messages`` 拼用户历史。
         恢复后会用当前项目记忆刷新首条 ``system``，避免 SCREAM.md 等更新后不生效。
+
+        **不**会发起任何 LLM 请求；REPL/TUI 须在用户显式提交新输入后才可调用
+        ``iter_repl_assistant_events*`` / ``submit_message`` 等推理入口。
         """
         stored = load_session(session_id)
         transcript = TranscriptStore(entries=list(stored.messages), flushed=True)

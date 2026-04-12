@@ -7,9 +7,14 @@ Scream-Code Rich 视觉规范：斜杠指令与技能输出统一边框、语义
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from rich import box
+from rich.text import Text
+
+# Rich 会把 ``[/foo]`` 解析成闭合标签；斜杠指令标题若以 ``[/`` 开头会触发 MarkupError。
+_SLASH_CLOSE_TITLE = re.compile(r'^\s*\[/')
 
 Variant = Literal['info', 'success', 'warning', 'error', 'accent', 'neutral']
 
@@ -56,6 +61,17 @@ class ScreamTheme:
         return cls._BORDER_MAP.get(variant, cls.BORDER_INFO)
 
 
+def _coerce_panel_heading(value: str | Text | None) -> str | Text | None:
+    """``Panel`` 的 title/subtitle 若为 str 会走 markup；``[/cmd]`` 形式必须按字面量渲染。"""
+    if value is None:
+        return None
+    if isinstance(value, Text):
+        return value
+    if isinstance(value, str) and _SLASH_CLOSE_TITLE.match(value):
+        return Text(value)
+    return value
+
+
 def skill_panel(
     renderable: Any,
     *,
@@ -72,8 +88,8 @@ def skill_panel(
 
     return Panel(
         renderable,
-        title=title,
-        subtitle=subtitle,
+        title=_coerce_panel_heading(title),
+        subtitle=_coerce_panel_heading(subtitle),
         border_style=ScreamTheme.border(variant),
         box=ScreamTheme.BOX,
         expand=expand,
@@ -94,7 +110,7 @@ def nested_skill_panel(
 
     return Panel(
         renderable,
-        title=title,
+        title=_coerce_panel_heading(title),
         border_style=ScreamTheme.border(variant),
         box=ScreamTheme.BOX,
         expand=expand,

@@ -47,7 +47,7 @@ from .command_graph import build_command_graph
 from .commands import execute_command, get_command, get_commands, render_command_index
 from .direct_modes import run_deep_link, run_direct_connect
 from .claw_config import load_project_claw_json
-from .llm_settings import load_project_dotenv
+from .llm_settings import load_project_dotenv, reload_project_dotenv
 from .model_manager import run_config_interactive_menu
 from .replLauncher import (
     build_repl_banner,
@@ -417,6 +417,145 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.handled else 1
     parser.error(f'未知子命令: {args.command}')
     return 2
+
+
+def _print_geek_help() -> None:
+    print(
+        """
+╔════════════════════════════════════════════════════════════╗
+║  SCREAM // neural.cli  ·  single entry · ~/.scream state  ║
+╚════════════════════════════════════════════════════════════╝
+
+  scream              启动 TUI；若无 API Key，会先跑交互引导
+  scream config       模型 / 密钥完整菜单（写入 ~/.scream/）
+  scream help         本页
+
+  配置目录            ~/.scream/llm_config.json  +  ~/.scream/.env
+"""
+    )
+
+
+def _offer_launch_tui_after_config() -> int:
+    if not sys.stdin.isatty():
+        return 0
+    try:
+        import questionary
+        from questionary import Style
+    except ImportError:
+        return 0
+    style = Style([('selected', 'fg:ansicyan bold')])
+    try:
+        go = questionary.confirm('是否进入主界面（TUI）？', default=True, style=style).ask()
+    except (KeyboardInterrupt, EOFError):
+        print('\n已取消。', flush=True)
+        return 130
+    if go is True:
+        reload_project_dotenv()
+        return _run_product_tui(llm_enabled=True, skip_ready_check=True)
+    return 0
+
+
+def _run_product_tui(*, llm_enabled: bool, skip_ready_check: bool = False) -> int:
+    from .llm_onboarding import ensure_llm_ready_interactive
+    from .tui_app import run_python_tui_repl
+
+    if llm_enabled and not skip_ready_check:
+        if not ensure_llm_ready_interactive():
+            print(
+                'scream: 未完成模型配置。运行 scream config 后再试。',
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+    try:
+        return run_python_tui_repl(llm_enabled=llm_enabled, route_limit=5)
+    except KeyboardInterrupt:
+        print('\n已中断。', flush=True)
+        return 130
+    except Exception as exc:
+        print(f'scream: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+        return 1
+
+
+class _ScreamProductParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f'scream: {message}', file=sys.stderr)
+        print('提示：运行「scream help」查看用法。', file=sys.stderr)
+        self.exit(2)
+
+
+def cli_main(argv: list[str]) -> int:
+    """产品 CLI：``scream`` / ``scream config`` / ``scream help``。"""
+    from .claw_config import is_product_session_ready
+    from .llm_onboarding import ensure_llm_ready_interactive, run_product_config_menu
+
+    check_and_install_dependencies()
+    load_project_dotenv()
+    load_project_claw_json()
+
+    parser = _ScreamProductParser(prog='scream', add_help=False)
+    parser.add_argument('-h', '--help', action='store_true', help='显示帮助')
+    parser.add_argument(
+        'command',
+        nargs='?',
+        default=None,
+        choices=(None, 'config', 'help'),
+        metavar='子命令',
+    )
+    args = parser.parse_args(argv)
+
+    if args.help:
+        _print_geek_help()
+        return 0
+    if args.command == 'help':
+        _print_geek_help()
+        return 0
+    if args.command == 'config':
+        code = run_product_config_menu()
+        if code != 0:
+            return code
+        reload_project_dotenv()
+        return _offer_launch_tui_after_config()
+
+    if not is_product_session_ready():
+        if not sys.stdin.isatty():
+            print(
+                'scream: 未检测到 API Key，且当前为非交互环境。'
+                '请配置 ~/.scream/ 或设置环境变量。',
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        if not ensure_llm_ready_interactive():
+            print(
+                'scream: 未完成配置。可运行 scream config 稍后再试。',
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        reload_project_dotenv()
+
+    return _run_product_tui(llm_enabled=True, skip_ready_check=True)
+
+
+def cli_entry() -> int:
+    """setuptools ``console_scripts`` 入口：``scream=src.main:cli_entry``。"""
+    try:
+        return cli_main(sys.argv[1:])
+    except KeyboardInterrupt:
+        print('\n已中断。', flush=True)
+        return 130
+    except SystemExit as e:
+        code = e.code
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            return code
+        return 1
+    except Exception as exc:
+        print(f'scream: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+        return 1
 
 
 if __name__ == '__main__':

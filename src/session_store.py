@@ -82,6 +82,7 @@ def save_session(session: StoredSession, directory: Path | None = None) -> Path:
 
 
 def load_session(session_id: str, directory: Path | None = None) -> StoredSession:
+    """读取会话 JSON；纯 I/O + 反序列化，不触发大模型或 REPL 回合。"""
     target_dir = directory or resolve_session_dir()
     data = json.loads((target_dir / f'{session_id}.json').read_text(encoding='utf-8'))
     raw_llm = data.get('llm_conversation_messages')

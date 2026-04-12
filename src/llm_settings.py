@@ -11,8 +11,32 @@ def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def scream_user_config_dir() -> Path:
+    """用户级配置目录（``~/.scream``），与代码仓库解耦。"""
+    d = Path.home() / '.scream'
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _migrate_legacy_repo_dotenv_if_needed() -> None:
+    """首次使用时将仓库根 ``.env`` 复制到 ``~/.scream/.env``（若后者尚不存在）。"""
+    dst = scream_user_config_dir() / '.env'
+    if dst.is_file():
+        return
+    leg = project_root() / '.env'
+    if not leg.is_file():
+        return
+    try:
+        dst.write_text(leg.read_text(encoding='utf-8'), encoding='utf-8')
+    except OSError:
+        pass
+
+
 def load_project_dotenv() -> None:
-    """从项目根目录加载 `.env` 到进程环境（幂等）。"""
+    """先加载 ``~/.scream/.env``，再加载项目根 ``.env``（后者不覆盖已有键）。"""
     global _DOTENV_LOADED
     if _DOTENV_LOADED:
         return
@@ -21,7 +45,13 @@ def load_project_dotenv() -> None:
     except ImportError:
         _DOTENV_LOADED = True
         return
-    load_dotenv(project_root() / '.env')
+    _migrate_legacy_repo_dotenv_if_needed()
+    user_env = scream_user_config_dir() / '.env'
+    if user_env.is_file():
+        load_dotenv(user_env)
+    proj = project_root() / '.env'
+    if proj.is_file():
+        load_dotenv(proj, override=False)
     _DOTENV_LOADED = True
 
 
@@ -34,10 +64,14 @@ def reload_project_dotenv() -> None:
 
 def upsert_project_dotenv_var(key: str, value: str) -> None:
     """
-    在项目根 `.env` 中新增或覆盖一行 ``KEY=value``，并同步更新 ``os.environ``。
+    在 ``~/.scream/.env`` 中新增或覆盖 ``KEY=value``，并同步更新 ``os.environ``。
     值中的换行会被替换为空格，避免破坏 .env 格式。
     """
-    path = project_root() / '.env'
+    path = scream_user_config_dir() / '.env'
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     safe_value = value.replace('\n', ' ').replace('\r', '')
     lines: list[str] = []
     if path.is_file():
@@ -60,17 +94,16 @@ def upsert_project_dotenv_var(key: str, value: str) -> None:
     os.environ[key] = safe_value
 
 
-def read_project_dotenv_value(key: str) -> str:
-    """从当前环境或项目根 ``.env`` 文件中读取某键的值（不含引号包裹处理外的转义）。"""
-    v = os.environ.get(key, '').strip()
-    if v:
-        return v
-    path = project_root() / '.env'
+def _read_dotenv_file_value(path: Path, key: str) -> str:
     if not path.is_file():
         return ''
     prefix_eq = f'{key}='
     prefix_sp = f'{key} ='
-    for line in path.read_text(encoding='utf-8').splitlines():
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return ''
+    for line in lines:
         s = line.strip()
         if not s or s.startswith('#'):
             continue
@@ -84,6 +117,17 @@ def read_project_dotenv_value(key: str) -> str:
             raw = raw[1:-1]
         return raw.strip()
     return ''
+
+
+def read_project_dotenv_value(key: str) -> str:
+    """优先环境变量，其次 ``~/.scream/.env``，再次项目根 ``.env``。"""
+    v = os.environ.get(key, '').strip()
+    if v:
+        return v
+    u = _read_dotenv_file_value(scream_user_config_dir() / '.env', key)
+    if u:
+        return u
+    return _read_dotenv_file_value(project_root() / '.env', key)
 
 
 def migrate_project_dotenv_key(old_key: str, new_key: str) -> None:
@@ -100,21 +144,28 @@ def migrate_project_dotenv_key(old_key: str, new_key: str) -> None:
 
 
 def remove_project_dotenv_var(key: str) -> None:
-    """从项目根 ``.env`` 中移除指定键的行（若存在），不影响其它变量。"""
-    path = project_root() / '.env'
+    """从 ``~/.scream/.env``（及兼容性的项目根 ``.env``）中移除指定键。"""
     os.environ.pop(key, None)
-    if not path.is_file():
-        return
-    lines = path.read_text(encoding='utf-8').splitlines()
     prefix = f'{key}='
-    out: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(prefix) or stripped.startswith(f'{key} ='):
-            continue
-        out.append(line)
-    body = '\n'.join(out).rstrip() + ('\n' if out else '')
-    path.write_text(body, encoding='utf-8')
+
+    def _strip(path: Path) -> None:
+        if not path.is_file():
+            return
+        try:
+            lines = path.read_text(encoding='utf-8').splitlines()
+        except OSError:
+            return
+        out: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(prefix) or stripped.startswith(f'{key} ='):
+                continue
+            out.append(line)
+        body = '\n'.join(out).rstrip() + ('\n' if out else '')
+        path.write_text(body, encoding='utf-8')
+
+    _strip(scream_user_config_dir() / '.env')
+    _strip(project_root() / '.env')
 
 
 @dataclass(frozen=True)

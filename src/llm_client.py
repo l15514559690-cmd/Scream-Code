@@ -131,7 +131,7 @@ class ChatCompletionResult:
     conversation_messages: list[dict[str, Any]] | None = None
 
 
-_KEY_SETUP_HINT = '未检测到密钥，请执行 scream-config 进行设置'
+_KEY_SETUP_HINT = '未检测到密钥，请执行 scream config 进行设置'
 
 
 def _raise_if_missing_key(settings: LlmConnectionSettings) -> None:
