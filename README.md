@@ -1,6 +1,7 @@
+# 🚀 Scream-Code (尖叫Agent终端)
+
 <img width="1690" height="836" alt="image" src="https://github.com/user-attachments/assets/a8f5869d-e4cd-4de6-970a-67038894eff3" />
 
-# 🚀 Scream-Code (尖叫Agent终端)
 
 > **“让 AI 走出网页聊天框，真正接管你的本地生产力。”**
 
