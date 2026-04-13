@@ -148,12 +148,10 @@ class StopSkill(BaseSkill):
     category: ClassVar[str] = 'memory'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
-        from .. import agent_cancel
-
-        agent_cancel.request_agent_cancel()
+        context.engine.request_stream_abort()
         msg(
             context.console,
-            '已请求中断当前工具链（bash 子进程将尽快结束；未执行的 tool 将收到 [User Interrupted Task]）。',
+            '已请求中断当前生成与工具链（流式输出将尽快结束；bash 子进程将尽快结束；未执行的 tool 将收到 [User Interrupted Task]）。',
             style='bold yellow',
         )
         return SkillOutcome()

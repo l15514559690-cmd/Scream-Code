@@ -5,8 +5,9 @@
   ``Live(auto_refresh=False)`` 仅在我们节流后的帧上 ``update``；15ms 时间片 + 字形批处理，
   避免每 token 全量 Markdown 重排；终端高度绑定的**尾部视口**把滚动锁在 Live 区，scrollback 不乱跳；
   未闭合 `` ``` `` 在解析前虚拟闭合，Pygments 结构不塌。
-- **定稿**：瞬态 Live 结束后靛紫 ``Panel`` / ``print_solidified_assistant_markdown`` 写入历史；首包前 ``console.status``；
-  **不用** ``patch_stdout``。
+- **定稿**：瞬态 Live 结束后靛紫 ``Panel`` / ``print_solidified_assistant_markdown`` 写入历史；首包前 ``console.status``。
+- **生成中输入**：流式回合走 ``replLauncher._run_streaming_turn_tui_concurrent``：``asyncio`` + ``patch_stdout`` + ``prompt_async``，
+  底部输入框在思考/输出期间仍可用，``/stop`` 与 Ctrl+C 触发 ``engine.request_stream_abort()``；回合结束 ``tcflush``  stdin 丢弃幽灵回车。
 - **神经底栏**：``prompt_toolkit`` 的 ``bottom_toolbar`` 全宽深色条 + 青/绿高亮；TUI 流式时在 ``Live`` 内用 ``Group`` 叠一行 Rich 页脚，与输入态信息同源（模型 / 沙箱 / 记忆条数 / Token%）。
 - **斜杠补全**：``/`` 菜单；**Enter** 在补全打开时只确认补全（见 ``repl_slash_helpers``）。
 - **PTY 断开**：``EOFError`` → ``sys.exit(0)``。
@@ -109,7 +110,7 @@ def _print_welcome_panel(console: Any) -> None:
         f'\n[bold {_BRAND_HEX}]Scream Code[/bold {_BRAND_HEX}]  ·  '
         f'[dim]Python TUI[/dim]  ·  '
         f'[dim]Rich + prompt_toolkit[/dim]\n'
-        f'[dim]输入 [bold]/[/bold] 打开斜杠指令 · EOF 关窗安全退出 · Ctrl+C 中断生成[/dim]\n'
+        f'[dim]输入 [bold]/[/bold] 打开斜杠指令 · EOF 关窗安全退出 · 生成中可 [bold]/stop[/bold] 或 Ctrl+C 终止[/dim]\n'
     )
     body = Align.center(Text.assemble(logo, tag))
     console.print(
@@ -344,9 +345,10 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
         _ensure_stdio_utf8,
         _maybe_print_repl_memory_load_warning,
         _print_graceful_interrupt,
-        _run_streaming_turn,
+        _run_streaming_turn_tui_concurrent,
         _try_persist_repl_session,
         build_repl_banner,
+        repl_stdin_flush_pending_if_tty,
     )
     from .repl_slash_commands import dispatch_repl_slash_command
     from .runtime import PortRuntime
@@ -392,6 +394,11 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
 
     # 靛蓝品牌提示符：须为严格 XML（勿用 `<style ... bold>` 无值属性，会触发 ExpatError）
     prompt_html = HTML(f'<style fg="{_BRAND_HEX}"><b>尖叫&gt; </b></style>')
+    generating_prompt_html = HTML(
+        '\n'
+        '<style fg="#fbbf24"><b> 😖 正在生成...  (输入 /stop 终止当前任务)</b></style>\n'
+        f'<style fg="{_BRAND_HEX}"><b> 尖叫&gt; </b></style>'
+    )
 
     while True:
         try:
@@ -429,14 +436,17 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                 console.print('[dim grey42]↪ 视觉快照已注入，正在请求模型分析…[/dim grey42]')
                 console.print(Rule(style=_BRAND_MUTED))
                 try:
-                    _run_streaming_turn(
+                    _run_streaming_turn_tui_concurrent(
+                        session,
                         engine,
                         runtime,
                         fp,
                         console,
                         route_limit=route_limit,
                         team=use_team,
-                        status_engine=engine,
+                        status_engine=None,
+                        prompt_message_html=generating_prompt_html,
+                        bottom_toolbar=lambda: _get_bottom_toolbar(engine),
                     )
                 except KeyboardInterrupt:
                     _print_graceful_interrupt(console, use_rich=True)
@@ -447,6 +457,8 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                         )
                     except Exception:
                         print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
+                finally:
+                    repl_stdin_flush_pending_if_tty()
                 _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
                 _try_persist_repl_session(engine)
                 console.print()
@@ -465,14 +477,17 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
         # 用户消息 ↔ 模型输出：极简分隔线（避免与状态栏前重复堆叠 Rule）
         console.print(Rule(style=_BRAND_MUTED))
         try:
-            _run_streaming_turn(
+            _run_streaming_turn_tui_concurrent(
+                session,
                 engine,
                 runtime,
                 msg,
                 console,
                 route_limit=route_limit,
                 team=use_team,
-                status_engine=engine,
+                status_engine=None,
+                prompt_message_html=generating_prompt_html,
+                bottom_toolbar=lambda: _get_bottom_toolbar(engine),
             )
         except KeyboardInterrupt:
             _print_graceful_interrupt(console, use_rich=True)
@@ -485,6 +500,8 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
             except Exception:
                 print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
             continue
+        finally:
+            repl_stdin_flush_pending_if_tty()
 
         _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
         _try_persist_repl_session(engine)

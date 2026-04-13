@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -59,6 +60,11 @@ class QueryEnginePort:
     repl_team_mode: bool = field(default=False, repr=False)
     #: REPL 等场景注入 Rich Console，用于 LLM 请求与工具路由时的 Status 指示器。
     ui_console: Any | None = field(default=None, repr=False)
+    #: 与 REPL/TUI 流式回合配合：是否处于 ``iter_repl_assistant_events*`` 消费中（跨线程读须加锁）。
+    _stream_state_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+    _stream_generating: bool = field(default=False, repr=False, compare=False)
 
     @classmethod
     def from_workspace(cls) -> 'QueryEnginePort':
@@ -241,6 +247,35 @@ class QueryEnginePort:
             user_lines.extend(f'- {d.tool_name}: {d.reason}' for d in denied_tools)
         return '\n'.join(user_lines)
 
+    def mark_stream_generation_start(self) -> None:
+        """新一轮 LLM 流式编排开始（在 ``reset_agent_cancel`` 之后调用）。"""
+        with self._stream_state_lock:
+            self._stream_generating = True
+
+    def mark_stream_generation_end(self) -> None:
+        with self._stream_state_lock:
+            self._stream_generating = False
+
+    def request_stream_abort(self) -> None:
+        """
+        用户请求终止当前生成/工具链：与 ``agent_cancel`` 同源信号，供 TUI 侧 ``/stop``、Ctrl+C 等触发。
+        """
+        from . import agent_cancel
+
+        agent_cancel.request_agent_cancel()
+
+    @property
+    def is_generating(self) -> bool:
+        with self._stream_state_lock:
+            return self._stream_generating
+
+    @property
+    def is_aborted(self) -> bool:
+        """是否与 ``/stop``、Ctrl+C 等一致处于「取消已请求」状态（由 ``agent_cancel`` 承载）。"""
+        from . import agent_cancel
+
+        return agent_cancel.agent_cancel_requested()
+
     def _repl_messages_base_before_current_user(self) -> list[dict[str, Any]]:
         """
         构造「当前 user 条」之前的消息前缀。
@@ -413,68 +448,79 @@ class QueryEnginePort:
         raw_override = (self.config.llm_model or '').strip()
         model_override = raw_override or None
 
+        self.mark_stream_generation_start()
         try:
-            for ev in iter_agent_executor_events(
-                messages,
-                settings,
-                model=model_override,
-                tools=get_openai_agent_tools(),
-            ):
-                et = ev.get('type')
-                if et == 'executor_complete':
-                    snap = ev.get('conversation_messages')
-                    if isinstance(snap, list):
-                        self.llm_conversation_messages = snap
-                    in_tok = int(ev.get('input_tokens', 0))
-                    out_tok = int(ev.get('output_tokens', 0))
-                    llm_text = str(ev.get('assistant_text', '') or '')
-                    output = self._finalize_llm_assistant_text(
-                        llm_text,
-                        summary_lines,
-                        matched_commands,
-                        matched_tools,
-                        denied_tools,
-                    )
-                    if in_tok > 0 or out_tok > 0:
-                        self.total_usage = UsageSummary(
-                            input_tokens=self.total_usage.input_tokens + in_tok,
-                            output_tokens=self.total_usage.output_tokens + out_tok,
+            try:
+                for ev in iter_agent_executor_events(
+                    messages,
+                    settings,
+                    model=model_override,
+                    tools=get_openai_agent_tools(),
+                ):
+                    et = ev.get('type')
+                    if et == 'executor_complete':
+                        snap = ev.get('conversation_messages')
+                        if isinstance(snap, list):
+                            self.llm_conversation_messages = snap
+                        in_tok = int(ev.get('input_tokens', 0))
+                        out_tok = int(ev.get('output_tokens', 0))
+                        llm_text = str(ev.get('assistant_text', '') or '')
+                        stop_reason = str(ev.get('stop_reason') or 'completed')
+                        if (
+                            stop_reason == 'user_interrupt'
+                            and '[🛑 任务已被用户手动终止]' not in llm_text
+                        ):
+                            llm_text = (
+                                llm_text.rstrip() + '\n\n[🛑 任务已被用户手动终止]'
+                            )
+                        output = self._finalize_llm_assistant_text(
+                            llm_text,
+                            summary_lines,
+                            matched_commands,
+                            matched_tools,
+                            denied_tools,
                         )
-                    else:
-                        self.total_usage = self.total_usage.add_turn(prompt, output)
+                        if in_tok > 0 or out_tok > 0:
+                            self.total_usage = UsageSummary(
+                                input_tokens=self.total_usage.input_tokens + in_tok,
+                                output_tokens=self.total_usage.output_tokens + out_tok,
+                            )
+                        else:
+                            self.total_usage = self.total_usage.add_turn(prompt, output)
 
-                    stop_reason = str(ev.get('stop_reason') or 'completed')
-                    if (
-                        self.total_usage.input_tokens + self.total_usage.output_tokens
-                        > self.config.max_budget_tokens
-                    ):
-                        stop_reason = 'max_budget_reached'
-                    self.mutable_messages.append(prompt)
-                    self.transcript_store.append(prompt)
-                    self.permission_denials.extend(denied_tools)
-                    self.compact_messages_if_needed()
-                    yield {
-                        'type': 'finished',
-                        'output': output,
-                        'stop_reason': stop_reason,
-                        'turn_input_tokens': in_tok,
-                        'turn_output_tokens': out_tok,
-                        'cumulative_input_tokens': self.total_usage.input_tokens,
-                        'cumulative_output_tokens': self.total_usage.output_tokens,
-                    }
-                    return
-                if et == 'llm_error':
+                        if (
+                            self.total_usage.input_tokens + self.total_usage.output_tokens
+                            > self.config.max_budget_tokens
+                        ):
+                            stop_reason = 'max_budget_reached'
+                        self.mutable_messages.append(prompt)
+                        self.transcript_store.append(prompt)
+                        self.permission_denials.extend(denied_tools)
+                        self.compact_messages_if_needed()
+                        yield {
+                            'type': 'finished',
+                            'output': output,
+                            'stop_reason': stop_reason,
+                            'turn_input_tokens': in_tok,
+                            'turn_output_tokens': out_tok,
+                            'cumulative_input_tokens': self.total_usage.input_tokens,
+                            'cumulative_output_tokens': self.total_usage.output_tokens,
+                        }
+                        return
+                    if et == 'llm_error':
+                        yield ev
+                        return
                     yield ev
-                    return
-                yield ev
-        except GeneratorExit:
-            raise
-        except Exception as exc:
-            yield {
-                'type': 'llm_error',
-                'output': f'[LLM] 会话编排异常: {exc}',
-            }
-            return
+            except GeneratorExit:
+                raise
+            except Exception as exc:
+                yield {
+                    'type': 'llm_error',
+                    'output': f'[LLM] 会话编排异常: {exc}',
+                }
+                return
+        finally:
+            self.mark_stream_generation_end()
 
     def iter_team_repl_assistant_events(
         self,
@@ -540,77 +586,85 @@ class QueryEnginePort:
         phase_in = 0
         phase_out = 0
 
+        self.mark_stream_generation_start()
         try:
-            for agent_label, user_text, use_tools in phases:
-                yield {'type': 'team_agent', 'agent': agent_label}
-                msgs = self._assemble_messages_for_team_phase(user_text)
-                tools_kw: list[dict[str, Any]] | None = None if use_tools else []
-                for ev in iter_agent_executor_events(
-                    msgs,
-                    settings,
-                    model=model_override,
-                    tools=tools_kw,
-                ):
-                    et = ev.get('type')
-                    if et == 'executor_complete':
-                        snap = ev.get('conversation_messages')
-                        if isinstance(snap, list):
-                            self.llm_conversation_messages = snap
-                        phase_in += int(ev.get('input_tokens', 0))
-                        phase_out += int(ev.get('output_tokens', 0))
-                        body = str(ev.get('assistant_text', '') or '').strip()
-                        combined_chunks.append(f'[{agent_label}]\n{body}')
-                        break
-                    if et == 'llm_error':
+            try:
+                for agent_label, user_text, use_tools in phases:
+                    yield {'type': 'team_agent', 'agent': agent_label}
+                    msgs = self._assemble_messages_for_team_phase(user_text)
+                    tools_kw: list[dict[str, Any]] | None = None if use_tools else []
+                    for ev in iter_agent_executor_events(
+                        msgs,
+                        settings,
+                        model=model_override,
+                        tools=tools_kw,
+                    ):
+                        et = ev.get('type')
+                        if et == 'executor_complete':
+                            snap = ev.get('conversation_messages')
+                            if isinstance(snap, list):
+                                self.llm_conversation_messages = snap
+                            phase_in += int(ev.get('input_tokens', 0))
+                            phase_out += int(ev.get('output_tokens', 0))
+                            body = str(ev.get('assistant_text', '') or '').strip()
+                            combined_chunks.append(f'[{agent_label}]\n{body}')
+                            break
+                        if et == 'llm_error':
+                            yield ev
+                            return
                         yield ev
-                        return
-                    yield ev
 
-            if phase_in > 0 or phase_out > 0:
-                self.total_usage = UsageSummary(
-                    input_tokens=self.total_usage.input_tokens + phase_in,
-                    output_tokens=self.total_usage.output_tokens + phase_out,
+                if phase_in > 0 or phase_out > 0:
+                    self.total_usage = UsageSummary(
+                        input_tokens=self.total_usage.input_tokens + phase_in,
+                        output_tokens=self.total_usage.output_tokens + phase_out,
+                    )
+                else:
+                    out_all = '\n\n'.join(combined_chunks)
+                    self.total_usage = self.total_usage.add_turn(prompt, out_all)
+
+                stop_reason = 'completed'
+                if (
+                    self.total_usage.input_tokens + self.total_usage.output_tokens
+                    > self.config.max_budget_tokens
+                ):
+                    stop_reason = 'max_budget_reached'
+
+                full_out = '\n\n---\n\n'.join(combined_chunks)
+                if self.is_aborted and '[🛑 任务已被用户手动终止]' not in full_out:
+                    full_out = full_out.rstrip() + '\n\n[🛑 任务已被用户手动终止]'
+                    if stop_reason == 'completed':
+                        stop_reason = 'user_interrupt'
+                output = self._finalize_llm_assistant_text(
+                    full_out,
+                    summary_lines,
+                    matched_commands,
+                    matched_tools,
+                    denied_tools,
                 )
-            else:
-                out_all = '\n\n'.join(combined_chunks)
-                self.total_usage = self.total_usage.add_turn(prompt, out_all)
-
-            stop_reason = 'completed'
-            if (
-                self.total_usage.input_tokens + self.total_usage.output_tokens
-                > self.config.max_budget_tokens
-            ):
-                stop_reason = 'max_budget_reached'
-
-            full_out = '\n\n---\n\n'.join(combined_chunks)
-            output = self._finalize_llm_assistant_text(
-                full_out,
-                summary_lines,
-                matched_commands,
-                matched_tools,
-                denied_tools,
-            )
-            self.mutable_messages.append(prompt)
-            self.transcript_store.append(prompt)
-            self.permission_denials.extend(denied_tools)
-            self.compact_messages_if_needed()
-            yield {
-                'type': 'finished',
-                'output': output,
-                'stop_reason': stop_reason,
-                'turn_input_tokens': phase_in,
-                'turn_output_tokens': phase_out,
-                'cumulative_input_tokens': self.total_usage.input_tokens,
-                'cumulative_output_tokens': self.total_usage.output_tokens,
-            }
-        except GeneratorExit:
-            raise
-        except Exception as exc:
-            yield {
-                'type': 'llm_error',
-                'output': f'[LLM] 团队编排异常: {exc}',
-            }
-            return
+                self.mutable_messages.append(prompt)
+                self.transcript_store.append(prompt)
+                self.permission_denials.extend(denied_tools)
+                self.compact_messages_if_needed()
+                yield {
+                    'type': 'finished',
+                    'output': output,
+                    'stop_reason': stop_reason,
+                    'turn_input_tokens': phase_in,
+                    'turn_output_tokens': phase_out,
+                    'cumulative_input_tokens': self.total_usage.input_tokens,
+                    'cumulative_output_tokens': self.total_usage.output_tokens,
+                }
+            except GeneratorExit:
+                raise
+            except Exception as exc:
+                yield {
+                    'type': 'llm_error',
+                    'output': f'[LLM] 团队编排异常: {exc}',
+                }
+                return
+        finally:
+            self.mark_stream_generation_end()
 
     def iter_repl_assistant_events_with_runtime(
         self,

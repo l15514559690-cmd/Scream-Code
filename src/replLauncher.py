@@ -361,6 +361,493 @@ def _print_assistant_error(console: object, message: str) -> None:
     console.print()
 
 
+class _StreamingTurnSession:
+    """单次 LLM 流式回合：后台线程跑事件生成器，主线程或 asyncio 驱动 Rich Live 消费队列。"""
+
+    def __init__(
+        self,
+        engine: Any,
+        runtime: Any,
+        line: str,
+        console: Any,
+        *,
+        route_limit: int,
+        team: bool,
+        status_engine: Any | None,
+    ) -> None:
+        self.engine = engine
+        self.runtime = runtime
+        self.line = line
+        self.console = console
+        self.route_limit = route_limit
+        self.team = team
+        self.status_engine = status_engine
+        self.use_live = bool(
+            getattr(console, 'is_terminal', False) and console.is_terminal
+        )
+        self.gen = engine.iter_repl_assistant_events_with_runtime(
+            line, runtime=runtime, route_limit=route_limit, team=team
+        )
+        import queue
+
+        self.outq: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=0)
+        self.buffer = ''
+        self.tool_streaming_buffer = ''
+        self.live: Any = None
+        self.round_saw_tool_json_stream = False
+        self.last_render_time = 0.0
+        self.last_painted_display_len = 0
+
+    def start_worker(self) -> None:
+        import threading
+
+        outq = self.outq
+        gen = self.gen
+
+        def _worker() -> None:
+            try:
+                for ev in gen:
+                    outq.put(('ok', ev))
+                outq.put(('stop', None))
+            except BaseException as exc:
+                outq.put(('err', exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _streaming_display_payload(self) -> str:
+        display_text = self.buffer
+        if self.tool_streaming_buffer:
+            tool_lines = self.tool_streaming_buffer.splitlines()
+            if len(tool_lines) > 15:
+                rolling_tool = '...\n' + '\n'.join(tool_lines[-15:])
+            else:
+                rolling_tool = self.tool_streaming_buffer
+            display_text += (
+                '\n\n> ⚙️ **正在编写代码与工具参数...**\n```json\n'
+                f'{rolling_tool}\n```'
+            )
+        return display_text
+
+    def _live_frame_renderable(self, display_text: str) -> Any:
+        from .repl_ui_render import streaming_markdown_for_live
+
+        md = streaming_markdown_for_live(display_text, console=self.console)
+        if self.status_engine is None:
+            return md
+        from rich.console import Group
+        from rich.text import Text
+
+        from .tui_app import neural_status_stream_footer_markup
+
+        try:
+            w = int(
+                getattr(getattr(self.console, 'size', None), 'width', None) or 80
+            )
+        except (TypeError, ValueError):
+            w = 80
+        rule_w = max(24, min(max(w - 2, 24), 120))
+        rule = Text('▔' * rule_w, style='dim #0f172a')
+        foot = Text.from_markup(
+            neural_status_stream_footer_markup(self.status_engine)
+        )
+        foot.overflow = 'ellipsis'
+        foot.no_wrap = True
+        return Group(md, rule, foot)
+
+    def _apply_streaming_live(self, *, force: bool, queue_quiet: bool) -> None:
+        from .repl_ui_render import (
+            STREAM_LIVE_MIN_CHAR_DELTA,
+            STREAM_LIVE_MIN_INTERVAL_SEC,
+        )
+        from rich.live import Live
+
+        if not self.use_live:
+            return
+        display_text = self._streaming_display_payload()
+        if not display_text.strip():
+            return
+        dlen = len(display_text)
+        now = time.time()
+        if not force:
+            if dlen == self.last_painted_display_len:
+                return
+            delta = dlen - self.last_painted_display_len
+            elapsed = now - self.last_render_time
+            if self.live is not None:
+                if (
+                    delta < STREAM_LIVE_MIN_CHAR_DELTA
+                    and elapsed < STREAM_LIVE_MIN_INTERVAL_SEC
+                    and not queue_quiet
+                ):
+                    return
+        frame = self._live_frame_renderable(display_text)
+        if self.live is None:
+            self.live = Live(
+                frame,
+                console=self.console,
+                auto_refresh=True,
+                refresh_per_second=30,
+                transient=True,
+                vertical_overflow='ellipsis',
+            )
+            self.live.start(refresh=True)
+        else:
+            try:
+                self.live.update(frame)
+            except BaseException:
+                pass
+        self.last_render_time = now
+        self.last_painted_display_len = dlen
+
+    def _squash_live_for_halt(self) -> None:
+        if self.use_live and self._streaming_display_payload().strip():
+            self._apply_streaming_live(force=True, queue_quiet=True)
+
+    def _stop_live(self) -> None:
+        if self.live is not None:
+            try:
+                self.live.stop()
+            except BaseException:
+                pass
+            self.live = None
+        self.last_render_time = 0.0
+        self.last_painted_display_len = 0
+
+    @staticmethod
+    def _queue_try_get(outq: Any) -> tuple[str, Any] | None:
+        import queue
+
+        try:
+            return outq.get(timeout=0.12)
+        except queue.Empty:
+            return None
+
+    def _poll_sync(self, *, show_thinking_status: bool) -> dict[str, Any] | None:
+        from contextlib import nullcontext
+
+        status_obj: Any = None
+        if show_thinking_status and self.live is None and self.use_live:
+            status_obj = self.console.status(
+                f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]',
+                spinner='point',
+            )
+            status_ctx: Any = status_obj
+        else:
+            status_ctx = nullcontext()
+
+        with status_ctx:
+            last_status_anim = time.time()
+            while True:
+                if (
+                    status_obj is not None
+                    and self.use_live
+                    and (time.time() - last_status_anim > 0.3)
+                ):
+                    status_obj.update(
+                        f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]'
+                    )
+                    last_status_anim = time.time()
+
+                item = self._queue_try_get(self.outq)
+                if item is None:
+                    continue
+                kind, payload = item
+                if kind == 'ok':
+                    return payload
+                if kind == 'stop':
+                    return None
+                if kind == 'err':
+                    if isinstance(payload, GeneratorExit):
+                        raise KeyboardInterrupt from None
+                    raise payload
+
+    async def _poll_async(self, *, show_thinking_status: bool) -> dict[str, Any] | None:
+        import asyncio
+        from contextlib import nullcontext
+
+        status_obj: Any = None
+        if show_thinking_status and self.live is None and self.use_live:
+            status_obj = self.console.status(
+                f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]',
+                spinner='point',
+            )
+            status_ctx: Any = status_obj
+        else:
+            status_ctx = nullcontext()
+
+        with status_ctx:
+            last_status_anim = time.time()
+            while True:
+                if (
+                    status_obj is not None
+                    and self.use_live
+                    and (time.time() - last_status_anim > 0.3)
+                ):
+                    status_obj.update(
+                        f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]'
+                    )
+                    last_status_anim = time.time()
+
+                item = await asyncio.to_thread(self._queue_try_get, self.outq)
+                if item is None:
+                    await asyncio.sleep(0)
+                    continue
+                kind, payload = item
+                if kind == 'ok':
+                    return payload
+                if kind == 'stop':
+                    return None
+                if kind == 'err':
+                    if isinstance(payload, GeneratorExit):
+                        raise KeyboardInterrupt from None
+                    raise payload
+
+    def _drain_queue_after_interrupt(self) -> None:
+        import queue
+
+        try:
+            while True:
+                self.outq.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _process_stream_deltas(self, ev: dict[str, Any]) -> None:
+        et = ev['type']
+        if et == 'text_delta':
+            self.buffer += ev.get('text', '')
+        else:
+            self.tool_streaming_buffer += ev.get('fragment', '')
+            self.round_saw_tool_json_stream = True
+
+        while not self.outq.empty():
+            try:
+                kind, payload = self.outq.queue[0]
+                if kind == 'ok' and payload.get('type') in ('text_delta', 'tool_delta'):
+                    self.outq.get_nowait()
+                    if payload['type'] == 'text_delta':
+                        self.buffer += payload.get('text', '')
+                    else:
+                        self.tool_streaming_buffer += payload.get('fragment', '')
+                        self.round_saw_tool_json_stream = True
+                else:
+                    break
+            except Exception:
+                break
+
+        queue_quiet = self.outq.empty()
+        self._apply_streaming_live(force=False, queue_quiet=queue_quiet)
+
+    def _finish_turn_success(self, ev: dict[str, Any]) -> None:
+        from .repl_ui_render import (
+            print_cyber_turn_divider,
+            print_solidified_assistant_markdown,
+            tool_params_stream_collapsed_panel,
+        )
+
+        self._squash_live_for_halt()
+        self._stop_live()
+        out = ev.get('output', '')
+        show_tool_collapse = self.round_saw_tool_json_stream or bool(
+            self.tool_streaming_buffer.strip()
+        )
+        body = ''
+        if self.buffer.strip():
+            body = self.buffer.strip()
+        elif isinstance(out, str) and out.strip():
+            body = out.strip()
+        if body:
+            print_solidified_assistant_markdown(self.console, body)
+        if show_tool_collapse:
+            self.console.print(
+                tool_params_stream_collapsed_panel(
+                    self.tool_streaming_buffer.strip() or None
+                )
+            )
+        if body or show_tool_collapse:
+            self.console.print()
+        print_cyber_turn_divider(self.console)
+
+    def run_sync_loop(self) -> None:
+        from .repl_ui_render import (
+            build_api_tool_op_renderable,
+            print_cyber_turn_divider,
+            tool_execution_status_message,
+        )
+
+        if self.use_live:
+            print_cyber_turn_divider(self.console)
+
+        pending: dict[str, Any] | None = self._poll_sync(
+            show_thinking_status=self.use_live and self.live is None
+        )
+        while pending is not None:
+            ev = pending
+            pending = None
+            et = ev['type']
+
+            if et == 'blocked':
+                self._squash_live_for_halt()
+                self._stop_live()
+                _print_assistant_output(self.console, ev['output'])
+                return
+            if et == 'llm_error':
+                self._squash_live_for_halt()
+                self._stop_live()
+                _print_assistant_error(self.console, ev['output'])
+                return
+            if et == 'team_agent':
+                self._squash_live_for_halt()
+                self._stop_live()
+                agent = str(ev.get('agent', 'Agent'))
+                styles = {
+                    'Planner': 'bold cyan',
+                    'Coder': 'bold green',
+                    'Reviewer': 'bold yellow',
+                }
+                st = styles.get(agent, 'bold white')
+                self.console.print(f'[{st}]━━ {agent} ━━[/{st}]')
+                pending = self._poll_sync(
+                    show_thinking_status=self.use_live and self.live is None
+                )
+                continue
+            if et == 'non_llm':
+                self._squash_live_for_halt()
+                self._stop_live()
+                _print_assistant_output(self.console, ev['output'])
+                return
+            if et == 'tool_phase':
+                self._squash_live_for_halt()
+                self._stop_live()
+                label = ', '.join(ev['tools'])
+                self.console.print(
+                    f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]'
+                )
+                pending = self._poll_sync(
+                    show_thinking_status=self.use_live and self.live is None
+                )
+                continue
+            if et == 'api_tool_op':
+                self._squash_live_for_halt()
+                self._stop_live()
+                if self.buffer.strip():
+                    _print_assistant_output(self.console, self.buffer)
+                self.buffer = ''
+                self.tool_streaming_buffer = ''
+                self.console.print(build_api_tool_op_renderable(ev))
+                self.console.print()
+                tool_name = str(ev.get('tool_name', 'tool'))
+                with self.console.status(
+                    tool_execution_status_message(tool_name),
+                    spinner='dots12',
+                    spinner_style='cyan',
+                ):
+                    pending = self._poll_sync(show_thinking_status=False)
+                continue
+            if et in ('text_delta', 'tool_delta'):
+                self._process_stream_deltas(ev)
+                pending = self._poll_sync(show_thinking_status=False)
+                continue
+            if et == 'finished':
+                self._finish_turn_success(ev)
+                return
+
+            pending = self._poll_sync(
+                show_thinking_status=self.use_live and self.live is None
+            )
+
+    async def run_async_loop(self) -> None:
+        from .repl_ui_render import (
+            build_api_tool_op_renderable,
+            print_cyber_turn_divider,
+            tool_execution_status_message,
+        )
+
+        if self.use_live:
+            print_cyber_turn_divider(self.console)
+
+        pending: dict[str, Any] | None = await self._poll_async(
+            show_thinking_status=self.use_live and self.live is None
+        )
+        while pending is not None:
+            ev = pending
+            pending = None
+            et = ev['type']
+
+            if et == 'blocked':
+                self._squash_live_for_halt()
+                self._stop_live()
+                _print_assistant_output(self.console, ev['output'])
+                return
+            if et == 'llm_error':
+                self._squash_live_for_halt()
+                self._stop_live()
+                _print_assistant_error(self.console, ev['output'])
+                return
+            if et == 'team_agent':
+                self._squash_live_for_halt()
+                self._stop_live()
+                agent = str(ev.get('agent', 'Agent'))
+                styles = {
+                    'Planner': 'bold cyan',
+                    'Coder': 'bold green',
+                    'Reviewer': 'bold yellow',
+                }
+                st = styles.get(agent, 'bold white')
+                self.console.print(f'[{st}]━━ {agent} ━━[/{st}]')
+                pending = await self._poll_async(
+                    show_thinking_status=self.use_live and self.live is None
+                )
+                continue
+            if et == 'non_llm':
+                self._squash_live_for_halt()
+                self._stop_live()
+                _print_assistant_output(self.console, ev['output'])
+                return
+            if et == 'tool_phase':
+                self._squash_live_for_halt()
+                self._stop_live()
+                label = ', '.join(ev['tools'])
+                self.console.print(
+                    f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]'
+                )
+                pending = await self._poll_async(
+                    show_thinking_status=self.use_live and self.live is None
+                )
+                continue
+            if et == 'api_tool_op':
+                self._squash_live_for_halt()
+                self._stop_live()
+                if self.buffer.strip():
+                    _print_assistant_output(self.console, self.buffer)
+                self.buffer = ''
+                self.tool_streaming_buffer = ''
+                self.console.print(build_api_tool_op_renderable(ev))
+                self.console.print()
+                tool_name = str(ev.get('tool_name', 'tool'))
+                with self.console.status(
+                    tool_execution_status_message(tool_name),
+                    spinner='dots12',
+                    spinner_style='cyan',
+                ):
+                    pending = await self._poll_async(show_thinking_status=False)
+                continue
+            if et in ('text_delta', 'tool_delta'):
+                self._process_stream_deltas(ev)
+                pending = await self._poll_async(show_thinking_status=False)
+                continue
+            if et == 'finished':
+                self._finish_turn_success(ev)
+                return
+
+            pending = await self._poll_async(
+                show_thinking_status=self.use_live and self.live is None
+            )
+
+    def finalize(self) -> None:
+        self._stop_live()
+        _repl_terminal_soft_reset(self.console)
+
+
 # REPL 单行历史仅驻内存；限制条数避免极长会话下 list 膨胀拖慢 prompt_toolkit
 _REPL_HISTORY_MAX_ITEMS = 512
 
@@ -509,313 +996,174 @@ def _run_streaming_turn(
     team: bool = False,
     status_engine: Any | None = None,
 ) -> None:
-    from rich.live import Live
+    from .agent_cancel import request_agent_cancel
 
-    from .repl_ui_render import (
-        STREAM_LIVE_MIN_CHAR_DELTA,
-        STREAM_LIVE_MIN_INTERVAL_SEC,
-        build_api_tool_op_renderable,
-        print_cyber_turn_divider,
-        print_solidified_assistant_markdown,
-        streaming_markdown_for_live,
-        tool_execution_status_message,
-        tool_params_stream_collapsed_panel,
+    sess = _StreamingTurnSession(
+        engine,
+        runtime,
+        line,
+        console,
+        route_limit=route_limit,
+        team=team,
+        status_engine=status_engine,
     )
-
-    use_live = bool(getattr(console, 'is_terminal', False) and console.is_terminal)
-    gen = engine.iter_repl_assistant_events_with_runtime(
-        line, runtime=runtime, route_limit=route_limit, team=team
-    )
-
-    import queue
-    import threading
-    from contextlib import nullcontext
-
-    outq: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=0)
-
-    def _worker() -> None:
-        try:
-            for ev in gen:
-                outq.put(('ok', ev))
-            outq.put(('stop', None))
-        except BaseException as exc:
-            outq.put(('err', exc))
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-    buffer = ''
-    tool_streaming_buffer = ''
-    live: Any = None
-    round_saw_tool_json_stream = False
-
-    last_render_time = 0.0
-    last_painted_display_len = 0
-
-    def _streaming_display_payload() -> str:
-        display_text = buffer
-        if tool_streaming_buffer:
-            tool_lines = tool_streaming_buffer.splitlines()
-            if len(tool_lines) > 15:
-                rolling_tool = '...\n' + '\n'.join(tool_lines[-15:])
-            else:
-                rolling_tool = tool_streaming_buffer
-            display_text += (
-                '\n\n> ⚙️ **正在编写代码与工具参数...**\n```json\n'
-                f'{rolling_tool}\n```'
-            )
-        return display_text
-
-    def _live_frame_renderable(display_text: str) -> Any:
-        """Markdown 主区 + 可选神经底栏（TUI 流式时钉在 Live 视窗最底行）。"""
-        md = streaming_markdown_for_live(display_text, console=console)
-        if status_engine is None:
-            return md
-        from rich.console import Group
-        from rich.text import Text
-
-        from .tui_app import neural_status_stream_footer_markup
-
-        try:
-            w = int(getattr(getattr(console, 'size', None), 'width', None) or 80)
-        except (TypeError, ValueError):
-            w = 80
-        rule_w = max(24, min(max(w - 2, 24), 120))
-        rule = Text('▔' * rule_w, style='dim #0f172a')
-        # Rich 旧版：from_markup 不接受 overflow/no_wrap，须在实例上设置
-        foot = Text.from_markup(neural_status_stream_footer_markup(status_engine))
-        foot.overflow = 'ellipsis'
-        foot.no_wrap = True
-        return Group(md, rule, foot)
-
-    def _apply_streaming_live(*, force: bool, queue_quiet: bool) -> None:
-        """节流 + 批处理：在队列仍忙时按时间/字数合并 ``live.update``；``Live`` 用 ``auto_refresh`` 周期 refresh。"""
-        nonlocal live, last_render_time, last_painted_display_len
-        if not use_live:
-            return
-        display_text = _streaming_display_payload()
-        if not display_text.strip():
-            return
-        dlen = len(display_text)
-        now = time.time()
-        if not force:
-            if dlen == last_painted_display_len:
-                return
-            delta = dlen - last_painted_display_len
-            elapsed = now - last_render_time
-            # 尚未创建 Live 时不要按字数节流，否则首几字会一直攒不够 MIN_CHAR_DELTA、界面空白。
-            if live is not None:
-                if (
-                    delta < STREAM_LIVE_MIN_CHAR_DELTA
-                    and elapsed < STREAM_LIVE_MIN_INTERVAL_SEC
-                    and not queue_quiet
-                ):
-                    return
-        frame = _live_frame_renderable(display_text)
-        if live is None:
-            # Rich Live.update() 默认不 refresh；auto_refresh=False 时终端会一直停在首帧。
-            # 用后台刷新线程 + 首帧 start(refresh=True)，节流路径里仍 update 新 renderable。
-            live = Live(
-                frame,
-                console=console,
-                auto_refresh=True,
-                refresh_per_second=30,
-                transient=True,
-                vertical_overflow='ellipsis',
-            )
-            live.start(refresh=True)
-        else:
-            try:
-                live.update(frame)
-            except BaseException:
-                pass
-        last_render_time = now
-        last_painted_display_len = dlen
-
-    def _squash_live_for_halt() -> None:
-        if use_live and _streaming_display_payload().strip():
-            _apply_streaming_live(force=True, queue_quiet=True)
-
-    def _stop_live() -> None:
-        nonlocal live, last_render_time, last_painted_display_len
-        if live is not None:
-            try:
-                live.stop()
-            except BaseException:
-                pass
-            live = None
-        # 下一轮 Live 重新计时，避免工具间隙的「首包」被旧时间戳节流卡死
-        last_render_time = 0.0
-        last_painted_display_len = 0
-
-    def _poll(*, show_thinking_status: bool) -> dict[str, Any] | None:
-        status_obj: Any = None
-        if show_thinking_status and live is None and use_live:
-            status_obj = console.status(
-                f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]',
-                spinner='point',
-            )
-            status_ctx: Any = status_obj
-        else:
-            status_ctx = nullcontext()
-
-        with status_ctx:
-            last_status_anim = time.time()
-            while True:
-                if (
-                    status_obj is not None
-                    and use_live
-                    and (time.time() - last_status_anim > 0.3)
-                ):
-                    status_obj.update(
-                        f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]'
-                    )
-                    last_status_anim = time.time()
-
-                try:
-                    kind, payload = outq.get(timeout=0.1)
-                    if kind == 'ok':
-                        return payload
-                    if kind == 'stop':
-                        return None
-                    if kind == 'err':
-                        if isinstance(payload, GeneratorExit):
-                            raise KeyboardInterrupt from None
-                        raise payload
-                except queue.Empty:
-                    continue
-
+    sess.start_worker()
     try:
-        if use_live:
-            print_cyber_turn_divider(console)
-        pending: dict[str, Any] | None = _poll(
-            show_thinking_status=use_live and live is None,
-        )
-        while pending is not None:
-            ev = pending
-            pending = None
-            et = ev['type']
-
-            if et == 'blocked':
-                _squash_live_for_halt()
-                _stop_live()
-                _print_assistant_output(console, ev['output'])
-                return
-            if et == 'llm_error':
-                _squash_live_for_halt()
-                _stop_live()
-                _print_assistant_error(console, ev['output'])
-                return
-            if et == 'team_agent':
-                _squash_live_for_halt()
-                _stop_live()
-                agent = str(ev.get('agent', 'Agent'))
-                styles = {
-                    'Planner': 'bold cyan',
-                    'Coder': 'bold green',
-                    'Reviewer': 'bold yellow',
-                }
-                st = styles.get(agent, 'bold white')
-                console.print(f'[{st}]━━ {agent} ━━[/{st}]')
-                pending = _poll(show_thinking_status=use_live and live is None)
-                continue
-            if et == 'non_llm':
-                _squash_live_for_halt()
-                _stop_live()
-                _print_assistant_output(console, ev['output'])
-                return
-            if et == 'tool_phase':
-                _squash_live_for_halt()
-                _stop_live()
-                label = ', '.join(ev['tools'])
-                console.print(f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]')
-                pending = _poll(show_thinking_status=use_live and live is None)
-                continue
-            if et == 'api_tool_op':
-                _squash_live_for_halt()
-                _stop_live()
-                if buffer.strip():
-                    _print_assistant_output(console, buffer)
-                buffer = ''
-                tool_streaming_buffer = ''
-                console.print(build_api_tool_op_renderable(ev))
-                console.print()
-                tool_name = str(ev.get('tool_name', 'tool'))
-                # 下一次 next(gen) 会在 llm_client 内同步执行工具；用 Status 覆盖等待期
-                with console.status(
-                    tool_execution_status_message(tool_name),
-                    spinner='dots12',
-                    spinner_style='cyan',
-                ):
-                    pending = _poll(show_thinking_status=False)
-                continue
-            if et in ('text_delta', 'tool_delta'):
-                if et == 'text_delta':
-                    buffer += ev.get('text', '')
-                else:
-                    tool_streaming_buffer += ev.get('fragment', '')
-                    round_saw_tool_json_stream = True
-
-                # 极限合并：一次性排空队列里所有立即可用的流事件
-                while not outq.empty():
-                    try:
-                        kind, payload = outq.queue[0]
-                        if kind == 'ok' and payload.get('type') in ('text_delta', 'tool_delta'):
-                            outq.get_nowait()
-                            if payload['type'] == 'text_delta':
-                                buffer += payload.get('text', '')
-                            else:
-                                tool_streaming_buffer += payload.get('fragment', '')
-                                round_saw_tool_json_stream = True
-                        else:
-                            break
-                    except Exception:
-                        break
-
-                # 节流：~30Hz 时间片 + 小批次字形；队列静默时不过滤尾包
-                queue_quiet = outq.empty()
-                _apply_streaming_live(force=False, queue_quiet=queue_quiet)
-
-                pending = _poll(show_thinking_status=False)
-                continue
-            if et == 'finished':
-                _squash_live_for_halt()
-                _stop_live()
-                out = ev.get('output', '')
-                show_tool_collapse = round_saw_tool_json_stream or bool(
-                    tool_streaming_buffer.strip()
-                )
-                body = ''
-                if buffer.strip():
-                    body = buffer.strip()
-                elif isinstance(out, str) and out.strip():
-                    body = out.strip()
-                if body:
-                    print_solidified_assistant_markdown(console, body)
-                if show_tool_collapse:
-                    console.print(
-                        tool_params_stream_collapsed_panel(
-                            tool_streaming_buffer.strip() or None
-                        )
-                    )
-                if body or show_tool_collapse:
-                    console.print()
-                print_cyber_turn_divider(console)
-                return
-
-            pending = _poll(show_thinking_status=use_live and live is None)
+        sess.run_sync_loop()
     except KeyboardInterrupt:
-        _safe_close_generator(gen)
+        _safe_close_generator(sess.gen)
+        sess._drain_queue_after_interrupt()
+        sess._squash_live_for_halt()
+        sess._stop_live()
         try:
-            while True:
-                outq.get_nowait()
-        except queue.Empty:
-            pass
-        _squash_live_for_halt()
-        _stop_live()
+            engine.request_stream_abort()
+        except Exception:
+            request_agent_cancel()
         _print_graceful_interrupt(console, use_rich=True)
     finally:
-        _stop_live()
-        _repl_terminal_soft_reset(console)
+        sess.finalize()
+
+
+def _run_streaming_turn_tui_concurrent(
+    session: Any,
+    engine: Any,
+    runtime: Any,
+    line: str,
+    console: Any,
+    *,
+    route_limit: int,
+    team: bool,
+    status_engine: Any | None,
+    prompt_message_html: Any,
+    bottom_toolbar: Any,
+) -> None:
+    import asyncio
+
+    from prompt_toolkit.patch_stdout import patch_stdout
+    from prompt_toolkit.validation import Validator
+
+    from .agent_cancel import request_agent_cancel
+
+    # 并发 TUI 模式下底部交互由 prompt_toolkit 独占，避免与 Rich Live 页脚双层叠加。
+    sess = _StreamingTurnSession(
+        engine,
+        runtime,
+        line,
+        console,
+        route_limit=route_limit,
+        team=team,
+        status_engine=None,
+    )
+    sess.start_worker()
+    turn_done = asyncio.Event()
+    active_prompt_task: asyncio.Task[str] | None = None
+
+    async def _cancel_active_prompt_task() -> None:
+        nonlocal active_prompt_task
+        t = active_prompt_task
+        if t is None:
+            return
+        if not t.done():
+            t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        active_prompt_task = None
+
+    async def _drive_input() -> None:
+        nonlocal active_prompt_task
+        stop_only_validator = Validator.from_callable(
+            lambda text: (text or '').strip() == '/stop',
+            error_message='当前正在生成响应，仅支持输入 /stop 终止任务',
+            move_cursor_to_end=True,
+        )
+        prompt_task = asyncio.create_task(
+            session.prompt_async(
+                prompt_message_html,
+                bottom_toolbar=bottom_toolbar,
+                handle_sigint=True,
+                validator=stop_only_validator,
+                validate_while_typing=False,
+            )
+        )
+        active_prompt_task = prompt_task
+        wait_turn = asyncio.create_task(turn_done.wait())
+        done, _ = await asyncio.wait(
+            {prompt_task, wait_turn},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if wait_turn in done:
+            await _cancel_active_prompt_task()
+            return
+        wait_turn.cancel()
+        try:
+            await wait_turn
+        except asyncio.CancelledError:
+            pass
+        try:
+            text = prompt_task.result()
+        except asyncio.CancelledError:
+            active_prompt_task = None
+            return
+        except KeyboardInterrupt:
+            active_prompt_task = None
+            try:
+                engine.request_stream_abort()
+            except Exception:
+                request_agent_cancel()
+            await turn_done.wait()
+            return
+        active_prompt_task = None
+        if turn_done.is_set():
+            return
+        if (text or '').strip() == '/stop':
+            try:
+                engine.request_stream_abort()
+            except Exception:
+                request_agent_cancel()
+            await turn_done.wait()
+
+    async def _drive_stream() -> None:
+        try:
+            with patch_stdout(raw=True):
+                await sess.run_async_loop()
+        finally:
+            turn_done.set()
+            await _cancel_active_prompt_task()
+
+    async def _runner() -> None:
+        stream_task = asyncio.create_task(_drive_stream())
+        input_task = asyncio.create_task(_drive_input())
+        try:
+            await stream_task
+        finally:
+            turn_done.set()
+            await _cancel_active_prompt_task()
+            input_task.cancel()
+            try:
+                await input_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+    try:
+        asyncio.run(_runner())
+    except KeyboardInterrupt:
+        _safe_close_generator(sess.gen)
+        sess._drain_queue_after_interrupt()
+        try:
+            engine.request_stream_abort()
+        except Exception:
+            request_agent_cancel()
+        sess._squash_live_for_halt()
+        sess._stop_live()
+        _print_graceful_interrupt(console, use_rich=True)
+    finally:
+        sess.finalize()
 
 
 def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int:
@@ -964,6 +1312,8 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
                         )
                     except Exception:
                         print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
+                finally:
+                    repl_stdin_flush_pending_if_tty()
                 _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
                 _try_persist_repl_session(engine)
             continue
@@ -995,6 +1345,8 @@ def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int
             except Exception:
                 print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
             continue
+        finally:
+            repl_stdin_flush_pending_if_tty()
         _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
         _try_persist_repl_session(engine)
 

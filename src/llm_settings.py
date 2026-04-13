@@ -6,6 +6,10 @@ from pathlib import Path
 
 _DOTENV_LOADED = False
 
+# LLM 网络超时防护（秒）：连接建立上限 + 流式读取上限
+LLM_CONNECT_TIMEOUT = 15.0
+LLM_READ_TIMEOUT = 90.0
+
 
 def project_root() -> Path:
     return Path(__file__).resolve().parent.parent

@@ -33,6 +33,15 @@ cd Scream-Code
 bash install.sh
 ```
 
+### Windows 用户一键安装（PowerShell）
+如果你使用 Windows，请在项目根目录执行下面这行命令（可绕过执行策略限制）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+> 若你的终端权限较严，可用“以管理员身份运行 PowerShell”后再执行。安装脚本会自动检测 Python / pip、创建 `.venv`、安装依赖、下载 Playwright Chromium，并在完成后自动启动 `scream`。
+
 **☕ 这时脚本会自动完成以下动作：**
 * 🔍 **环境体检**：自动检查 Python 和 Pip 是否就绪。
 * 📦 **无污染安装**：创建一个隐藏的虚拟环境 (`.venv`)，绝不弄乱你电脑原本的 Python。

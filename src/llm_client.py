@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import asyncio
 import json
 import os
 from collections.abc import Iterator
@@ -10,7 +11,11 @@ from typing import Any
 from openai import OpenAI
 
 from . import agent_cancel
-from .llm_settings import LlmConnectionSettings
+from .llm_settings import (
+    LLM_CONNECT_TIMEOUT,
+    LLM_READ_TIMEOUT,
+    LlmConnectionSettings,
+)
 from .message_prune import prune_historical_messages
 
 
@@ -132,6 +137,9 @@ class ChatCompletionResult:
 
 
 _KEY_SETUP_HINT = '未检测到密钥，请执行 scream config 进行设置'
+_LLM_TRANSPORT_FUSE_MSG = (
+    '\n\n[💥 引擎熔断：网络请求超时或连接失败，请检查网络/代理设置后重试]'
+)
 
 
 def _raise_if_missing_key(settings: LlmConnectionSettings) -> None:
@@ -168,6 +176,55 @@ def _map_llm_auth_exception(exc: BaseException) -> LlmClientError | None:
     if resp is not None and getattr(resp, 'status_code', None) == 401:
         return LlmClientError(_KEY_SETUP_HINT)
     return None
+
+
+def _is_timeout_or_network_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    try:
+        import httpx
+
+        if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+            return True
+    except ImportError:
+        pass
+    try:
+        import openai
+
+        timeout_err = getattr(openai, 'APITimeoutError', None)
+        conn_err = getattr(openai, 'APIConnectionError', None)
+        cls_list = tuple(c for c in (timeout_err, conn_err) if isinstance(c, type))
+        if cls_list and isinstance(exc, cls_list):
+            return True
+    except ImportError:
+        pass
+    try:
+        import anthropic
+
+        timeout_err = getattr(anthropic, 'APITimeoutError', None)
+        conn_err = getattr(anthropic, 'APIConnectionError', None)
+        cls_list = tuple(c for c in (timeout_err, conn_err) if isinstance(c, type))
+        if cls_list and isinstance(exc, cls_list):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def _build_httpx_timeout() -> Any:
+    try:
+        import httpx
+
+        return httpx.Timeout(
+            timeout=LLM_READ_TIMEOUT,
+            connect=LLM_CONNECT_TIMEOUT,
+            read=LLM_READ_TIMEOUT,
+            write=LLM_READ_TIMEOUT,
+            pool=LLM_CONNECT_TIMEOUT,
+        )
+    except ImportError:
+        # 兜底：SDK 也接受 float 语义（总超时）
+        return float(LLM_READ_TIMEOUT)
 
 
 def openai_tools_to_anthropic(openai_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -407,7 +464,11 @@ def _chat_completion_stream_openai(
     use_model: str,
     tools: list[dict[str, Any]] | None,
 ) -> Iterator[StreamPart]:
-    client = OpenAI(base_url=settings.base_url, api_key=settings.api_key)
+    client = OpenAI(
+        base_url=settings.base_url,
+        api_key=settings.api_key,
+        timeout=_build_httpx_timeout(),
+    )
     stream = _open_chat_stream(
         client, use_model=use_model, messages=messages, tools=tools
     )
@@ -441,6 +502,7 @@ def _chat_completion_stream_anthropic(
 
     base_kw: dict[str, Any] = {
         'api_key': settings.api_key,
+        'timeout': _build_httpx_timeout(),
     }
     if settings.base_url and str(settings.base_url).strip():
         base_kw['base_url'] = str(settings.base_url).strip().rstrip('/')
@@ -556,6 +618,8 @@ def chat_completion_stream(
         mapped = _map_llm_auth_exception(exc)
         if mapped is not None:
             raise mapped from exc
+        if _is_timeout_or_network_exception(exc):
+            raise LlmClientError(_LLM_TRANSPORT_FUSE_MSG) from exc
         raise
 
 
@@ -628,9 +692,16 @@ def iter_agent_executor_events(
                 if part.completion_tokens is not None:
                     round_out = part.completion_tokens
         except LlmClientError as exc:
-            yield {'type': 'llm_error', 'output': f'[LLM] {exc}'}
+            msg = str(exc)
+            if msg == _LLM_TRANSPORT_FUSE_MSG:
+                yield {'type': 'llm_error', 'output': msg}
+            else:
+                yield {'type': 'llm_error', 'output': f'[LLM] {msg}'}
             return
         except Exception as exc:  # pragma: no cover - 网络/供应商错误
+            if _is_timeout_or_network_exception(exc):
+                yield {'type': 'llm_error', 'output': _LLM_TRANSPORT_FUSE_MSG}
+                return
             yield {'type': 'llm_error', 'output': f'[LLM] 请求异常: {exc}'}
             return
 
