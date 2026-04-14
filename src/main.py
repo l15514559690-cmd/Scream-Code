@@ -148,6 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
         default='',
         help='可选的一次性提示词（在管道模式下会与 stdin 内容拼装）',
     )
+    repl_parser.add_argument(
+        '--session_id',
+        '--session-id',
+        default='',
+        help='可选会话标识（供外部桥接层透传；当前版本用于向下游执行链路透传上下文标识）',
+    )
     subparsers.add_parser('config', help='交互式管理多模型配置（llm_config.json）')
     subparsers.add_parser('summary', help='以 Markdown 渲染 Python 移植工作区摘要')
     subparsers.add_parser('manifest', help='打印当前 Python 工作区清单')
@@ -274,6 +280,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(incoming_argv)
     manifest = build_port_manifest()
     if args.command == 'repl':
+        if getattr(args, 'session_id', '').strip():
+            # 向下游执行链路透传外部会话 ID（例如飞书 chat_id），便于后续扩展会话隔离。
+            os.environ['SCREAM_SESSION_ID'] = str(args.session_id).strip()
         is_piped = detect_piped_stdin()
         if is_piped and not getattr(args, 'json_stdio', False):
             pipe_content = read_piped_stdin_text()
@@ -281,7 +290,18 @@ def main(argv: list[str] | None = None) -> int:
                 getattr(args, 'prompt', '') or '',
                 pipe_content,
             )
-            return run_headless_query(query_text, llm_enabled=bool(args.llm))
+            return run_headless_query(
+                query_text,
+                llm_enabled=bool(args.llm),
+                session_id=getattr(args, 'session_id', '') or '',
+            )
+        if (getattr(args, 'prompt', '') or '').strip():
+            # 显式传入 prompt 时走一次性执行，避免进入交互循环阻塞桥接侧车。
+            return run_headless_query(
+                str(args.prompt).strip(),
+                llm_enabled=bool(args.llm),
+                session_id=getattr(args, 'session_id', '') or '',
+            )
         if getattr(args, 'json_stdio', False):
             from .replLauncher import run_repl_json_stdio_loop
 

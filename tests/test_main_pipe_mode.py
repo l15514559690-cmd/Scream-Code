@@ -46,7 +46,7 @@ class MainPipeModeTests(unittest.TestCase):
         call_args, call_kwargs = run_pipe.call_args
         self.assertIn('请解释', call_args[0])
         self.assertIn('abc', call_args[0])
-        self.assertEqual(call_kwargs, {'llm_enabled': True})
+        self.assertEqual(call_kwargs, {'llm_enabled': True, 'session_id': ''})
 
     def test_run_headless_query_error_returns_nonzero(self) -> None:
         with patch('src.query_engine.QueryEnginePort.from_workspace', side_effect=RuntimeError('boom')):

@@ -47,7 +47,12 @@ def read_piped_stdin_text(stdin: TextIO | None = None) -> str:
         return ''
 
 
-def run_headless_query(query_text: str, *, llm_enabled: bool = True) -> int:
+def run_headless_query(
+    query_text: str,
+    *,
+    llm_enabled: bool = True,
+    session_id: str = '',
+) -> int:
     """
     无头单次执行：不初始化 prompt_toolkit / rich.Live，处理后直接退出。
     """
@@ -57,7 +62,14 @@ def run_headless_query(query_text: str, *, llm_enabled: bool = True) -> int:
     try:
         from .query_engine import QueryEnginePort
 
-        engine = QueryEnginePort.from_workspace()
+        sid = (session_id or '').strip()
+        if sid:
+            try:
+                engine = QueryEnginePort.from_saved_session(sid)
+            except Exception:
+                engine = QueryEnginePort.from_workspace()
+        else:
+            engine = QueryEnginePort.from_workspace()
         engine.config = replace(engine.config, llm_enabled=llm_enabled)
         result = engine.submit_message(prompt)
         output = str(getattr(result, 'output', '') or '')
