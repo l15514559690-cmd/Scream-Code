@@ -51,7 +51,7 @@ class StoredSession:
     messages: tuple[str, ...]
     input_tokens: int
     output_tokens: int
-    #: 发往 LLM 的完整消息快照（含 assistant / tool），供重启后恢复上下文；旧版 JSON 无此字段则为空。
+    #: 发往 LLM 的完整消息快照（含 assistant / tool）；可能经上下文折叠缩短；旧版 JSON 无此字段则为空。
     llm_conversation_messages: tuple[dict[str, Any], ...] = ()
 
 
@@ -96,6 +96,12 @@ def load_session(session_id: str, directory: Path | None = None) -> StoredSessio
         output_tokens=data['output_tokens'],
         llm_conversation_messages=llm_conv,
     )
+
+
+def session_exists(session_id: str, directory: Path | None = None) -> bool:
+    """会话文件是否存在（仅文件层检查，不触发反序列化）。"""
+    target_dir = directory or resolve_session_dir()
+    return (target_dir / f'{session_id}.json').is_file()
 
 
 def list_saved_session_entries(

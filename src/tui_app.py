@@ -6,7 +6,7 @@
   避免每 token 全量 Markdown 重排；终端高度绑定的**尾部视口**把滚动锁在 Live 区，scrollback 不乱跳；
   未闭合 `` ``` `` 在解析前虚拟闭合，Pygments 结构不塌。
 - **定稿**：瞬态 Live 结束后靛紫 ``Panel`` / ``print_solidified_assistant_markdown`` 写入历史；首包前 ``console.status``。
-- **生成中输入**：流式回合走 ``replLauncher._run_streaming_turn_tui_concurrent``：``asyncio`` + ``patch_stdout`` + ``prompt_async``，
+- **生成中输入**：流式回合走 ``replLauncher._run_streaming_turn_tui_concurrent``：``asyncio`` + ``patch_stdout`` + ``prompt_async``（回合结束会清空 ``PromptSession.validator``，避免校验器泄漏到下一轮），
   底部输入框在思考/输出期间仍可用，``/stop`` 与 Ctrl+C 触发 ``engine.request_stream_abort()``；回合结束 ``tcflush``  stdin 丢弃幽灵回车。
 - **神经底栏**：``prompt_toolkit`` 的 ``bottom_toolbar`` 全宽深色条 + 青/绿高亮；TUI 流式时在 ``Live`` 内用 ``Group`` 叠一行 Rich 页脚，与输入态信息同源（模型 / 沙箱 / 记忆条数 / Token%）。
 - **斜杠补全**：``/`` 菜单；**Enter** 在补全打开时只确认补全（见 ``repl_slash_helpers``）。

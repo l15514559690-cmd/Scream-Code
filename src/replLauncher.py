@@ -361,6 +361,31 @@ def _print_assistant_error(console: object, message: str) -> None:
     console.print()
 
 
+def _dedupe_assistant_scrollback_echoes(text: str) -> str:
+    """
+    折叠展示层偶发的「同段自我介绍 / 同句」重影：相邻完全相同的段落或文本行只保留一份。
+    不影响有意重复的结构化列表（仅合并**连续**相同块）。
+    """
+    raw = (text or '').strip()
+    if not raw:
+        return raw
+    paras = [p.strip() for p in raw.split('\n\n') if p.strip()]
+    merged_p: list[str] = []
+    for p in paras:
+        if merged_p and p == merged_p[-1]:
+            continue
+        merged_p.append(p)
+    t2 = '\n\n'.join(merged_p)
+    lines = t2.splitlines()
+    out_ln: list[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if s and out_ln and s == out_ln[-1].strip():
+            continue
+        out_ln.append(ln)
+    return '\n'.join(out_ln).strip()
+
+
 class _StreamingTurnSession:
     """单次 LLM 流式回合：后台线程跑事件生成器，主线程或 asyncio 驱动 Rich Live 消费队列。"""
 
@@ -644,7 +669,7 @@ class _StreamingTurnSession:
             tool_params_stream_collapsed_panel,
         )
 
-        self._squash_live_for_halt()
+        # 不在此再 squash Live：最后一帧若经 transient Live 与定稿 Panel 双写，易造成 scrollback 重影。
         self._stop_live()
         out = ev.get('output', '')
         show_tool_collapse = self.round_saw_tool_json_stream or bool(
@@ -655,6 +680,7 @@ class _StreamingTurnSession:
             body = self.buffer.strip()
         elif isinstance(out, str) and out.strip():
             body = out.strip()
+        body = _dedupe_assistant_scrollback_echoes(body) if body else body
         if body:
             print_solidified_assistant_markdown(self.console, body)
         if show_tool_collapse:
@@ -1024,6 +1050,18 @@ def _run_streaming_turn(
         sess.finalize()
 
 
+def _reset_prompt_session_validator_after_stream(session: Any) -> None:
+    """
+    ``PromptSession.prompt_async(..., validator=…)`` 在 prompt_toolkit 内会**持久写入**
+    ``session.validator``（仅当参数非 None 时赋值，传 None 不会清除旧值）。
+    并发流式回合结束后必须清空，否则下一轮 ``prompt()`` 仍套用「仅 /stop」校验，用户无法输入。
+    """
+    try:
+        session.validator = None
+    except Exception:
+        pass
+
+
 def _run_streaming_turn_tui_concurrent(
     session: Any,
     engine: Any,
@@ -1163,6 +1201,7 @@ def _run_streaming_turn_tui_concurrent(
         sess._stop_live()
         _print_graceful_interrupt(console, use_rich=True)
     finally:
+        _reset_prompt_session_validator_after_stream(session)
         sess.finalize()
 
 

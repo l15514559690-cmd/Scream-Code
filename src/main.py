@@ -517,7 +517,6 @@ def cli_main(argv: list[str]) -> int:
             return code
         reload_project_dotenv()
         return _offer_launch_tui_after_config()
-
     if not is_product_session_ready():
         if not sys.stdin.isatty():
             print(

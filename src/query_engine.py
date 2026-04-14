@@ -65,6 +65,8 @@ class QueryEnginePort:
         default_factory=threading.Lock, repr=False, compare=False
     )
     _stream_generating: bool = field(default=False, repr=False, compare=False)
+    #: 本轮在 ``check_and_compress_history`` 中已成功折叠 ``llm_conversation_messages``，待 UI 打一行提示后清零。
+    _just_compressed: bool = field(default=False, repr=False, compare=False)
 
     @classmethod
     def from_workspace(cls) -> 'QueryEnginePort':
@@ -127,6 +129,32 @@ class QueryEnginePort:
             self.mutable_messages[:] = (
                 self.mutable_messages[-free:] if free > 0 else []
             )
+
+    def check_and_compress_history(
+        self, settings: Any, model_override: str | None
+    ) -> None:
+        """
+        仅压缩 ``self.llm_conversation_messages`` 中**已落盘的历史**（尚未把本轮 user 拼进列表），
+        成功则更新实例、``persist_session``，并置 ``_just_compressed`` 供 UI 提示。
+        """
+        from .context_compressor import compress_history, should_compress_messages
+
+        raw = self.llm_conversation_messages
+        if not raw or not should_compress_messages(raw):
+            return
+        before_len = len(raw)
+        try:
+            compressed = compress_history(raw, settings, model=model_override)
+        except Exception:
+            return
+        if len(compressed) >= before_len:
+            return
+        self.llm_conversation_messages = compressed
+        try:
+            self.persist_session()
+        except Exception:
+            pass
+        self._just_compressed = True
 
     def _emit_pre_llm_context_soft_warning(self) -> None:
         """
@@ -359,12 +387,21 @@ class QueryEnginePort:
         from .llm_settings import read_llm_connection_settings
 
         self._emit_pre_llm_context_soft_warning()
-        messages = self._assemble_messages_for_llm_turn(
-            prompt, matched_commands, matched_tools, denied_tools
-        )
         settings = read_llm_connection_settings()
         raw_override = (self.config.llm_model or '').strip()
         model_override = raw_override or None
+        self.check_and_compress_history(settings, model_override)
+        if self._just_compressed:
+            msg = '\n[🧠 历史记忆已折叠，释放上下文空间...]\n'
+            if self.ui_console is not None:
+                try:
+                    self.ui_console.print(msg)
+                except Exception:
+                    pass
+            self._just_compressed = False
+        messages = self._assemble_messages_for_llm_turn(
+            prompt, matched_commands, matched_tools, denied_tools
+        )
 
         def _call_llm():
             return chat_completion(messages, settings, model=model_override)
@@ -433,9 +470,6 @@ class QueryEnginePort:
             yield {'type': 'non_llm', 'output': output, 'stop_reason': stop_reason}
             return
 
-        messages: list[dict[str, Any]] = self._assemble_messages_for_llm_turn(
-            prompt, matched_commands, matched_tools, denied_tools
-        )
         self._emit_pre_llm_context_soft_warning()
         try:
             settings = read_llm_connection_settings()
@@ -447,10 +481,22 @@ class QueryEnginePort:
             return
         raw_override = (self.config.llm_model or '').strip()
         model_override = raw_override or None
+        self.check_and_compress_history(settings, model_override)
 
         self.mark_stream_generation_start()
         try:
             try:
+                if self._just_compressed:
+                    yield {
+                        'type': 'text_delta',
+                        'text': (
+                            '\n[🧠 历史记忆已折叠，释放上下文空间...]\n'
+                        ),
+                    }
+                    self._just_compressed = False
+                messages: list[dict[str, Any]] = self._assemble_messages_for_llm_turn(
+                    prompt, matched_commands, matched_tools, denied_tools
+                )
                 for ev in iter_agent_executor_events(
                     messages,
                     settings,
@@ -561,6 +607,7 @@ class QueryEnginePort:
         raw_override = (self.config.llm_model or '').strip()
         model_override = raw_override or None
 
+        self.check_and_compress_history(settings, model_override)
         self._emit_pre_llm_context_soft_warning()
 
         phases: tuple[tuple[str, str, bool], ...] = (
@@ -589,6 +636,14 @@ class QueryEnginePort:
         self.mark_stream_generation_start()
         try:
             try:
+                if self._just_compressed:
+                    yield {
+                        'type': 'text_delta',
+                        'text': (
+                            '\n[🧠 历史记忆已折叠，释放上下文空间...]\n'
+                        ),
+                    }
+                    self._just_compressed = False
                 for agent_label, user_text, use_tools in phases:
                     yield {'type': 'team_agent', 'agent': agent_label}
                     msgs = self._assemble_messages_for_team_phase(user_text)

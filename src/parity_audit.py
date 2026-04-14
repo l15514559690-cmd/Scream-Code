@@ -56,7 +56,6 @@ ARCHIVE_DIR_MAPPINGS = {
     'remote': 'remote',
     'schemas': 'schemas',
     'screens': 'screens',
-    'server': 'server',
     'services': 'services',
     'skills': 'skills',
     'state': 'state',
