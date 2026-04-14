@@ -239,14 +239,19 @@ def _run_findskills_cli() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    incoming_argv = list(sys.argv[1:] if argv is None else argv)
+    if incoming_argv and incoming_argv[0] in ('config', 'help'):
+        # 兼容历史入口：即便旧脚本仍指向 main()，也统一走产品级 scream 子命令语义。
+        return cli_main(incoming_argv)
+
     check_and_install_dependencies()
     load_project_dotenv()
     load_project_claw_json()
     # 无子命令时（仅可执行文件名）直接进入带大模型的 REPL（repl 默认 --llm）
-    if argv is None and len(sys.argv) == 1:
-        argv = ['repl']
+    if not incoming_argv:
+        incoming_argv = ['repl']
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(incoming_argv)
     manifest = build_port_manifest()
     if args.command == 'repl':
         if getattr(args, 'json_stdio', False):
@@ -583,6 +588,26 @@ def cli_entry() -> int:
         return 1
     except Exception as exc:
         print(f'scream: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+        return 1
+
+
+def config_entry() -> int:
+    """setuptools ``console_scripts`` 入口：``scream-config=src.main:config_entry``。"""
+    try:
+        # 独立子命令入口，确保在任意终端环境下都可一键进入配置流程。
+        return cli_main(['config'])
+    except KeyboardInterrupt:
+        print('\n已中断。', flush=True)
+        return 130
+    except SystemExit as e:
+        code = e.code
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            return code
+        return 1
+    except Exception as exc:
+        print(f'scream-config: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
         return 1
 
 

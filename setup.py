@@ -14,6 +14,7 @@ setup(
     entry_points={
         'console_scripts': [
             'scream=src.main:cli_entry',
+            'scream-config=src.main:config_entry',
         ],
     },
 )

@@ -630,7 +630,7 @@ def run_config_interactive_menu() -> int:
     from questionary import Style
 
     style = Style([('selected', 'fg:ansicyan bold')])
-    print_startup_banner()
+    print_startup_banner(compact=True)
     print_project_memory_loaded_notice()
     ensure_default_config_file()
     while True:

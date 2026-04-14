@@ -270,7 +270,7 @@ def print_project_memory_loaded_notice() -> None:
             print(msg, flush=True)
 
 
-def print_startup_banner(*, ensure_config: bool = True) -> None:
+def print_startup_banner(*, ensure_config: bool = True, compact: bool = False) -> None:
     if ensure_config:
         try:
             from . import model_manager
@@ -290,12 +290,40 @@ def print_startup_banner(*, ensure_config: bool = True) -> None:
         return
 
     console = Console()
-    art = Text(_logo_plain(), style='bold cyan')
-    panel = Panel.fit(
-        Align.center(art),
-        border_style='bold cyan',
-        padding=(1, 2),
-    )
+    if compact:
+        compact_text = Text.from_markup(
+            '[bold cyan]SCREAM CODE[/bold cyan]\n'
+            '[dim]Model Config Center[/dim]'
+        )
+        panel = Panel(
+            Align.center(compact_text),
+            border_style='bold cyan',
+            padding=(0, 1),
+            expand=True,
+        )
+    else:
+        logo_lines = list(_SLANT_LOGO_LINES)
+        max_logo_width = max(len(line) for line in logo_lines)
+        # 预留 Panel 左右边框与 padding，避免窄终端时被硬截断。
+        available = max(20, console.width - 6)
+        if available >= max_logo_width:
+            art = Text(_logo_plain(), style='bold cyan')
+            panel = Panel.fit(
+                Align.center(art),
+                border_style='bold cyan',
+                padding=(1, 2),
+            )
+        else:
+            compact_text = Text.from_markup(
+                '[bold cyan]SCREAM CODE[/bold cyan]\n'
+                '[dim]Neural CLI[/dim]'
+            )
+            panel = Panel(
+                Align.center(compact_text),
+                border_style='bold cyan',
+                padding=(0, 1),
+                expand=True,
+            )
     console.print(panel)
     console.print()
 

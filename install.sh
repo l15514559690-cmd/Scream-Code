@@ -88,6 +88,29 @@ echo -e "${DIM}   （实际为可编辑安装至本仓库 .venv，便于 scream 
 "$PIP" install -q -e "$ROOT" || die "editable 安装失败（pip install -e .）"
 ok "Scream-Code 已安装：${BOLD}scream${RESET} → ${DIM}$VENV/bin/scream${RESET}"
 
+# 兜底包装器：部分 Python/venv 组合下 editable 导入钩子可能不生效。
+# 这里强制注入项目根目录，确保在任意 cwd 都能直接执行 scream / scream-config。
+cat >"$VENV/bin/scream" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "$SCRIPT_DIR/python3" -m src.main "$@"
+EOF
+chmod +x "$VENV/bin/scream"
+
+cat >"$VENV/bin/scream-config" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "$SCRIPT_DIR/python3" -m src.main config "$@"
+EOF
+chmod +x "$VENV/bin/scream-config"
+ok "已写入底层启动包装器（scream / scream-config）"
+
 # ── 3. Playwright Chromium ────────────────────────────────
 echo ""
 echo -e "${BLUE}${BOLD}👁️ 正在初始化视觉引擎内核 (Playwright)…${RESET}"
@@ -115,7 +138,9 @@ SCREAM_BIN="$VENV/bin/scream"
 [[ -x "$SCREAM_BIN" ]] || die "未找到可执行文件：${BOLD}$SCREAM_BIN${RESET}"
 
 echo -e "${DIM}下次可在终端直接运行：${RESET} ${CYAN}$SCREAM_BIN${RESET}"
+echo -e "${DIM}配置可直接运行：${RESET} ${CYAN}$VENV/bin/scream-config${RESET}"
 echo -e "${DIM}或执行 ${CYAN}export PATH=\"$VENV/bin:\$PATH\"${RESET} ${DIM}后输入 ${CYAN}scream${RESET}"
+echo -e "${DIM}已加 PATH 后也可直接输入：${CYAN}scream config${RESET} ${DIM}或 ${CYAN}scream-config${RESET}"
 echo ""
 echo -e "${MAGENTA}${BOLD}────────── 以下为 Scream 输出 ──────────${RESET}"
 exec "$SCREAM_BIN"
