@@ -98,9 +98,25 @@ Scream-Code 的交互分为三个维度：**系统入口**、**超能力指令**
 
 ---
 
+## 🧩 近期引擎层能力（长会话 · 流式 · 稳定）
+
+以下为 Python TUI / `query_engine` 路径上的增强，便于你理解「后台在干什么」：
+
+| 能力 | 说明 |
+| :--- | :--- |
+| **无感上下文压缩** | 当发往模型的非 `system` 消息条数超过阈值时，会在**本轮用户消息写入会话前**对 `llm_conversation_messages` 做摘要折叠（`src/context_compressor.py` + `check_and_compress_history`）。成功则落盘会话 JSON，终端可出现一行 `[🧠 历史记忆已折叠，释放上下文空间...]`；摘要请求失败则静默跳过，不影响当轮对话。 |
+| **流式时仍可打断** | 大模型生成时底部输入区保持可用；仅允许提交 `/stop` 终止当前生成（`replLauncher` 并发路径）。回合结束后会清空 `PromptSession.validator`，避免下一轮仍卡在「只能输 /stop」的假象。 |
+| **LLM 网络熔断** | `llm_settings` 中配置连接/读超时；超时或网络异常时以友好文案结束当轮，而不是无限挂死（详见 `llm_client`）。 |
+| **助手定稿去重** | 流式结束写入 scrollback 前，对相邻重复的段落/行做一次折叠，减轻自我介绍等内容的「重影」感。 |
+| **人设与系统提示** | 核心人格与工具纪律集中在 `src/agent/prompt_builder.py` 的 `SYSTEM_PROMPT_CORE`，由 `system_init.build_system_init_message` 与项目记忆、沙箱策略等运行时片段拼接后注入每条 system。 |
+
+---
+
 ## 👨‍💻 开发者进阶：定制你的专属 Skill
 
-你可以像堆乐高一样给 Scream-Code 加功能。只需在 `~/.scream/skills/` 目录下新建一个 Python 文件：
+仓库根目录下的 `skills/` **默认可为空**（仅保留占位 `.gitkeep`）；推荐把自定义斜杠技能放在用户目录 **`~/.scream/skills/`**，与项目仓库解耦、升级时不易冲突。
+
+你可以像堆乐高一样给 Scream-Code 加功能。在 `~/.scream/skills/` 下新建一个 Python 文件，例如：
 
 ```python
 from src.skills.base_skill import BaseSkill
