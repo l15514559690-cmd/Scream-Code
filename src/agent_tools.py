@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -8,9 +9,13 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
+from .constants.messages import AGENT_EXEC_TIMEOUT_SEC, MSG_TIMEOUT_FUSE, MSG_TOOL_EXCEPTION
 from .llm_settings import project_root
+
+_log = logging.getLogger(__name__)
 
 
 def _allow_global_access() -> bool:
@@ -117,7 +122,7 @@ def execute_mac_bash(command: str) -> str:
 
     需要系统存在 ``/bin/bash``；用于让大模型运行构建、测试、git 等命令。
     若 ``SandboxManager.is_sandbox_enabled`` 为 True，则改为在 Docker 容器内执行（挂载工作区根到 ``/workspace``）。
-    否则：沙箱路径策略下在工作区根目录执行；全局越狱模式下在用户主目录下执行。超时 120 秒。
+    否则：沙箱路径策略下在工作区根目录执行；全局越狱模式下在用户主目录下执行。超时 60 秒。
     请勿用于交互式或长期驻留进程。
 
     Args:
@@ -171,7 +176,7 @@ def execute_mac_bash(command: str) -> str:
     try:
         from . import agent_cancel
 
-        deadline = time.monotonic() + 120.0
+        deadline = time.monotonic() + AGENT_EXEC_TIMEOUT_SEC
         while reader.is_alive():
             if agent_cancel.agent_cancel_requested():
                 proc.terminate()
@@ -192,7 +197,7 @@ def execute_mac_bash(command: str) -> str:
                 except subprocess.TimeoutExpired:
                     pass
                 reader.join(timeout=8.0)
-                return '[执行失败] TimeoutExpired: 命令超过 120 秒'
+                return MSG_TIMEOUT_FUSE
             time.sleep(0.12)
         reader.join(timeout=1.0)
     except OSError as exc:
@@ -307,7 +312,15 @@ def run_agent_tool(function_name: str, arguments_json: str) -> str:
     """调度技能注册表；兼容测试与旧调用点。"""
     from .tools_registry import get_tools_registry
 
-    return get_tools_registry().execute_tool(function_name, arguments_json)
+    try:
+        return get_tools_registry().execute_tool(function_name, arguments_json)
+    except Exception as exc:  # pragma: no cover - 兜底防御
+        err = f'{type(exc).__name__}: {exc}'
+        tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip().splitlines()
+        tb_short = '\n'.join(tb[:6]) if tb else ''
+        _log.warning('run_agent_tool crashed: %s', err)
+        msg = MSG_TOOL_EXCEPTION.format(error_trace=err)
+        return f'{msg}\n{tb_short}' if tb_short else msg
 
 
 def builtin_openai_tools_schema() -> list[dict[str, object]]:

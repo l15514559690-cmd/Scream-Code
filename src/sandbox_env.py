@@ -8,10 +8,12 @@ import time
 from pathlib import Path
 from typing import ClassVar
 
+from .constants.messages import AGENT_EXEC_TIMEOUT_SEC, MSG_TIMEOUT_FUSE
+
 # 默认镜像；可用环境变量覆盖：`export SCREAM_SANDBOX_IMAGE=node:18-alpine`
 SANDBOX_DOCKER_IMAGE_DEFAULT = 'python:3.11-slim'
 
-SANDBOX_COMMAND_TIMEOUT_SEC = 120.0
+SANDBOX_COMMAND_TIMEOUT_SEC = AGENT_EXEC_TIMEOUT_SEC
 _OUTPUT_CAP = 32_000
 
 
@@ -117,7 +119,7 @@ class SandboxManager:
                     except subprocess.TimeoutExpired:
                         pass
                     reader.join(timeout=8.0)
-                    return '[执行失败] TimeoutExpired: 沙箱命令超过 120 秒'
+                    return MSG_TIMEOUT_FUSE
                 time.sleep(0.12)
             reader.join(timeout=1.0)
         except OSError as exc:

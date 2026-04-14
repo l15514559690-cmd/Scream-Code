@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import asyncio
 import json
+import logging
 import os
+import traceback
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -11,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from openai import OpenAI
 
 from . import agent_cancel
+from .constants.messages import MSG_LLM_NETWORK_ERROR, MSG_TOOL_EXCEPTION
 from .llm_settings import (
     LLM_CONNECT_TIMEOUT,
     LLM_READ_TIMEOUT,
@@ -140,9 +143,7 @@ class ChatCompletionResult:
 
 
 _KEY_SETUP_HINT = '未检测到密钥，请执行 scream config 进行设置'
-_LLM_TRANSPORT_FUSE_MSG = (
-    '\n\n[💥 引擎熔断：网络请求超时或连接失败，请检查网络/代理设置后重试]'
-)
+_LLM_TRANSPORT_FUSE_MSG = MSG_LLM_NETWORK_ERROR
 
 
 def _raise_if_missing_key(settings: LlmConnectionSettings) -> None:
@@ -266,6 +267,7 @@ def _parse_tool_arguments(raw: str | dict[str, Any] | None) -> dict[str, Any]:
 
 
 _MCP_BROWSER_TIMEOUT_MSG = '[系统] 浏览器响应超时，建议检查网络或重启 MCP 引擎'
+_log = logging.getLogger(__name__)
 
 
 def _summarize_tool_arg_value(val: Any, *, max_len: int = 160) -> str:
@@ -308,6 +310,28 @@ def _format_tool_call_progress_hint(name: str, args: dict[str, Any]) -> str:
 def _mcp_client_error_is_timeout(msg: str) -> bool:
     s = (msg or '').lower()
     return '超时' in msg or 'timeout' in s
+
+
+def _mcp_client_error_is_disconnect(msg: str) -> bool:
+    s = (msg or '').lower()
+    keys = (
+        'pipe',
+        'broken pipe',
+        'connection reset',
+        'connection closed',
+        'disconnect',
+        '未连接',
+        'stopped',
+    )
+    return any(k in s for k in keys)
+
+
+def _short_exception_trace(exc: BaseException, *, max_lines: int = 6) -> str:
+    lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    merged = ''.join(lines).strip().splitlines()
+    if len(merged) > max_lines:
+        merged = merged[:max_lines]
+    return '\n'.join(merged).strip()
 
 
 def _parse_data_url_image(url: str) -> tuple[str | None, str | None]:
@@ -834,11 +858,21 @@ def iter_agent_executor_events(
                             if _mcp_client_error_is_timeout(msg):
                                 result = _MCP_BROWSER_TIMEOUT_MSG
                             else:
+                                if _mcp_client_error_is_disconnect(msg):
+                                    _log.warning(
+                                        'MCP bridge disconnected while calling %s: %s',
+                                        fn,
+                                        msg,
+                                    )
                                 result = f'[MCP错误] {msg}'
                     else:
                         result = f'[错误] 未知工具: {fn}'
                 except Exception as exc:
-                    result = f'[执行失败] {type(exc).__name__}: {exc}'
+                    err = f'{type(exc).__name__}: {exc}'
+                    trace = _short_exception_trace(exc)
+                    result = MSG_TOOL_EXCEPTION.format(error_trace=err)
+                    if trace:
+                        result = f'{result}\n{trace}'
                 msgs.append(
                     {
                         'role': 'tool',

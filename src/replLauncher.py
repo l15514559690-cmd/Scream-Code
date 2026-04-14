@@ -7,6 +7,8 @@ import sys
 import time
 from typing import Any
 
+from rich.spinner import Spinner
+
 from .agent_cancel import reset_agent_cancel
 
 # 引入活泼的 ASCII / 全角颜文字作为思考动画（与 _poll 内 Status.update 联动）
@@ -27,11 +29,11 @@ _kawaii_cycle = itertools.cycle(KAWAII_FRAMES)
 
 # Slant 风格 ASCII（用户指定，勿改字符结构）
 _SLANT_LOGO_LINES = (
-    '_____  __________  _________    __  ___     __________  ____  ______',
-    '  / ___/ / ____/ __ \\/ ____/   |  /  |/  /    / ____/ __ \\/ __ \\/ ____/',
-    '  \\__ \\ / /   / /_/ / __/ / /| | / /|_/ /    / /   / / / / / / / __/   ',
-    ' ___/ // /___/ _, _/ /___/ ___ |/ /  / /    / /___/ /_/ / /_/ / /___   ',
-    '/____/ \\____/_/ |_/_____/_/  |_/_/  /_/     \\____/\\____/_____/_____/',
+    '   _____                                 ____      __     ',
+    '  / ___/_____________  ____ _____ ___   / ____/___/ /__   ',
+    '  \\__ \\/ ___/ ___/ _ \\/ __ `/ __ `__ \\ / /   / __  / _ \\  ',
+    ' ___/ / /__/ /  /  __/ /_/ / / / / / // /___/ /_/ /  __/  ',
+    '/____/\\___/_/   \\___/\\__,_/_/ /_/ /_/ \\____/\\__,_/\\___/   ',
 )
 
 
@@ -399,6 +401,7 @@ class _StreamingTurnSession:
         route_limit: int,
         team: bool,
         status_engine: Any | None,
+        on_team_agent: Any | None = None,
     ) -> None:
         self.engine = engine
         self.runtime = runtime
@@ -407,6 +410,7 @@ class _StreamingTurnSession:
         self.route_limit = route_limit
         self.team = team
         self.status_engine = status_engine
+        self.on_team_agent = on_team_agent
         self.use_live = bool(
             getattr(console, 'is_terminal', False) and console.is_terminal
         )
@@ -455,7 +459,10 @@ class _StreamingTurnSession:
 
     def _live_frame_renderable(self, display_text: str) -> Any:
         from .repl_ui_render import streaming_markdown_for_live
+        from rich.text import Text
 
+        if not self.buffer.strip() and not self.tool_streaming_buffer.strip():
+            return Text('')
         md = streaming_markdown_for_live(display_text, console=self.console)
         if self.status_engine is None:
             return md
@@ -489,8 +496,6 @@ class _StreamingTurnSession:
         if not self.use_live:
             return
         display_text = self._streaming_display_payload()
-        if not display_text.strip():
-            return
         dlen = len(display_text)
         now = time.time()
         if not force:
@@ -511,9 +516,9 @@ class _StreamingTurnSession:
                 frame,
                 console=self.console,
                 auto_refresh=True,
-                refresh_per_second=30,
+                refresh_per_second=35,
                 transient=True,
-                vertical_overflow='ellipsis',
+                vertical_overflow='visible',
             )
             self.live.start(refresh=True)
         else:
@@ -529,12 +534,13 @@ class _StreamingTurnSession:
             self._apply_streaming_live(force=True, queue_quiet=True)
 
     def _stop_live(self) -> None:
-        if self.live is not None:
+        if self.live is not None and getattr(self.live, 'is_started', False):
             try:
+                # 使用 Rich 原生 transient 擦除流程退出，避免缩小边界导致残影。
                 self.live.stop()
             except BaseException:
                 pass
-            self.live = None
+        self.live = None
         self.last_render_time = 0.0
         self.last_painted_display_len = 0
 
@@ -547,85 +553,37 @@ class _StreamingTurnSession:
         except queue.Empty:
             return None
 
-    def _poll_sync(self, *, show_thinking_status: bool) -> dict[str, Any] | None:
-        from contextlib import nullcontext
+    def _poll_sync(self) -> dict[str, Any] | None:
+        while True:
+            item = self._queue_try_get(self.outq)
+            if item is None:
+                continue
+            kind, payload = item
+            if kind == 'ok':
+                return payload
+            if kind == 'stop':
+                return None
+            if kind == 'err':
+                if isinstance(payload, GeneratorExit):
+                    raise KeyboardInterrupt from None
+                raise payload
 
-        status_obj: Any = None
-        if show_thinking_status and self.live is None and self.use_live:
-            status_obj = self.console.status(
-                f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]',
-                spinner='point',
-            )
-            status_ctx: Any = status_obj
-        else:
-            status_ctx = nullcontext()
-
-        with status_ctx:
-            last_status_anim = time.time()
-            while True:
-                if (
-                    status_obj is not None
-                    and self.use_live
-                    and (time.time() - last_status_anim > 0.3)
-                ):
-                    status_obj.update(
-                        f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]'
-                    )
-                    last_status_anim = time.time()
-
-                item = self._queue_try_get(self.outq)
-                if item is None:
-                    continue
-                kind, payload = item
-                if kind == 'ok':
-                    return payload
-                if kind == 'stop':
-                    return None
-                if kind == 'err':
-                    if isinstance(payload, GeneratorExit):
-                        raise KeyboardInterrupt from None
-                    raise payload
-
-    async def _poll_async(self, *, show_thinking_status: bool) -> dict[str, Any] | None:
+    async def _poll_async(self) -> dict[str, Any] | None:
         import asyncio
-        from contextlib import nullcontext
-
-        status_obj: Any = None
-        if show_thinking_status and self.live is None and self.use_live:
-            status_obj = self.console.status(
-                f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]',
-                spinner='point',
-            )
-            status_ctx: Any = status_obj
-        else:
-            status_ctx = nullcontext()
-
-        with status_ctx:
-            last_status_anim = time.time()
-            while True:
-                if (
-                    status_obj is not None
-                    and self.use_live
-                    and (time.time() - last_status_anim > 0.3)
-                ):
-                    status_obj.update(
-                        f'[bold #a5b4fc]⟁ 神经链路同步中 {next(_kawaii_cycle)}[/]'
-                    )
-                    last_status_anim = time.time()
-
-                item = await asyncio.to_thread(self._queue_try_get, self.outq)
-                if item is None:
-                    await asyncio.sleep(0)
-                    continue
-                kind, payload = item
-                if kind == 'ok':
-                    return payload
-                if kind == 'stop':
-                    return None
-                if kind == 'err':
-                    if isinstance(payload, GeneratorExit):
-                        raise KeyboardInterrupt from None
-                    raise payload
+        while True:
+            item = await asyncio.to_thread(self._queue_try_get, self.outq)
+            if item is None:
+                await asyncio.sleep(0)
+                continue
+            kind, payload = item
+            if kind == 'ok':
+                return payload
+            if kind == 'stop':
+                return None
+            if kind == 'err':
+                if isinstance(payload, GeneratorExit):
+                    raise KeyboardInterrupt from None
+                raise payload
 
     def _drain_queue_after_interrupt(self) -> None:
         import queue
@@ -662,15 +620,12 @@ class _StreamingTurnSession:
         queue_quiet = self.outq.empty()
         self._apply_streaming_live(force=False, queue_quiet=queue_quiet)
 
-    def _finish_turn_success(self, ev: dict[str, Any]) -> None:
+    def _render_finish_turn_success(self, ev: dict[str, Any]) -> None:
         from .repl_ui_render import (
             print_cyber_turn_divider,
             print_solidified_assistant_markdown,
             tool_params_stream_collapsed_panel,
         )
-
-        # 不在此再 squash Live：最后一帧若经 transient Live 与定稿 Panel 双写，易造成 scrollback 重影。
-        self._stop_live()
         out = ev.get('output', '')
         show_tool_collapse = self.round_saw_tool_json_stream or bool(
             self.tool_streaming_buffer.strip()
@@ -693,6 +648,20 @@ class _StreamingTurnSession:
             self.console.print()
         print_cyber_turn_divider(self.console)
 
+    def _finish_turn_success(self, ev: dict[str, Any]) -> None:
+        # 不在此再 squash Live：最后一帧若经 transient Live 与定稿 Panel 双写，易造成 scrollback 重影。
+        self._stop_live()
+        # 给终端驱动一个最小调度片段，确保擦除帧先落地再打印定稿。
+        time.sleep(0.05)
+        self._render_finish_turn_success(ev)
+
+    async def _finish_turn_success_async(self, ev: dict[str, Any]) -> None:
+        import asyncio
+
+        self._stop_live()
+        await asyncio.sleep(0.05)
+        self._render_finish_turn_success(ev)
+
     def run_sync_loop(self) -> None:
         from .repl_ui_render import (
             build_api_tool_op_renderable,
@@ -702,10 +671,9 @@ class _StreamingTurnSession:
 
         if self.use_live:
             print_cyber_turn_divider(self.console)
+            self._apply_streaming_live(force=True, queue_quiet=False)
 
-        pending: dict[str, Any] | None = self._poll_sync(
-            show_thinking_status=self.use_live and self.live is None
-        )
+        pending: dict[str, Any] | None = self._poll_sync()
         while pending is not None:
             ev = pending
             pending = None
@@ -722,6 +690,11 @@ class _StreamingTurnSession:
                 _print_assistant_error(self.console, ev['output'])
                 return
             if et == 'team_agent':
+                if callable(self.on_team_agent):
+                    try:
+                        self.on_team_agent(ev.get('agent'))
+                    except Exception:
+                        pass
                 self._squash_live_for_halt()
                 self._stop_live()
                 agent = str(ev.get('agent', 'Agent'))
@@ -732,9 +705,7 @@ class _StreamingTurnSession:
                 }
                 st = styles.get(agent, 'bold white')
                 self.console.print(f'[{st}]━━ {agent} ━━[/{st}]')
-                pending = self._poll_sync(
-                    show_thinking_status=self.use_live and self.live is None
-                )
+                pending = self._poll_sync()
                 continue
             if et == 'non_llm':
                 self._squash_live_for_halt()
@@ -748,9 +719,7 @@ class _StreamingTurnSession:
                 self.console.print(
                     f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]'
                 )
-                pending = self._poll_sync(
-                    show_thinking_status=self.use_live and self.live is None
-                )
+                pending = self._poll_sync()
                 continue
             if et == 'api_tool_op':
                 self._squash_live_for_halt()
@@ -767,19 +736,17 @@ class _StreamingTurnSession:
                     spinner='dots12',
                     spinner_style='cyan',
                 ):
-                    pending = self._poll_sync(show_thinking_status=False)
+                    pending = self._poll_sync()
                 continue
             if et in ('text_delta', 'tool_delta'):
                 self._process_stream_deltas(ev)
-                pending = self._poll_sync(show_thinking_status=False)
+                pending = self._poll_sync()
                 continue
             if et == 'finished':
                 self._finish_turn_success(ev)
                 return
 
-            pending = self._poll_sync(
-                show_thinking_status=self.use_live and self.live is None
-            )
+            pending = self._poll_sync()
 
     async def run_async_loop(self) -> None:
         from .repl_ui_render import (
@@ -790,10 +757,9 @@ class _StreamingTurnSession:
 
         if self.use_live:
             print_cyber_turn_divider(self.console)
+            self._apply_streaming_live(force=True, queue_quiet=False)
 
-        pending: dict[str, Any] | None = await self._poll_async(
-            show_thinking_status=self.use_live and self.live is None
-        )
+        pending: dict[str, Any] | None = await self._poll_async()
         while pending is not None:
             ev = pending
             pending = None
@@ -810,6 +776,11 @@ class _StreamingTurnSession:
                 _print_assistant_error(self.console, ev['output'])
                 return
             if et == 'team_agent':
+                if callable(self.on_team_agent):
+                    try:
+                        self.on_team_agent(ev.get('agent'))
+                    except Exception:
+                        pass
                 self._squash_live_for_halt()
                 self._stop_live()
                 agent = str(ev.get('agent', 'Agent'))
@@ -820,9 +791,7 @@ class _StreamingTurnSession:
                 }
                 st = styles.get(agent, 'bold white')
                 self.console.print(f'[{st}]━━ {agent} ━━[/{st}]')
-                pending = await self._poll_async(
-                    show_thinking_status=self.use_live and self.live is None
-                )
+                pending = await self._poll_async()
                 continue
             if et == 'non_llm':
                 self._squash_live_for_halt()
@@ -836,9 +805,7 @@ class _StreamingTurnSession:
                 self.console.print(
                     f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]'
                 )
-                pending = await self._poll_async(
-                    show_thinking_status=self.use_live and self.live is None
-                )
+                pending = await self._poll_async()
                 continue
             if et == 'api_tool_op':
                 self._squash_live_for_halt()
@@ -855,19 +822,17 @@ class _StreamingTurnSession:
                     spinner='dots12',
                     spinner_style='cyan',
                 ):
-                    pending = await self._poll_async(show_thinking_status=False)
+                    pending = await self._poll_async()
                 continue
             if et in ('text_delta', 'tool_delta'):
                 self._process_stream_deltas(ev)
-                pending = await self._poll_async(show_thinking_status=False)
+                pending = await self._poll_async()
                 continue
             if et == 'finished':
-                self._finish_turn_success(ev)
+                await self._finish_turn_success_async(ev)
                 return
 
-            pending = await self._poll_async(
-                show_thinking_status=self.use_live and self.live is None
-            )
+            pending = await self._poll_async()
 
     def finalize(self) -> None:
         self._stop_live()
@@ -1050,18 +1015,6 @@ def _run_streaming_turn(
         sess.finalize()
 
 
-def _reset_prompt_session_validator_after_stream(session: Any) -> None:
-    """
-    ``PromptSession.prompt_async(..., validator=…)`` 在 prompt_toolkit 内会**持久写入**
-    ``session.validator``（仅当参数非 None 时赋值，传 None 不会清除旧值）。
-    并发流式回合结束后必须清空，否则下一轮 ``prompt()`` 仍套用「仅 /stop」校验，用户无法输入。
-    """
-    try:
-        session.validator = None
-    except Exception:
-        pass
-
-
 def _run_streaming_turn_tui_concurrent(
     session: Any,
     engine: Any,
@@ -1074,11 +1027,14 @@ def _run_streaming_turn_tui_concurrent(
     status_engine: Any | None,
     prompt_message_html: Any,
     bottom_toolbar: Any,
+    on_stream_input_feedback: Any | None = None,
+    on_stream_output_started: Any | None = None,
+    on_stream_heartbeat: Any | None = None,
+    on_team_agent: Any | None = None,
 ) -> None:
     import asyncio
 
     from prompt_toolkit.patch_stdout import patch_stdout
-    from prompt_toolkit.validation import Validator
 
     from .agent_cancel import request_agent_cancel
 
@@ -1091,7 +1047,26 @@ def _run_streaming_turn_tui_concurrent(
         route_limit=route_limit,
         team=team,
         status_engine=None,
+        on_team_agent=on_team_agent,
     )
+    stream_output_started = False
+    _orig_process_stream_deltas = sess._process_stream_deltas
+
+    def _process_stream_deltas_with_signal(ev: dict[str, Any]) -> None:
+        nonlocal stream_output_started
+        if (
+            not stream_output_started
+            and ev.get('type') in ('text_delta', 'tool_delta')
+            and callable(on_stream_output_started)
+        ):
+            stream_output_started = True
+            try:
+                on_stream_output_started()
+            except Exception:
+                pass
+        _orig_process_stream_deltas(ev)
+
+    sess._process_stream_deltas = _process_stream_deltas_with_signal  # type: ignore[method-assign]
     sess.start_worker()
     turn_done = asyncio.Event()
     active_prompt_task: asyncio.Task[str] | None = None
@@ -1102,7 +1077,19 @@ def _run_streaming_turn_tui_concurrent(
         if t is None:
             return
         if not t.done():
-            t.cancel()
+            try:
+                buf = getattr(session, 'default_buffer', None)
+                if buf is not None:
+                    buf.text = ''
+            except Exception:
+                pass
+            try:
+                app = getattr(session, 'app', None)
+                is_running = bool(getattr(app, 'is_running', False)) if app is not None else False
+                if app is not None and is_running:
+                    app.exit(result=None)
+            except Exception:
+                pass
         try:
             await t
         except asyncio.CancelledError:
@@ -1113,56 +1100,74 @@ def _run_streaming_turn_tui_concurrent(
 
     async def _drive_input() -> None:
         nonlocal active_prompt_task
-        stop_only_validator = Validator.from_callable(
-            lambda text: (text or '').strip() == '/stop',
-            error_message='当前正在生成响应，仅支持输入 /stop 终止任务',
-            move_cursor_to_end=True,
-        )
-        prompt_task = asyncio.create_task(
-            session.prompt_async(
-                prompt_message_html,
-                bottom_toolbar=bottom_toolbar,
-                handle_sigint=True,
-                validator=stop_only_validator,
-                validate_while_typing=False,
-            )
-        )
-        active_prompt_task = prompt_task
-        wait_turn = asyncio.create_task(turn_done.wait())
-        done, _ = await asyncio.wait(
-            {prompt_task, wait_turn},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if wait_turn in done:
-            await _cancel_active_prompt_task()
-            return
-        wait_turn.cancel()
         try:
-            await wait_turn
-        except asyncio.CancelledError:
-            pass
-        try:
-            text = prompt_task.result()
-        except asyncio.CancelledError:
-            active_prompt_task = None
-            return
-        except KeyboardInterrupt:
-            active_prompt_task = None
+            while not turn_done.is_set():
+                if callable(on_stream_input_feedback):
+                    try:
+                        on_stream_input_feedback('')
+                    except Exception:
+                        pass
+                prompt_task = asyncio.create_task(
+                    session.prompt_async(
+                        prompt_message_html,
+                        bottom_toolbar=bottom_toolbar,
+                        handle_sigint=True,
+                        validate_while_typing=False,
+                    )
+                )
+                active_prompt_task = prompt_task
+                wait_turn = asyncio.create_task(turn_done.wait())
+                done, _ = await asyncio.wait(
+                    {prompt_task, wait_turn},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if wait_turn in done:
+                    await _cancel_active_prompt_task()
+                    return
+                wait_turn.cancel()
+                try:
+                    await wait_turn
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    text = prompt_task.result()
+                except asyncio.CancelledError:
+                    active_prompt_task = None
+                    return
+                except KeyboardInterrupt:
+                    active_prompt_task = None
+                    try:
+                        engine.request_stream_abort()
+                    except Exception:
+                        request_agent_cancel()
+                    await turn_done.wait()
+                    return
+                active_prompt_task = None
+                if turn_done.is_set():
+                    return
+                if (text or '').strip() == '/stop':
+                    try:
+                        engine.request_stream_abort()
+                    except Exception:
+                        request_agent_cancel()
+                    await turn_done.wait()
+                    return
+                if callable(on_stream_input_feedback):
+                    try:
+                        on_stream_input_feedback('[仅支持 /stop]')
+                    except Exception:
+                        pass
+        finally:
+            if callable(on_stream_input_feedback):
+                try:
+                    on_stream_input_feedback('')
+                except Exception:
+                    pass
+            # 兜底触发一次安全刷新，避免 prompt_toolkit 残影带入下一轮。
             try:
-                engine.request_stream_abort()
+                console.print('', end='')
             except Exception:
-                request_agent_cancel()
-            await turn_done.wait()
-            return
-        active_prompt_task = None
-        if turn_done.is_set():
-            return
-        if (text or '').strip() == '/stop':
-            try:
-                engine.request_stream_abort()
-            except Exception:
-                request_agent_cancel()
-            await turn_done.wait()
+                pass
 
     async def _drive_stream() -> None:
         try:
@@ -1175,12 +1180,29 @@ def _run_streaming_turn_tui_concurrent(
     async def _runner() -> None:
         stream_task = asyncio.create_task(_drive_stream())
         input_task = asyncio.create_task(_drive_input())
+        heartbeat_task: asyncio.Task[None] | None = None
+        if callable(on_stream_heartbeat):
+            async def _heartbeat_loop() -> None:
+                while not turn_done.is_set():
+                    try:
+                        on_stream_heartbeat()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.4)
+            heartbeat_task = asyncio.create_task(_heartbeat_loop())
         try:
             await stream_task
         finally:
             turn_done.set()
             await _cancel_active_prompt_task()
-            input_task.cancel()
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
             try:
                 await input_task
             except asyncio.CancelledError:
@@ -1201,7 +1223,11 @@ def _run_streaming_turn_tui_concurrent(
         sess._stop_live()
         _print_graceful_interrupt(console, use_rich=True)
     finally:
-        _reset_prompt_session_validator_after_stream(session)
+        if callable(on_team_agent):
+            try:
+                on_team_agent(None)
+            except Exception:
+                pass
         sess.finalize()
 
 

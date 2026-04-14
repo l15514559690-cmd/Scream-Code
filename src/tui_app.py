@@ -6,8 +6,8 @@
   避免每 token 全量 Markdown 重排；终端高度绑定的**尾部视口**把滚动锁在 Live 区，scrollback 不乱跳；
   未闭合 `` ``` `` 在解析前虚拟闭合，Pygments 结构不塌。
 - **定稿**：瞬态 Live 结束后靛紫 ``Panel`` / ``print_solidified_assistant_markdown`` 写入历史；首包前 ``console.status``。
-- **生成中输入**：流式回合走 ``replLauncher._run_streaming_turn_tui_concurrent``：``asyncio`` + ``patch_stdout`` + ``prompt_async``（回合结束会清空 ``PromptSession.validator``，避免校验器泄漏到下一轮），
-  底部输入框在思考/输出期间仍可用，``/stop`` 与 Ctrl+C 触发 ``engine.request_stream_abort()``；回合结束 ``tcflush``  stdin 丢弃幽灵回车。
+- **生成中输入**：流式回合走 ``replLauncher._run_streaming_turn_tui_concurrent``：``asyncio`` + ``patch_stdout`` + ``prompt_async``，
+  底部输入框在思考/输出期间仍可用；生成中仅 ``/stop`` 生效，其他输入会给出提示并继续等待；``/stop`` 与 Ctrl+C 触发 ``engine.request_stream_abort()``；回合结束 ``tcflush`` stdin 丢弃幽灵回车。
 - **神经底栏**：``prompt_toolkit`` 的 ``bottom_toolbar`` 全宽深色条 + 青/绿高亮；TUI 流式时在 ``Live`` 内用 ``Group`` 叠一行 Rich 页脚，与输入态信息同源（模型 / 沙箱 / 记忆条数 / Token%）。
 - **斜杠补全**：``/`` 菜单；**Enter** 在补全打开时只确认补全（见 ``repl_slash_helpers``）。
 - **PTY 断开**：``EOFError`` → ``sys.exit(0)``。
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any
 
 # 品牌色（Tailwind Indigo / 紫系）
@@ -25,6 +26,17 @@ _BRAND_MUTED = '#6366f1'
 _BRAND_SOFT = '#A5B4FC'
 _ASSISTANT_SURFACE = '#161622'
 _USER_ACCENT = '#c4b5fd'
+_current_team_agent: str | None = None
+
+
+def set_current_team_agent(agent_name: str | None) -> None:
+    global _current_team_agent
+    raw = '' if agent_name is None else str(agent_name).strip()
+    _current_team_agent = raw or None
+
+
+def get_current_team_agent() -> str | None:
+    return _current_team_agent
 
 
 def _prompt_toolkit_style() -> Any:
@@ -90,29 +102,34 @@ def _build_tui_prompt_session() -> Any:
 
 def _ascii_logo_lines() -> tuple[str, ...]:
     return (
-        r'  ███████╗ ██████╗██████╗ ███████╗ █████╗ ███╗   ███╗',
-        r'  ██╔════╝██╔════╝██╔══██╗██╔════╝██╔══██╗████╗ ████║',
-        r'  ███████╗██║     ██████╔╝█████╗  ███████║██╔████╔██║',
-        r'  ╚════██║██║     ██╔══██╗██╔══╝  ██╔══██║██║╚██╔╝██║',
-        r'  ███████║╚██████╗██║  ██║███████╗██║  ██║██║ ╚═╝ ██║',
-        r'  ╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝',
+        r'  ███████╗ ██████╗██████╗ ███████╗ █████╗ ███╗   ███╗    ██████╗ ██████╗ ██████╗ ███████╗',
+        r'  ██╔════╝██╔════╝██╔══██╗██╔════╝██╔══██╗████╗ ████║   ██╔════╝██╔═══██╗██╔══██╗██╔════╝',
+        r'  ███████╗██║     ██████╔╝█████╗  ███████║██╔████╔██║   ██║     ██║   ██║██║  ██║█████╗  ',
+        r'  ╚════██║██║     ██╔══██╗██╔══╝  ██╔══██║██║╚██╔╝██║   ██║     ██║   ██║██║  ██║██╔══╝  ',
+        r'  ███████║╚██████╗██║  ██║███████╗██║  ██║██║ ╚═╝ ██║   ╚██████╗╚██████╔╝██████╔╝███████╗',
+        r'  ╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝    ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝',
     )
 
 
 def _print_welcome_panel(console: Any) -> None:
     from rich import box
     from rich.align import Align
+    from rich.console import Group
     from rich.panel import Panel
     from rich.text import Text
 
     logo = Text('\n'.join(_ascii_logo_lines()), style=f'bold {_BRAND_SOFT}')
     tag = Text.from_markup(
-        f'\n[bold {_BRAND_HEX}]Scream Code[/bold {_BRAND_HEX}]  ·  '
+        f'[bold {_BRAND_HEX}]Scream Code[/bold {_BRAND_HEX}]  ·  '
         f'[dim]Python TUI[/dim]  ·  '
         f'[dim]Rich + prompt_toolkit[/dim]\n'
-        f'[dim]输入 [bold]/[/bold] 打开斜杠指令 · EOF 关窗安全退出 · 生成中可 [bold]/stop[/bold] 或 Ctrl+C 终止[/dim]\n'
+        f'[dim]输入 [bold]/[/bold] 打开斜杠指令 · EOF 关窗安全退出 · 生成中可 [bold]/stop[/bold] 或 Ctrl+C 终止[/dim]'
     )
-    body = Align.center(Text.assemble(logo, tag))
+    body = Group(
+        Align.center(logo),
+        Text(''),
+        Align.center(tag),
+    )
     console.print(
         Panel(
             body,
@@ -395,14 +412,58 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
     engine.ui_console = console
 
     session = _build_tui_prompt_session()
+    current_error_msg = ''
+    _thinking_emojis = ['🤔', '💭', '💡', '✨', '⚡️']
+
+    def _set_stream_input_feedback(msg: str) -> None:
+        nonlocal current_error_msg
+        current_error_msg = (msg or '').strip()
+        try:
+            app = getattr(session, 'app', None)
+            if app is not None:
+                app.invalidate()
+        except Exception:
+            pass
+
+    def _invalidate_prompt() -> None:
+        try:
+            app = getattr(session, 'app', None)
+            if app is not None:
+                app.invalidate()
+        except Exception:
+            pass
+
+    def _on_team_agent(agent_name: str | None) -> None:
+        set_current_team_agent(agent_name)
+        _invalidate_prompt()
 
     # 靛蓝品牌提示符：须为严格 XML（勿用 `<style ... bold>` 无值属性，会触发 ExpatError）
     prompt_html = HTML(f'<style fg="{_BRAND_HEX}"><b>尖叫&gt; </b></style>')
-    generating_prompt_html = HTML(
-        '\n'
-        '<style fg="#fbbf24"><b> 😖 正在生成...  (输入 /stop 终止当前任务)</b></style>\n'
-        f'<style fg="{_BRAND_HEX}"><b> 尖叫&gt; </b></style>'
-    )
+
+    def generating_prompt_html() -> Any:
+        team_agent = get_current_team_agent()
+        if team_agent:
+            tip = (
+                f'<style fg="ansibrightblack">🐺 {team_agent} 正在思考与执行... '
+                '(输入 /stop 终止)</style>'
+            )
+        else:
+            idx = int(time.time() * 2.5) % len(_thinking_emojis)
+            tip = (
+                f'<style fg="ansibrightblack">{_thinking_emojis[idx]} 神经链路生成中... '
+                '(输入 /stop 终止)</style>'
+            )
+        err = (
+            f'\n<style fg="ansired"><b>{current_error_msg}</b></style>'
+            if current_error_msg
+            else ''
+        )
+        return HTML(
+            '\n'
+            f'{tip}'
+            f'{err}\n'
+            f'<style fg="{_BRAND_HEX}"><b> 尖叫&gt; </b></style>'
+        )
 
     while True:
         try:
@@ -451,6 +512,9 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                         status_engine=None,
                         prompt_message_html=generating_prompt_html,
                         bottom_toolbar=lambda: _get_bottom_toolbar(engine),
+                        on_stream_input_feedback=_set_stream_input_feedback,
+                        on_stream_heartbeat=_invalidate_prompt,
+                        on_team_agent=_on_team_agent,
                     )
                 except KeyboardInterrupt:
                     _print_graceful_interrupt(console, use_rich=True)
@@ -463,6 +527,7 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                         print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
                 finally:
                     repl_stdin_flush_pending_if_tty()
+                    set_current_team_agent(None)
                 _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
                 _try_persist_repl_session(engine)
                 console.print()
@@ -492,6 +557,9 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                 status_engine=None,
                 prompt_message_html=generating_prompt_html,
                 bottom_toolbar=lambda: _get_bottom_toolbar(engine),
+                on_stream_input_feedback=_set_stream_input_feedback,
+                on_stream_heartbeat=_invalidate_prompt,
+                on_team_agent=_on_team_agent,
             )
         except KeyboardInterrupt:
             _print_graceful_interrupt(console, use_rich=True)
@@ -506,6 +574,7 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
             continue
         finally:
             repl_stdin_flush_pending_if_tty()
+            set_current_team_agent(None)
 
         _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
         _try_persist_repl_session(engine)

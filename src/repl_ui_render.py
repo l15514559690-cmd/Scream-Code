@@ -37,6 +37,18 @@ _CODE_PANEL_BG = '#09090B'
 _StockMarkdownContext = _rich_markdown_mod.MarkdownContext
 
 
+def _get_dynamic_thinking_title() -> str:
+    try:
+        from .tui_app import get_current_team_agent
+
+        agent = get_current_team_agent()
+    except Exception:
+        agent = None
+    if agent:
+        return f'[dim]🐺 {agent} 神经链路同步中...[/dim]'
+    return '[dim]✨ 神经链路生成中...[/dim]'
+
+
 def wrap_syntax_in_styled_panel(syntax: Syntax, lexer_name: str) -> Any:
     """
     将 ``Syntax`` 包进圆角 ``Panel``：极深底、靛紫边框、左上角语言标题（大写）。
@@ -209,11 +221,10 @@ def final_assistant_markdown_panel(markdown: str) -> Any:
     stripped = (markdown or '').strip()
     return Panel(
         ScreamMarkdown(stripped, code_theme=STREAMING_CODE_THEME),
-        title='◆ ASSISTANT',
         border_style='#4F46E5',
-        box=box.ROUNDED,
+        box=box.MINIMAL,
         expand=True,
-        padding=(1, 2),
+        padding=(0, 1),
     )
 
 
@@ -270,7 +281,7 @@ def print_solidified_assistant_markdown(console: Any, markdown: str) -> None:
     stripped = (markdown or '').strip()
     if not stripped:
         return
-    console.print(ScreamMarkdown(stripped, code_theme=STREAMING_CODE_THEME))
+    console.print(final_assistant_markdown_panel(stripped))
 
 
 def _safe_json_args(raw: str) -> dict[str, Any]:
@@ -556,15 +567,26 @@ def prepare_streaming_live_buffer(buffer: str, *, console: Any | None = None) ->
 
 def streaming_markdown_for_live(buffer: str, *, console: Any | None = None) -> Any:
     """
-    **仅**供 ``rich.Live`` 使用：裸 ``ScreamMarkdown``，禁止外层 ``Panel``（避免每 token 重绘一整张卡片）。
+    **仅**供 ``rich.Live`` 使用：轻量左边框 ``Panel`` + ``ScreamMarkdown``，强化流式区与历史区的视觉隔离。
     传入 ``console`` 时启用视口尾部裁剪，缓和全屏模式下终端滚动条抽搐。
     定稿请用 :func:`final_assistant_markdown_panel` / :func:`print_solidified_assistant_markdown`。
     """
+    from rich import box
+    from rich.panel import Panel
     from rich.text import Text
 
     buf = prepare_streaming_live_buffer(buffer, console=console)
     try:
-        return ScreamMarkdown(buf, code_theme=STREAMING_CODE_THEME)
+        md = ScreamMarkdown(buf, code_theme=STREAMING_CODE_THEME)
+        return Panel(
+            md,
+            box=box.MINIMAL,
+            border_style='dim #A5B4FC',
+            title=_get_dynamic_thinking_title(),
+            title_align='left',
+            padding=(0, 1),
+            expand=True,
+        )
     except Exception as exc:
         return Text(
             f'[dim]Markdown 渲染跳过（{type(exc).__name__}），已缓冲 {len(buffer or "")} 字符。[/dim]',

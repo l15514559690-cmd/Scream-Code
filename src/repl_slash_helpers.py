@@ -20,14 +20,15 @@ from .session_store import list_saved_session_entries, load_session
 from .setup import run_setup
 from .skills.base_skill import SLASH_CATEGORY_ORDER, SLASH_CATEGORY_TITLE
 
-_MEMO_EXTRACT_SYSTEM = """你是「长效记忆库」整理助手。下面是一段 REPL 对话摘录（仅作依据，勿外传语气）。
-请只输出 Markdown（可用 `###` 小标题与 `-` 列表），归纳：
-1. 用户的技术偏好（语言、框架、工具、代码风格）
-2. 已确定的架构或设计决策
-3. 关键项目背景与约束
+_MEMO_EXTRACT_SYSTEM = """你是 Scream Code 的「长期记忆库」冷酷整理引擎。用户会提供一段冗长的对话快照。
+你的任务是将其【极度压缩】为几条核心记忆，用于存入 SQLite 长期项目记忆文档中。
 
-要求：不要寒暄；不要重复摘录全文；禁止臆造摘录中不存在的内容；每条尽量具体可执行。
-若几乎无可保存信息，只输出一行：（本轮无可提取的长效要点）"""
+## 严格规则：
+1. 绝对禁止复述聊天的流水账、具体的报错日志或大段具体的代码实现。
+2. 只提取宏观长效信息：用户确立的技术栈、开发偏好、命名规范、以及项目级的重要架构决策。
+3. 输出必须极其精简，使用 Markdown 无序列表，总字数严控在 300 字以内。
+4. 如果这段对话只是日常 Debug、闲聊或临时查询，并没有沉淀出长效的项目级规则，请仅输出一行：（本轮无项目级长效要点）
+"""
 
 
 def flush_current_repl_session(engine: QueryEnginePort) -> str:
@@ -73,7 +74,7 @@ def completion_text_no_tools(
     return ''.join(parts).strip(), None
 
 
-def memo_session_excerpt(engine: QueryEnginePort, *, max_chars: int = 48_000) -> str:
+def memo_session_excerpt(engine: QueryEnginePort, *, max_chars: int = 24_000) -> str:
     blocks: list[str] = []
     for i, m in enumerate(engine.mutable_messages):
         blocks.append(f'### 用户轮次 {i + 1}\n{m}\n')
@@ -85,7 +86,7 @@ def memo_session_excerpt(engine: QueryEnginePort, *, max_chars: int = 48_000) ->
         content = msg.get('content', '')
         if not isinstance(content, str) or not content.strip():
             continue
-        cap = 12_000
+        cap = 4000
         body = content if len(content) <= cap else content[:cap] + '\n…(本条已截断)…'
         blocks.append(f'### assistant/user 历史 ({role})\n{body}\n')
     blob = '\n'.join(blocks).strip()
@@ -133,8 +134,10 @@ def confirm_store_summary(console: Any | None) -> bool:
 def print_slash_help(console: Any | None, registry: Any) -> None:
     """按分类列出斜杠技能；``/look`` 等可在首次调用时自动安装 Playwright/Chromium（需网络）。补全菜单打开时 Enter 仅写入补全、不提交整行。"""
     core_static: list[tuple[str, str]] = [
-        ('/clear', '清屏（TUI 补全可用）'),
-        ('exit · quit · q', '结束 REPL（非斜杠，与 Hermes/常见 CLI 一致）'),
+        ('/help', '📖 查看所有可用指令与说明'),
+        ('/clear', '🧽 清空当前屏幕显示 (保留记忆)'),
+        ('/exit', '🚪 退出 Scream Code (同 /quit)'),
+        ('/quit', '🚪 退出 Scream Code (同 /exit)'),
     ]
     system_tail: list[tuple[str, str]] = [
         ('$team <提示>', '仅本条走团队模式'),
@@ -631,7 +634,27 @@ class SlashCommandCompleter:
         fragment = text[slash:]
         if not fragment.startswith('/'):
             return
+        base_commands: list[tuple[str, str]] = [
+            ('/help', '📖 查看所有可用指令与说明'),
+            ('/clear', '🧽 清空当前屏幕显示 (保留记忆)'),
+            ('/exit', '🚪 退出 Scream Code (同 /quit)'),
+            ('/quit', '🚪 退出 Scream Code (同 /exit)'),
+        ]
+        seen: set[str] = set()
+        for cmd, meta in base_commands:
+            if cmd in seen:
+                continue
+            seen.add(cmd)
+            if cmd.startswith(fragment):
+                yield Completion(
+                    cmd,
+                    start_position=-len(fragment),
+                    display_meta=meta,
+                )
         for cmd, meta in get_skills_registry().iter_slash_completion_items():
+            if cmd in seen:
+                continue
+            seen.add(cmd)
             if cmd.startswith(fragment):
                 yield Completion(
                     cmd,

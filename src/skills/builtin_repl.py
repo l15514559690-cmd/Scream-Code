@@ -64,7 +64,7 @@ class SummarySkill(BaseSkill):
 
 class MemoSkill(BaseSkill):
     name: ClassVar[str] = 'memo'
-    description: ClassVar[str] = '写入或模型提取 SCREAM.md 要点'
+    description: ClassVar[str] = '🧠 提取并保存当前对话的核心记忆'
     category: ClassVar[str] = 'memory'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
@@ -111,7 +111,7 @@ class MemoSkill(BaseSkill):
 
 class NewSkill(BaseSkill):
     name: ClassVar[str] = 'new'
-    description: ClassVar[str] = '硬重置对话、session、计数与展示层缓存'
+    description: ClassVar[str] = '✨ 开启全新会话 (清空当前上下文)'
     category: ClassVar[str] = 'memory'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
@@ -159,7 +159,7 @@ class StopSkill(BaseSkill):
 
 class SessionsSkill(BaseSkill):
     name: ClassVar[str] = 'sessions'
-    description: ClassVar[str] = '列出 .port_sessions 历史会话'
+    description: ClassVar[str] = '📂 查看本地保存的历史会话列表'
     category: ClassVar[str] = 'memory'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
@@ -169,7 +169,7 @@ class SessionsSkill(BaseSkill):
 
 class LoadSkill(BaseSkill):
     name: ClassVar[str] = 'load'
-    description: ClassVar[str] = '恢复指定会话'
+    description: ClassVar[str] = '🔄 加载指定的历史会话恢复上下文'
     category: ClassVar[str] = 'memory'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
@@ -201,7 +201,7 @@ class LoadSkill(BaseSkill):
 
 class AuditSkill(BaseSkill):
     name: ClassVar[str] = 'audit'
-    description: ClassVar[str] = 'parity-audit 归档一致性'
+    description: ClassVar[str] = '📋 审查项目文件与架构对齐度'
     category: ClassVar[str] = 'system'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
@@ -268,7 +268,7 @@ class SkillsCommandSkill(BaseSkill):
 
 class DoctorSkill(BaseSkill):
     name: ClassVar[str] = 'doctor'
-    description: ClassVar[str] = '依赖 / 路径 / 权限快检'
+    description: ClassVar[str] = '🏥 运行系统环境与依赖依赖体检'
     category: ClassVar[str] = 'system'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
@@ -278,7 +278,7 @@ class DoctorSkill(BaseSkill):
 
 class CostSkill(BaseSkill):
     name: ClassVar[str] = 'cost'
-    description: ClassVar[str] = '本会话 Token 与粗略费用'
+    description: ClassVar[str] = '💰 查看当前 Token 消耗与预估费用'
     category: ClassVar[str] = 'system'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
@@ -288,7 +288,7 @@ class CostSkill(BaseSkill):
 
 class StatusSkill(BaseSkill):
     name: ClassVar[str] = 'status'
-    description: ClassVar[str] = '沙箱、工具、模型、.claw.json、项目记忆'
+    description: ClassVar[str] = '📊 查看 Agent 引擎与系统当前运行状态'
     category: ClassVar[str] = 'system'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
@@ -298,7 +298,7 @@ class StatusSkill(BaseSkill):
 
 class TeamSkill(BaseSkill):
     name: ClassVar[str] = 'team'
-    description: ClassVar[str] = '多代理编排开关（Planner→Coder→Reviewer）'
+    description: ClassVar[str] = '🐺 切换至多 Agent 团队模式 (Planner->Coder->Reviewer)'
     category: ClassVar[str] = 'system'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:

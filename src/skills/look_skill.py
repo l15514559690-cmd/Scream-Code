@@ -29,10 +29,7 @@ _MIME_FOR_SUFFIX: dict[str, str] = {
 class LookSkill(BaseSkill):
     name: ClassVar[str] = 'look'
     category: ClassVar[str] = 'vision'
-    description: ClassVar[str] = (
-        '获取指定 URL 的网页截图，并让 AI 分析视觉 UI 与代码 '
-        '（例如: /look http://localhost:3000 帮我看看按钮为什么没居中）'
-    )
+    description: ClassVar[str] = '👁️ 获取指定网页或 UI 的视觉快照'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
         console = context.console

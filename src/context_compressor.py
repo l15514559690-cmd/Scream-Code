@@ -13,12 +13,13 @@ _DEFAULT_MIN_TAIL = 6
 """动态尾部至少保留的消息条数（在 API 安全前提下可拉长）。"""
 
 _SUMMARY_USER_HEADER = (
-    '请将以下历史对话提取成一份高度凝练的摘要，保留所有关键事实、技术决策、路径、'
-    '代码片段的核心思路，以及用户的偏好。忽略客套话。'
+    '请将以下历史对话提取成极度凝练的纯文本摘要（必须丢弃所有客套话、尝试和失败的错误日志）：'
 )
 
 _SUMMARY_SYSTEM = (
-    '你是对话历史压缩器：只输出一段纯文本摘要，不要调用工具，不要输出任何前言或后语。'
+    '你是一个极其严苛的「上下文压缩引擎」。你的唯一任务是对极长的历史对话进行「有损压缩」。\n'
+    '绝对禁止原样摘抄代码块或流水账日志！不要输出任何前言或后语。\n'
+    '你必须将所有内容浓缩为不到 300 字的极简要点，只保留：1. 当前核心目标 2. 已解决的关键 Bug 3. 确定的架构与方案结论。'
 )
 
 
@@ -131,6 +132,9 @@ def _serialize_messages_block(chunk: list[dict[str, Any]]) -> str:
             body = json.dumps(raw, ensure_ascii=False)
         else:
             body = str(raw)
+        # 对长文本进行物理截断，防止总结引擎被撑爆
+        if len(body) > 1500:
+            body = body[:1500] + f"\n\n...[内容过长已由系统截断，原长 {len(body)} 字符]..."
         if role == 'assistant' and m.get('tool_calls'):
             try:
                 body = f'{body}\n[tool_calls]\n{json.dumps(m.get("tool_calls"), ensure_ascii=False)}'
