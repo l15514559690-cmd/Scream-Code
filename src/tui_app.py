@@ -300,6 +300,8 @@ def _get_bottom_toolbar(engine: Any) -> Any:
 
     import html as html_mod
 
+    from .main import render_mcp_online_toolbar_badge
+
     f = neural_status_fields(engine)
     m = html_mod.escape(f['model'])
     sb_txt = '🛡️ 沙箱: ON' if f['sandbox_on'] else '🔓 沙箱: OFF'
@@ -311,8 +313,10 @@ def _get_bottom_toolbar(engine: Any) -> Any:
         if f['team']
         else '<ansibrightblack>单人</ansibrightblack>'
     )
+    web_badge = render_mcp_online_toolbar_badge(engine)
     return HTML(
         ' '
+        f'{web_badge}'
         '<ansicyan><b>◈</b></ansicyan> '
         f'<ansigreen><b>[{m}]</b></ansigreen>  '
         '<ansiblue>│</ansiblue>  '

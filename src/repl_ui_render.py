@@ -324,7 +324,7 @@ def _truncate(s: str, max_len: int = 24_000) -> str:
 def build_api_tool_op_renderable(ev: dict[str, Any]) -> Any:
     """
     将 ``api_tool_op`` 事件包装为 Panel + Syntax（或摘要 Text）。
-    仅消费 ev 中已有字段：tool_name, arguments。
+    消费字段：tool_name, arguments；可选 progress_hint（例如 Browser MCP 一行摘要）。
     """
     from rich import box
     from rich.panel import Panel
@@ -333,7 +333,23 @@ def build_api_tool_op_renderable(ev: dict[str, Any]) -> Any:
 
     name = str(ev.get('tool_name', '') or 'tool')
     raw_args = str(ev.get('arguments', '') or '')
+    hint = str(ev.get('progress_hint', '') or '').strip()
     args = _safe_json_args(raw_args)
+
+    if hint:
+        meta = Text.assemble(
+            (hint + '\n\n', 'bold cyan'),
+            ('参数 JSON\n', 'bold dim'),
+            (raw_args[:8000] + ('…' if len(raw_args) > 8000 else ''), 'dim'),
+        )
+        return Panel(
+            meta,
+            title='[bold cyan]🌐 MCP[/bold cyan]',
+            box=box.ROUNDED,
+            border_style='cyan',
+            padding=(0, 1),
+            expand=True,
+        )
 
     fp = ''
     if isinstance(args.get('file_path'), str):

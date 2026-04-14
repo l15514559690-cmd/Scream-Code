@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shlex
 import threading
 import time
 from dataclasses import dataclass, field
@@ -14,6 +15,17 @@ from .port_manifest import PortManifest, build_port_manifest
 from .session_store import StoredSession, load_session, save_session
 from .tools import build_tool_backlog
 from .transcript import TranscriptStore
+
+_ONLINE_EXECUTION_PROTOCOL_NOTE = (
+    '\n\n<online_execution_protocol>\n'
+    '你现在处于【浏览器MCP模式】。请先确保浏览器已安装并连接 browser-mcp 插件，再执行以下思考链路：\n'
+    '1. **检索优先级**：严禁直接使用训练数据回答。你必须立即调用 browser_search 或 browser_navigate。\n'
+    '2. **多步规划**：如果第一步搜索结果不完整，你必须继续使用 browser_click 或 browser_scroll 进行深度挖掘。\n'
+    '3. **防爆提取**：调用读取工具时，必须强制要求 Text-only 模式，禁止获取 HTML 源码。\n'
+    "4. **连接性自检**：如果收到提示 'Extension not connected'，你必须停止执行，并明确指示用户："
+    "'请在浏览器中点击 Browser MCP 插件的 Connect 按钮'。禁止尝试使用本地 curl 降级。\n"
+    '</online_execution_protocol>'
+)
 
 
 @dataclass(frozen=True)
@@ -58,6 +70,8 @@ class QueryEnginePort:
     llm_conversation_messages: list[dict[str, Any]] = field(default_factory=list, repr=False)
     #: REPL 多代理团队模式（/team 切换）；与 ``$team`` 单行前缀可叠加触发编排。
     repl_team_mode: bool = field(default=False, repr=False)
+    #: 浏览器MCP模式：开启时，给 API 的 user 内容隐式追加「优先调用 Browser MCP 浏览器/搜索工具」指令。
+    mcp_online_mode: bool = field(default=False, repr=False)
     #: REPL 等场景注入 Rich Console，用于 LLM 请求与工具路由时的 Status 指示器。
     ui_console: Any | None = field(default=None, repr=False)
     #: 与 REPL/TUI 流式回合配合：是否处于 ``iter_repl_assistant_events*`` 消费中（跨线程读须加锁）。
@@ -67,6 +81,11 @@ class QueryEnginePort:
     _stream_generating: bool = field(default=False, repr=False, compare=False)
     #: 本轮在 ``check_and_compress_history`` 中已成功折叠 ``llm_conversation_messages``，待 UI 打一行提示后清零。
     _just_compressed: bool = field(default=False, repr=False, compare=False)
+    _mcp_client: Any | None = field(default=None, repr=False, compare=False)
+    _mcp_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+    _mcp_init_thread: threading.Thread | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_workspace(cls) -> 'QueryEnginePort':
@@ -105,7 +124,164 @@ class QueryEnginePort:
             transcript_store=transcript,
             llm_conversation_messages=llm_list,
             repl_team_mode=False,
+            mcp_online_mode=bool(getattr(stored, 'mcp_online_mode', False)),
         )
+
+    def __post_init__(self) -> None:
+        self._spawn_mcp_init_thread()
+
+    def _spawn_mcp_init_thread(self) -> bool:
+        with self._mcp_lock:
+            t = self._mcp_init_thread
+            if t is not None and t.is_alive():
+                return True
+            t = threading.Thread(target=self._try_init_mcp_client, daemon=True)
+            self._mcp_init_thread = t
+            t.start()
+        return True
+
+    def _try_init_mcp_client(self) -> bool:
+        from .llm_settings import read_mcp_server_command
+        from .mcp_manager import MCPClient, MCPClientError
+
+        cmd_raw = (read_mcp_server_command() or '').strip()
+        if not cmd_raw:
+            return False
+        try:
+            cmd = shlex.split(cmd_raw)
+        except ValueError:
+            return False
+        if not cmd:
+            return False
+        client = MCPClient(command=cmd)
+        with self._mcp_lock:
+            old = self._mcp_client
+            self._mcp_client = client
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+        try:
+            client.start()
+            client.refresh_tools()
+        except MCPClientError:
+            # 启动失败保留 client.status=error 供 UI 观测；不抛到主线程。
+            return False
+        except Exception:
+            try:
+                client.status = 'error'
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _merged_openai_tools(self) -> list[dict[str, Any]]:
+        from .llm_client import get_openai_agent_tools
+
+        local = get_openai_agent_tools()
+        seen: set[str] = set()
+        out: list[dict[str, Any]] = []
+
+        def _append_unique(rows: list[dict[str, Any]]) -> None:
+            for item in rows:
+                fn = item.get('function') if isinstance(item, dict) else None
+                if not isinstance(fn, dict):
+                    continue
+                name = str(fn.get('name') or '').strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                out.append(item)
+
+        _append_unique(local)
+        with self._mcp_lock:
+            mcp = self._mcp_client
+        if mcp is not None and getattr(mcp, 'is_running', False):
+            try:
+                _append_unique(mcp.openai_tools())
+            except Exception:
+                pass
+        return out
+
+    def _has_running_mcp_tools(self) -> bool:
+        with self._mcp_lock:
+            mcp = self._mcp_client
+        if mcp is None or not getattr(mcp, 'is_running', False):
+            return False
+        try:
+            return len(list(getattr(mcp, 'tools_cache', ()) or ())) > 0
+        except Exception:
+            return False
+
+    def get_mcp_client(self) -> Any | None:
+        with self._mcp_lock:
+            return self._mcp_client
+
+    def mcp_status_snapshot(self) -> dict[str, Any]:
+        from .llm_settings import read_mcp_server_command
+
+        cmd = (read_mcp_server_command() or '').strip()
+        with self._mcp_lock:
+            mcp = self._mcp_client
+        running = bool(mcp is not None and getattr(mcp, 'is_running', False))
+        status = str(getattr(mcp, 'status', 'idle') or 'idle') if mcp is not None else 'idle'
+        tools_count = 0
+        tools: list[dict[str, Any]] = []
+        if mcp is not None:
+            try:
+                cache = list(getattr(mcp, 'tools_cache', ()) or ())
+                tools_count = len(cache)
+                tools = [
+                    {
+                        'name': str(getattr(t, 'name', '') or ''),
+                        'description': str(getattr(t, 'description', '') or ''),
+                    }
+                    for t in cache
+                ]
+            except Exception:
+                tools = []
+        return {
+            'enabled': bool(cmd),
+            'running': running,
+            'command': cmd,
+            'tools_count': tools_count,
+            'tools': tools,
+            'web_mode': bool(self.mcp_online_mode),
+            'status': status,
+        }
+
+    def set_mcp_online_mode(self, enabled: bool) -> None:
+        self.mcp_online_mode = bool(enabled)
+
+    def toggle_mcp_online_mode(self) -> bool:
+        self.mcp_online_mode = not self.mcp_online_mode
+        return self.mcp_online_mode
+
+    def restart_mcp_client(self) -> bool:
+        with self._mcp_lock:
+            old = self._mcp_client
+            self._mcp_client = None
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+        return self._spawn_mcp_init_thread()
+
+    def close(self) -> None:
+        with self._mcp_lock:
+            mcp = self._mcp_client
+            self._mcp_client = None
+        if mcp is None:
+            return
+        try:
+            mcp.stop()
+        except Exception:
+            pass
+
+    def __del__(self) -> None:  # pragma: no cover - GC 时机不可预测
+        self.close()
 
     def _coerce_turn_capacity_before_turn(self) -> None:
         """
@@ -348,7 +524,16 @@ class QueryEnginePort:
                 prompt, matched_commands, matched_tools, denied_tools
             ),
         }
-        return self._repl_messages_base_before_current_user() + [user_msg]
+        messages = self._repl_messages_base_before_current_user() + [user_msg]
+        if self.mcp_online_mode and self._has_running_mcp_tools():
+            for m in reversed(messages):
+                if str(m.get('role') or '').strip().lower() != 'user':
+                    continue
+                raw = m.get('content')
+                content = raw if isinstance(raw, str) else str(raw or '')
+                m['content'] = content + _ONLINE_EXECUTION_PROTOCOL_NOTE
+                break
+        return messages
 
     def _assemble_messages_for_team_phase(self, user_content: str) -> list[dict[str, Any]]:
         """团队编排单阶段：在已有 ``llm_conversation_messages`` 上追加一条 user。"""
@@ -404,7 +589,13 @@ class QueryEnginePort:
         )
 
         def _call_llm():
-            return chat_completion(messages, settings, model=model_override)
+            return chat_completion(
+                messages,
+                settings,
+                model=model_override,
+                tools=self._merged_openai_tools(),
+                mcp_client=self._mcp_client,
+            )
 
         console = self.ui_console
         use_status = (
@@ -445,7 +636,7 @@ class QueryEnginePort:
         ``llm_client.iter_agent_executor_events``）。产出供 REPL/通道消费的 UI 事件。
         若生成器被 close()（如 Ctrl+C），不提交本轮。
         """
-        from .llm_client import get_openai_agent_tools, iter_agent_executor_events
+        from .llm_client import iter_agent_executor_events
         from .llm_settings import read_llm_connection_settings
 
         self._coerce_turn_capacity_before_turn()
@@ -501,7 +692,8 @@ class QueryEnginePort:
                     messages,
                     settings,
                     model=model_override,
-                    tools=get_openai_agent_tools(),
+                    tools=self._merged_openai_tools(),
+                    mcp_client=self._mcp_client,
                 ):
                     et = ev.get('type')
                     if et == 'executor_complete':
@@ -648,11 +840,14 @@ class QueryEnginePort:
                     yield {'type': 'team_agent', 'agent': agent_label}
                     msgs = self._assemble_messages_for_team_phase(user_text)
                     tools_kw: list[dict[str, Any]] | None = None if use_tools else []
+                    if use_tools:
+                        tools_kw = self._merged_openai_tools()
                     for ev in iter_agent_executor_events(
                         msgs,
                         settings,
                         model=model_override,
                         tools=tools_kw,
+                        mcp_client=self._mcp_client,
                     ):
                         et = ev.get('type')
                         if et == 'executor_complete':
@@ -847,6 +1042,7 @@ class QueryEnginePort:
                 input_tokens=self.total_usage.input_tokens,
                 output_tokens=self.total_usage.output_tokens,
                 llm_conversation_messages=conv_tuple,
+                mcp_online_mode=bool(self.mcp_online_mode),
             )
         )
         return str(path)

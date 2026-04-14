@@ -6,7 +6,7 @@ import json
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openai import OpenAI
 
@@ -17,6 +17,9 @@ from .llm_settings import (
     LlmConnectionSettings,
 )
 from .message_prune import prune_historical_messages
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .mcp_manager import MCPClient
 
 
 class LlmClientError(Exception):
@@ -260,6 +263,51 @@ def _parse_tool_arguments(raw: str | dict[str, Any] | None) -> dict[str, Any]:
         return json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
     except json.JSONDecodeError:
         return {}
+
+
+_MCP_BROWSER_TIMEOUT_MSG = '[系统] 浏览器响应超时，建议检查网络或重启 MCP 引擎'
+
+
+def _summarize_tool_arg_value(val: Any, *, max_len: int = 160) -> str:
+    if val is None:
+        return 'null'
+    if isinstance(val, bool):
+        return 'true' if val else 'false'
+    if isinstance(val, (int, float)):
+        return str(val)
+    if isinstance(val, str):
+        s = val.replace('\n', ' ').strip()
+        if len(s) > max_len:
+            return s[: max_len - 1] + '…'
+        return s
+    try:
+        s = json.dumps(val, ensure_ascii=False, separators=(',', ':'))
+    except (TypeError, ValueError):
+        s = str(val)
+    if len(s) > max_len:
+        return s[: max_len - 1] + '…'
+    return s
+
+
+def _format_tool_call_progress_hint(name: str, args: dict[str, Any]) -> str:
+    n = (name or '').strip() or 'tool'
+    if not args:
+        return f'[🌐 MCP 正在执行: {n}()]'
+    parts: list[str] = []
+    for k, v in list(args.items())[:6]:
+        key = str(k)
+        if not key:
+            continue
+        parts.append(f'{key}={_summarize_tool_arg_value(v)}')
+    inner = ', '.join(parts)
+    if len(args) > 6:
+        inner += ', …'
+    return f'[🌐 MCP 正在执行: {n}({inner})]'
+
+
+def _mcp_client_error_is_timeout(msg: str) -> bool:
+    s = (msg or '').lower()
+    return '超时' in msg or 'timeout' in s
 
 
 def _parse_data_url_image(url: str) -> tuple[str | None, str | None]:
@@ -629,6 +677,7 @@ def iter_agent_executor_events(
     *,
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
+    mcp_client: 'MCPClient | None' = None,
 ) -> Iterator[dict[str, Any]]:
     """
     **LLM Provider 侧唯一的多轮工具闭环**（本仓库对 claw-code 链路的 Python 镜像实现）。
@@ -650,6 +699,11 @@ def iter_agent_executor_events(
     in_tok = 0
     out_tok = 0
     text_slices: list[str] = []
+    local_tool_names = {
+        str(row.get('name') or '').strip()
+        for row in reg.list_tool_rows()
+        if isinstance(row, dict)
+    }
 
     cap = agent_tool_iteration_cap()
     n_iter = 0
@@ -742,16 +796,47 @@ def iter_agent_executor_events(
             for idx, tc in enumerate(tool_calls):
                 fn = tc['function']['name']
                 raw_args = tc['function']['arguments']
-                yield {
+                parsed_args = _parse_tool_arguments(raw_args)
+                progress_hint: str | None = None
+                if mcp_client is not None and getattr(mcp_client, 'is_running', False) and fn not in local_tool_names:
+                    progress_hint = _format_tool_call_progress_hint(fn, parsed_args)
+                ev_tool: dict[str, Any] = {
                     'type': 'api_tool_op',
                     'tool_name': fn,
                     'arguments': raw_args,
                 }
+                if progress_hint is not None:
+                    ev_tool['progress_hint'] = progress_hint
+                yield ev_tool
                 if agent_cancel.agent_cancel_requested():
                     interrupt_from_here = idx
                     break
                 try:
-                    result = reg.execute_tool(fn, raw_args)
+                    if fn in local_tool_names:
+                        result = reg.execute_tool(fn, raw_args)
+                    elif mcp_client is not None and getattr(mcp_client, 'is_running', False):
+                        from .mcp_manager import MCPClientError
+
+                        args = parsed_args
+                        try:
+                            mcp_resp = mcp_client.call_tool(fn, args)
+                            mcp_result = mcp_resp.get('result')
+                            if isinstance(mcp_result, (dict, list)):
+                                result = json.dumps(mcp_result, ensure_ascii=False)
+                            elif mcp_result is None:
+                                result = ''
+                            else:
+                                result = str(mcp_result)
+                            if not result.strip():
+                                result = '[MCP] 工具执行完成（无文本输出）'
+                        except MCPClientError as exc:
+                            msg = str(exc)
+                            if _mcp_client_error_is_timeout(msg):
+                                result = _MCP_BROWSER_TIMEOUT_MSG
+                            else:
+                                result = f'[MCP错误] {msg}'
+                    else:
+                        result = f'[错误] 未知工具: {fn}'
                 except Exception as exc:
                     result = f'[执行失败] {type(exc).__name__}: {exc}'
                 msgs.append(
@@ -801,13 +886,16 @@ def chat_completion(
     settings: LlmConnectionSettings,
     *,
     model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    mcp_client: 'MCPClient | None' = None,
 ) -> ChatCompletionResult:
     """非流式：消费 :func:`iter_agent_executor_events` 直至得到最终文本。"""
     for ev in iter_agent_executor_events(
         messages,
         settings,
         model=model,
-        tools=get_openai_agent_tools(),
+        tools=tools if tools is not None else get_openai_agent_tools(),
+        mcp_client=mcp_client,
     ):
         if ev['type'] == 'executor_complete':
             cm = ev.get('conversation_messages')

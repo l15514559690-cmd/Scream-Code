@@ -9,6 +9,8 @@ _DOTENV_LOADED = False
 # LLM 网络超时防护（秒）：连接建立上限 + 流式读取上限
 LLM_CONNECT_TIMEOUT = 15.0
 LLM_READ_TIMEOUT = 90.0
+MCP_SERVER_COMMAND: str | None = None
+"""可选 MCP server 启动命令（例如 ``npx -y @browsermcp/mcp``）；None 表示禁用。"""
 
 
 def project_root() -> Path:
@@ -225,3 +227,17 @@ def read_llm_connection_settings() -> LlmConnectionSettings:
         api_key_env_name=profile.api_key_env_name,
         profile_alias=profile.alias,
     )
+
+
+def read_mcp_server_command() -> str | None:
+    """
+    读取 MCP server 启动命令：
+    - 优先 ``MCP_SERVER_COMMAND`` 环境变量 / .env
+    - 无值时回退模块常量 ``MCP_SERVER_COMMAND``（默认 None）
+    """
+    load_project_dotenv()
+    raw = read_project_dotenv_value('MCP_SERVER_COMMAND').strip()
+    if raw:
+        return raw
+    fallback = (MCP_SERVER_COMMAND or '').strip()
+    return fallback or None

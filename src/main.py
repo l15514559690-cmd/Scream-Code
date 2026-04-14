@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+from typing import Any
 
 
 def check_and_install_dependencies() -> None:
@@ -40,6 +41,34 @@ def check_and_install_dependencies() -> None:
             __import__(mod)
         except ImportError:
             pass
+
+
+def render_mcp_online_toolbar_badge(engine: Any) -> str:
+    """
+    prompt_toolkit 底栏前缀：根据 ``engine.mcp_online_mode`` 返回联网状态标识。
+    由 TUI 层拼接进 HTML toolbar。
+    """
+    if engine is None:
+        return '<ansibrightblack>[🌐 浏览器MCP模式: 禁用]</ansibrightblack>  '
+    try:
+        mcp = engine.get_mcp_client() if hasattr(engine, 'get_mcp_client') else None
+        status = str(getattr(mcp, 'status', 'idle') or 'idle')
+    except Exception:
+        mcp = None
+        status = 'idle'
+
+    if status == 'starting':
+        return '<ansiyellow><b>[⌛ 浏览器MCP引擎加载中...]</b></ansiyellow>  '
+    if status == 'error':
+        return '<ansired><b>[⚠️ 浏览器MCP引擎异常]</b></ansired>  '
+    if status == 'ready':
+        on = bool(getattr(engine, 'mcp_online_mode', False))
+        if on:
+            return '<ansicyan><b>[🌐 浏览器MCP模式: ON]</b></ansicyan>  '
+        return '<ansibrightblack>[🌐 浏览器MCP模式: OFF]</ansibrightblack>  '
+    if mcp is None:
+        return '<ansibrightblack>[🌐 浏览器MCP模式: 禁用]</ansibrightblack>  '
+    return '<ansibrightblack>[🌐 浏览器MCP模式: OFF]</ansibrightblack>  '
 
 
 from .bootstrap_graph import build_bootstrap_graph

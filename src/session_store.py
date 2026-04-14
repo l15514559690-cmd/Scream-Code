@@ -53,6 +53,8 @@ class StoredSession:
     output_tokens: int
     #: 发往 LLM 的完整消息快照（含 assistant / tool）；可能经上下文折叠缩短；旧版 JSON 无此字段则为空。
     llm_conversation_messages: tuple[dict[str, Any], ...] = ()
+    #: 全局浏览器MCP模式：开启后优先要求模型调用 Browser MCP 浏览器/搜索工具。
+    mcp_online_mode: bool = False
 
 
 def resolve_session_dir(explicit: Path | None = None) -> Path:
@@ -95,6 +97,7 @@ def load_session(session_id: str, directory: Path | None = None) -> StoredSessio
         input_tokens=data['input_tokens'],
         output_tokens=data['output_tokens'],
         llm_conversation_messages=llm_conv,
+        mcp_online_mode=bool(data.get('mcp_online_mode', False)),
     )
 
 
