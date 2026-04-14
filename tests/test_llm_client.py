@@ -5,10 +5,14 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src.llm_client import (
+    LlmClientError,
+    StreamPart,
     agent_tool_iteration_cap,
+    chat_completion_stream,
     max_agent_tool_rounds,
     openai_user_content_to_anthropic,
 )
+from src.llm_settings import LlmConnectionSettings
 from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEngineConfig, QueryEnginePort
 
@@ -110,6 +114,35 @@ class LlmClientTests(unittest.TestCase):
         fake_openai.assert_not_called()
         self.assertIn('[LLM]', result.output)
         self.assertIn('API_KEY', result.output)
+
+    def test_prefix_routing_uses_anthropic_channel(self) -> None:
+        settings = LlmConnectionSettings(
+            base_url='https://api.anthropic.com',
+            api_key='k',
+            model='anthropic/claude-3-5-sonnet-20240620',
+            api_protocol='openai',
+            api_key_env_name='ANTHROPIC_API_KEY',
+        )
+        with patch('src.llm_client._chat_completion_stream_openai') as openai_stream:
+            with patch(
+                'src.llm_client._chat_completion_stream_anthropic',
+                return_value=iter([StreamPart(text_delta='ok')]),
+            ) as anth_stream:
+                list(chat_completion_stream([{'role': 'user', 'content': 'hi'}], settings))
+        openai_stream.assert_not_called()
+        anth_stream.assert_called_once()
+
+    def test_prefix_routing_missing_provider_key_blows_fuse(self) -> None:
+        settings = LlmConnectionSettings(
+            base_url='https://api.openai.com/v1',
+            api_key='',
+            model='openai/gpt-4o-mini',
+            api_protocol='openai',
+            api_key_env_name='OPENAI_API_KEY',
+        )
+        with self.assertRaises(LlmClientError) as ctx:
+            list(chat_completion_stream([{'role': 'user', 'content': 'hi'}], settings))
+        self.assertIn('OPENAI_API_KEY', str(ctx.exception))
 
     def test_openai_user_content_to_anthropic_data_url_image(self) -> None:
         tiny = (

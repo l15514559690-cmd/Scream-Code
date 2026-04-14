@@ -15,11 +15,23 @@ from src.models import PortingModule
 from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEngineConfig, QueryEnginePort
 from src.repl_slash_commands import dispatch_repl_slash_command
-from src.session_store import StoredSession, save_session
+from src.session_store import StoredSession, resolve_session_dir, save_session
 from src.skills_registry import get_skills_registry, reset_skills_registry_for_tests
 
 
 class ReplSlashCommandsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_home = os.environ.get('HOME')
+        self._home_tmp = tempfile.TemporaryDirectory()
+        os.environ['HOME'] = self._home_tmp.name
+
+    def tearDown(self) -> None:
+        if self._old_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = self._old_home
+        self._home_tmp.cleanup()
+
     def test_slash_completion_includes_look_from_registry(self) -> None:
         reset_skills_registry_for_tests()
         reg = get_skills_registry()
@@ -149,8 +161,9 @@ class ReplSlashCommandsTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 os.chdir(tmp)
-                Path(tmp, '.port_sessions').mkdir(parents=True)
-                Path(tmp, '.port_sessions', 'bad.json').write_text('{', encoding='utf-8')
+                target = resolve_session_dir()
+                target.mkdir(parents=True, exist_ok=True)
+                (target / 'bad.json').write_text('{', encoding='utf-8')
                 eng = QueryEnginePort(build_port_manifest())
                 with patch('builtins.print'):
                     h, ne, _ = dispatch_repl_slash_command('/load bad', console=None, engine=eng)

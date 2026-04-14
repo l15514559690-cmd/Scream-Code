@@ -15,3 +15,7 @@ MSG_TOOL_EXCEPTION = (
 
 MSG_LLM_NETWORK_ERROR = '\n\n[💥 引擎熔断：网络请求超时或连接失败，请检查网络/代理设置后重试]'
 
+MSG_LLM_PROVIDER_KEY_MISSING = (
+    '[💥 引擎熔断：未检测到 {provider} 的环境变量密钥 (如 {expected_env_var})，请检查配置后重试。]'
+)
+

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .utils.workspace import get_workspace_root
+
 
 @dataclass(frozen=True)
 class PortContext:
@@ -17,7 +19,7 @@ class PortContext:
 
 
 def build_port_context(base: Path | None = None) -> PortContext:
-    root = base or Path(__file__).resolve().parent.parent
+    root = base or get_workspace_root()
     source_root = root / 'src'
     tests_root = root / 'tests'
     assets_root = root / 'assets'

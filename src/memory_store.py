@@ -8,16 +8,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+from .utils.workspace import get_workspace_data_root, get_workspace_root
+
 _MAX_KEY_LEN = 128
 _MAX_CONTENT_LEN = 500_000
 
 
 def memory_db_path() -> Path:
-    """``~/.scream/memory.db``；测试可设环境变量 ``SCREAM_MEMORY_DB`` 覆盖。"""
+    """当前工作区隔离内存库：``~/.screamcode/workspaces/{workspace_id}/memory.db``。"""
     raw = os.environ.get('SCREAM_MEMORY_DB', '').strip()
     if raw:
         return Path(raw).expanduser().resolve()
-    return Path.home() / '.scream' / 'memory.db'
+    return get_workspace_data_root(get_workspace_root()) / 'memory.db'
 
 
 def _utc_now_iso() -> str:
@@ -165,7 +167,7 @@ def format_project_long_term_memory_xml_block() -> str:
 
     lines = [
         '<Project_LongTerm_Memory>',
-        '<!-- 长期项目记忆（SQLite ~/.scream/memory.db）；由 memorize_project_rule / REPL /memory 维护 -->',
+        '<!-- 长期项目记忆（SQLite ~/.screamcode/workspaces/<workspace_id>/memory.db）；由 memorize_project_rule / REPL /memory 维护 -->',
         '',
     ]
     for r in rows:

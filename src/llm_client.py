@@ -13,11 +13,17 @@ from typing import TYPE_CHECKING, Any
 from openai import OpenAI
 
 from . import agent_cancel
-from .constants.messages import MSG_LLM_NETWORK_ERROR, MSG_TOOL_EXCEPTION
+from .constants.messages import (
+    MSG_LLM_NETWORK_ERROR,
+    MSG_LLM_PROVIDER_KEY_MISSING,
+    MSG_TOOL_EXCEPTION,
+)
 from .llm_settings import (
     LLM_CONNECT_TIMEOUT,
     LLM_READ_TIMEOUT,
     LlmConnectionSettings,
+    expected_api_key_env_var,
+    parse_model_route,
 )
 from .message_prune import prune_historical_messages
 
@@ -155,6 +161,22 @@ def _raise_if_missing_key(settings: LlmConnectionSettings) -> None:
     if settings.api_key_env_name:
         bits.append(f'请在项目根 `.env` 中配置 `{settings.api_key_env_name}`。')
     raise LlmClientError(' '.join(bits))
+
+
+def _raise_if_missing_provider_key(
+    settings: LlmConnectionSettings,
+    *,
+    provider: str,
+) -> None:
+    expected_env_var = expected_api_key_env_var(provider)
+    if (settings.api_key or '').strip():
+        return
+    raise LlmClientError(
+        MSG_LLM_PROVIDER_KEY_MISSING.format(
+            provider=provider,
+            expected_env_var=expected_env_var,
+        )
+    )
 
 
 def _map_llm_auth_exception(exc: BaseException) -> LlmClientError | None:
@@ -671,21 +693,26 @@ def chat_completion_stream(
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
 ) -> Iterator[StreamPart]:
-    """按配置的 ``api_protocol`` 选择 OpenAI 或 Anthropic 流式接口。"""
-    _raise_if_missing_key(settings)
+    """按模型前缀路由（provider/model_id）严格分发到对应客户端。"""
     # 内存修剪：不修改调用方传入的 messages（深拷贝在 prune 内完成）
     api_messages = prune_historical_messages(messages)
-    use_model = (model or settings.model).strip() or settings.model
-    proto = (settings.api_protocol or 'openai').strip().lower()
+    raw_model = (model or settings.model).strip() or settings.model
+    route = parse_model_route(
+        raw_model,
+        default_provider=settings.default_provider or settings.api_protocol or 'openai',
+    )
+    _raise_if_missing_provider_key(settings, provider=route.provider)
     try:
-        if proto == 'anthropic':
+        if route.provider == 'anthropic':
             yield from _chat_completion_stream_anthropic(
-                api_messages, settings, use_model=use_model, tools=tools
+                api_messages, settings, use_model=route.model_id, tools=tools
+            )
+        elif route.provider in ('openai', 'deepseek'):
+            yield from _chat_completion_stream_openai(
+                api_messages, settings, use_model=route.model_id, tools=tools
             )
         else:
-            yield from _chat_completion_stream_openai(
-                api_messages, settings, use_model=use_model, tools=tools
-            )
+            raise LlmClientError(f'[LLM] 不支持的 provider 路由: {route.provider}')
     except Exception as exc:
         mapped = _map_llm_auth_exception(exc)
         if mapped is not None:

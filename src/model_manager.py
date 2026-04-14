@@ -32,7 +32,12 @@ def _migrate_legacy_repo_llm_config_if_needed() -> None:
 
 
 def empty_config_payload() -> dict[str, Any]:
-    return {'active': None, 'models': [], 'allow_global_access': False}
+    return {
+        'active': None,
+        'models': [],
+        'allow_global_access': False,
+        'default_provider': 'openai',
+    }
 
 
 def read_allow_global_access(raw: dict[str, Any] | None = None) -> bool:
@@ -401,7 +406,12 @@ def _prompt_connection_fields(
     base_url = _prompt_text(style, 'Base URL：', default=url_d, required=True)
     if base_url is None:
         return None
-    model_name = _prompt_text(style, '模型名称：', default=model_d, required=True)
+    model_name = _prompt_text(
+        style,
+        '模型名称（推荐 provider/model_id，如 anthropic/claude-3-5-sonnet-20240620）：',
+        default=model_d,
+        required=True,
+    )
     if model_name is None:
         return None
     return (

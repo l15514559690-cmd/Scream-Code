@@ -74,7 +74,13 @@ def render_mcp_online_toolbar_badge(engine: Any) -> str:
 from .bootstrap_graph import build_bootstrap_graph
 from .command_graph import build_command_graph
 from .commands import execute_command, get_command, get_commands, render_command_index
-from .direct_modes import run_deep_link, run_direct_connect
+from .direct_modes import (
+    detect_piped_stdin,
+    read_piped_stdin_text,
+    run_deep_link,
+    run_direct_connect,
+    run_headless_query,
+)
 from .claw_config import load_project_claw_json
 from .llm_settings import load_project_dotenv, reload_project_dotenv
 from .model_manager import run_config_interactive_menu
@@ -90,7 +96,7 @@ from .port_manifest import build_port_manifest
 from .query_engine import QueryEnginePort
 from .remote_runtime import run_remote_mode, run_ssh_mode, run_teleport_mode
 from .runtime import PortRuntime
-from .session_store import load_session
+from .session_store import BLOCKED_CROSS_WORKSPACE_LOAD_MSG, CrossWorkspaceSessionLoadBlockedError, load_session
 from .setup import run_setup
 from .tool_pool import assemble_tool_pool
 from .tools import execute_tool, get_tool, get_tools, render_tool_index
@@ -135,6 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
         '--python-tui',
         action='store_true',
         help='纯 Python 终端 UI（prompt_toolkit + rich 流式 Markdown），规避 macOS PTY/crossterm EOF 问题',
+    )
+    repl_parser.add_argument(
+        'prompt',
+        nargs='?',
+        default='',
+        help='可选的一次性提示词（在管道模式下会与 stdin 内容拼装）',
     )
     subparsers.add_parser('config', help='交互式管理多模型配置（llm_config.json）')
     subparsers.add_parser('summary', help='以 Markdown 渲染 Python 移植工作区摘要')
@@ -219,6 +231,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _compose_headless_query(cli_prompt: str, pipe_content: str) -> str:
+    prompt = (cli_prompt or '').strip()
+    piped = (pipe_content or '').strip()
+    if prompt and piped:
+        return f'{prompt}\n\n[管道输入内容]:\n{piped}'
+    return prompt or piped
+
+
 def _run_findskills_cli() -> None:
     from rich.console import Console
     from rich.table import Table
@@ -254,6 +274,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(incoming_argv)
     manifest = build_port_manifest()
     if args.command == 'repl':
+        is_piped = detect_piped_stdin()
+        if is_piped and not getattr(args, 'json_stdio', False):
+            pipe_content = read_piped_stdin_text()
+            query_text = _compose_headless_query(
+                getattr(args, 'prompt', '') or '',
+                pipe_content,
+            )
+            return run_headless_query(query_text, llm_enabled=bool(args.llm))
         if getattr(args, 'json_stdio', False):
             from .replLauncher import run_repl_json_stdio_loop
 
@@ -404,7 +432,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f'已落盘={"是" if engine.transcript_store.flushed else "否"}')
         return 0
     if args.command == 'load-session':
-        session = load_session(args.session_id)
+        try:
+            session = load_session(args.session_id)
+        except CrossWorkspaceSessionLoadBlockedError:
+            print(BLOCKED_CROSS_WORKSPACE_LOAD_MSG, file=sys.stderr, flush=True)
+            return 1
         print(
             f'{session.session_id}\n'
             f'消息条数={len(session.messages)}\n'
@@ -551,6 +583,17 @@ def cli_main(argv: list[str]) -> int:
             return code
         reload_project_dotenv()
         return _offer_launch_tui_after_config()
+    if args.command is None and detect_piped_stdin():
+        if not is_product_session_ready():
+            print(
+                'scream: 未检测到 API Key，且当前为非交互环境。'
+                '请配置 ~/.scream/ 或设置环境变量。',
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        query_text = _compose_headless_query('', read_piped_stdin_text())
+        return run_headless_query(query_text, llm_enabled=True)
     if not is_product_session_ready():
         if not sys.stdin.isatty():
             print(

@@ -12,6 +12,21 @@ LLM_READ_TIMEOUT = 90.0
 MCP_SERVER_COMMAND: str | None = None
 """可选 MCP server 启动命令（例如 ``npx -y @browsermcp/mcp``）；None 表示禁用。"""
 
+_MODEL_PROVIDER_ALIASES: dict[str, str] = {
+    'openai': 'openai',
+    'oai': 'openai',
+    'anthropic': 'anthropic',
+    'claude': 'anthropic',
+    'deepseek': 'deepseek',
+}
+_MODEL_PROVIDER_PREFIX_HINTS: tuple[tuple[str, str], ...] = (
+    ('gpt-', 'openai'),
+    ('o1', 'openai'),
+    ('o3', 'openai'),
+    ('claude-', 'anthropic'),
+    ('deepseek-', 'deepseek'),
+)
+
 
 def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -186,6 +201,60 @@ class LlmConnectionSettings:
     #: 密钥所在环境变量名（用于报错指引）；旧版直连为 API_KEY。
     api_key_env_name: str | None = None
     profile_alias: str | None = None
+    default_provider: str = 'openai'
+
+
+@dataclass(frozen=True)
+class ParsedModelRoute:
+    provider: str
+    model_id: str
+    routed_model: str
+
+
+def normalize_provider_name(provider: str | None) -> str:
+    raw = (provider or '').strip().lower()
+    if not raw:
+        return 'openai'
+    return _MODEL_PROVIDER_ALIASES.get(raw, raw)
+
+
+def infer_provider_from_model_name(model_name: str) -> str | None:
+    m = (model_name or '').strip().lower()
+    if not m:
+        return None
+    for prefix, provider in _MODEL_PROVIDER_PREFIX_HINTS:
+        if m.startswith(prefix):
+            return provider
+    return None
+
+
+def expected_api_key_env_var(provider: str) -> str:
+    p = normalize_provider_name(provider)
+    if p == 'anthropic':
+        return 'ANTHROPIC_API_KEY'
+    if p == 'deepseek':
+        return 'DEEPSEEK_API_KEY'
+    return 'OPENAI_API_KEY'
+
+
+def parse_model_route(model_name: str, *, default_provider: str = 'openai') -> ParsedModelRoute:
+    """
+    解析 ``provider/model_id``。当无前缀时，按常见模型前缀推断厂商，失败则回退 ``default_provider``。
+    """
+    raw = (model_name or '').strip()
+    if not raw:
+        provider = normalize_provider_name(default_provider)
+        return ParsedModelRoute(provider=provider, model_id='', routed_model=f'{provider}/')
+    if '/' in raw:
+        pfx, rest = raw.split('/', 1)
+        provider = normalize_provider_name(pfx)
+        model_id = rest.strip()
+    else:
+        provider = infer_provider_from_model_name(raw) or normalize_provider_name(default_provider)
+        model_id = raw
+    model_id = model_id.strip()
+    routed_model = f'{provider}/{model_id}' if model_id else f'{provider}/'
+    return ParsedModelRoute(provider=provider, model_id=model_id, routed_model=routed_model)
 
 
 def _legacy_env_settings() -> LlmConnectionSettings:
@@ -194,15 +263,18 @@ def _legacy_env_settings() -> LlmConnectionSettings:
     base_url = raw_base.rstrip('/') if raw_base else ''
     if not base_url:
         base_url = 'https://api.openai.com/v1'
-    api_key = os.environ.get('API_KEY', '').strip()
-    model = os.environ.get('MODEL', '').strip() or 'gpt-4o-mini'
+    model = os.environ.get('MODEL', '').strip() or 'anthropic/claude-3-5-sonnet-20240620'
+    route = parse_model_route(model, default_provider='openai')
+    expected_env = expected_api_key_env_var(route.provider)
+    api_key = os.environ.get(expected_env, '').strip() or os.environ.get('API_KEY', '').strip()
     return LlmConnectionSettings(
         base_url=base_url,
         api_key=api_key,
-        model=model,
-        api_protocol='openai',
-        api_key_env_name='API_KEY',
+        model=route.routed_model,
+        api_protocol=route.provider,
+        api_key_env_name=expected_env if api_key else 'API_KEY',
         profile_alias=None,
+        default_provider='openai',
     )
 
 
@@ -216,16 +288,20 @@ def read_llm_connection_settings() -> LlmConnectionSettings:
     if raw is None:
         return _legacy_env_settings()
     profile = model_manager.get_active_profile(raw)
+    default_provider = normalize_provider_name(str(raw.get('default_provider', 'openai')))
     if profile is None:
         return _legacy_env_settings()
-    api_key = os.environ.get(profile.api_key_env_name, '').strip()
+    route = parse_model_route(profile.model_name, default_provider=profile.api_protocol or default_provider)
+    expected_env = expected_api_key_env_var(route.provider)
+    api_key = os.environ.get(profile.api_key_env_name, '').strip() or os.environ.get(expected_env, '').strip()
     return LlmConnectionSettings(
         base_url=profile.base_url.rstrip('/'),
         api_key=api_key,
-        model=profile.model_name,
-        api_protocol=profile.api_protocol,
-        api_key_env_name=profile.api_key_env_name,
+        model=route.routed_model,
+        api_protocol=route.provider,
+        api_key_env_name=profile.api_key_env_name or expected_env,
         profile_alias=profile.alias,
+        default_provider=default_provider,
     )
 
 

@@ -173,7 +173,11 @@ class LoadSkill(BaseSkill):
     category: ClassVar[str] = 'memory'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
-        from ..session_store import load_session
+        from ..session_store import (
+            BLOCKED_CROSS_WORKSPACE_LOAD_MSG,
+            CrossWorkspaceSessionLoadBlockedError,
+            load_session,
+        )
 
         sid = (args or '').split()[0] if (args or '').strip() else ''
         if not sid:
@@ -181,6 +185,9 @@ class LoadSkill(BaseSkill):
             return SkillOutcome()
         try:
             load_session(sid)
+        except CrossWorkspaceSessionLoadBlockedError:
+            msg(context.console, BLOCKED_CROSS_WORKSPACE_LOAD_MSG, style='bold red')
+            return SkillOutcome()
         except (OSError, FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             msg(context.console, f'无法加载会话 {sid!r}: {exc}', style='bold red')
             return SkillOutcome()

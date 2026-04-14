@@ -460,7 +460,7 @@ def print_sessions(console: Any | None) -> None:
         from rich.table import Table
 
         if not entries:
-            console.print('[dim]尚无已落盘会话（.port_sessions/）。[/dim]')
+            console.print('[dim]尚无已落盘会话（当前工作区 sessions）。[/dim]')
             return
         t = Table(
             title='/sessions · 本地会话历史',
