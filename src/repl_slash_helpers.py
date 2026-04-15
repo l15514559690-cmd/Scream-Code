@@ -661,3 +661,24 @@ class SlashCommandCompleter:
                     start_position=-len(fragment),
                     display_meta=meta,
                 )
+        # /feishu 子命令（与 SkillsRegistry 中 /feishu 主条目共存，便于输入 /feishu s… 时展开）
+        feishu_subcommands: list[tuple[str, str]] = [
+            ('/feishu start', '🚀 启动侧车（已运行则跳过）'),
+            ('/feishu stop', '🛑 关闭飞书连接'),
+            ('/feishu delete', '🗑️ 清除飞书会话与附件缓存'),
+            ('/feishu clear', '🗑️ 同 delete'),
+            ('/feishu config', '⚙️ 写入 AppID / AppSecret 至 .env'),
+            ('/feishu status', '📡 查看侧车进程状态'),
+            ('/feishu log', '📄 查看侧车日志'),
+            ('/feishu help', '❓ 子命令说明'),
+        ]
+        for cmd, meta in feishu_subcommands:
+            if cmd in seen:
+                continue
+            if cmd.startswith(fragment):
+                seen.add(cmd)
+                yield Completion(
+                    cmd,
+                    start_position=-len(fragment),
+                    display_meta=meta,
+                )

@@ -132,6 +132,14 @@ class ToolsRegistry:
                 return '[工具参数错误] key_name 须为非空字符串。'
             return agent_tools.forget_project_rule(k.strip())
 
+        from . import channel_tools
+
+        def _send_file_to_user(a: dict[str, Any]) -> str:
+            fp = a.get('file_path')
+            if not isinstance(fp, str) or not fp.strip():
+                return '[工具参数错误] 缺少有效字段 file_path（字符串）。'
+            return channel_tools.send_file_to_user(fp.strip())
+
         schemas = agent_tools.builtin_openai_tools_schema()
         handlers: dict[str, Callable[[dict[str, Any]], str]] = {
             'read_local_file': _read,
@@ -141,6 +149,7 @@ class ToolsRegistry:
             'update_project_memory': _memory,
             'memorize_project_rule': _memorize_rule,
             'forget_project_rule': _forget_rule,
+            'send_file_to_user': _send_file_to_user,
         }
         for schema in schemas:
             n = _tool_name_from_schema(schema)

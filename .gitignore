@@ -58,6 +58,9 @@ temp/
 .port_sessions/
 .scream/
 
+# Agent / 飞书侧车缓存（截图、临时文件，勿提交）
+/.scream_cache/
+
 # --- 可选：编辑器 ---
 .idea/
 .vscode/

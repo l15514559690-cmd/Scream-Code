@@ -281,7 +281,10 @@ def main(argv: list[str] | None = None) -> int:
     manifest = build_port_manifest()
     if args.command == 'repl':
         if getattr(args, 'session_id', '').strip():
-            # 向下游执行链路透传外部会话 ID（例如飞书 chat_id），便于后续扩展会话隔离。
+            # 向下游执行链路透传外部会话 ID（例如飞书侧车 ``feishu_*``）。
+            # 未传 ``--session-id`` 时，TUI/交互 REPL 的「自动续接最近会话」由
+            # ``session_store.most_recent_saved_session_id`` 提供，该函数会排除 ``feishu_`` 前缀，
+            # 避免飞书缓存污染主界面；显式传入或 headless ``run_headless_query(..., session_id=...)`` 仍照常加载。
             os.environ['SCREAM_SESSION_ID'] = str(args.session_id).strip()
         is_piped = detect_piped_stdin()
         if is_piped and not getattr(args, 'json_stdio', False):

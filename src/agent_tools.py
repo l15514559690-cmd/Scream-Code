@@ -369,6 +369,8 @@ def builtin_openai_tools_schema() -> list[dict[str, object]]:
                 '在 Docker 容器内通过 bash 执行命令（工作区根挂载为 /workspace，超时 120s）。'
                 '需要本机已安装 Docker；命令仅在容器环境内生效。'
             )
+    from . import channel_tools
+
     return [
         {
             'type': 'function',
@@ -521,4 +523,5 @@ def builtin_openai_tools_schema() -> list[dict[str, object]]:
                 },
             },
         },
+        channel_tools.SEND_FILE_TO_USER_OPENAI_TOOL,
     ]

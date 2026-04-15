@@ -237,6 +237,8 @@ def neural_status_fields(engine: Any) -> dict[str, Any]:
 
 def neural_status_stream_footer_markup(engine: Any) -> str:
     """Rich ``Text.from_markup`` 单行；与底栏语义对齐，嵌入 ``Live`` 底部。"""
+    from .ui.status_bar import feishu_stream_rich_fragment
+
     f = neural_status_fields(engine)
     sb_on = (
         '[bold #4ade80]🛡️ 沙箱: ON[/bold #4ade80]'
@@ -246,12 +248,14 @@ def neural_status_stream_footer_markup(engine: Any) -> str:
     team = '[bold #fbbf24]🐺 TEAM[/bold #fbbf24]' if f['team'] else '[dim]单人[/dim]'
     pct = f['token_pct']
     pct_style = '#fbbf24' if pct >= 85 else '#34d399' if pct < 50 else '#2dd4bf'
+    feishu_seg = feishu_stream_rich_fragment()
     return (
         f'[{_BRAND_HEX}]◈ NEURAL·BAR[/]  '
         f'[bold #2dd4bf][{f["model"]}][/bold #2dd4bf]  ·  {sb_on}  ·  '
         f'[bold #5eead4]🧠 记忆: {f["memory_n"]}条[/bold #5eead4]  ·  '
         f'[bold {pct_style}]📊 Token: {pct}%[/bold {pct_style}] '
         f'[dim](Σ {f["total_tokens"]})[/dim]  ·  {team}'
+        f'{feishu_seg}'
     )
 
 
@@ -318,6 +322,7 @@ def _get_bottom_toolbar(engine: Any) -> Any:
     import html as html_mod
 
     from .main import render_mcp_online_toolbar_badge
+    from .ui.status_bar import feishu_toolbar_html_fragment
 
     f = neural_status_fields(engine)
     m = html_mod.escape(f['model'])
@@ -331,6 +336,7 @@ def _get_bottom_toolbar(engine: Any) -> Any:
         else '<ansibrightblack>单人</ansibrightblack>'
     )
     web_badge = render_mcp_online_toolbar_badge(engine)
+    feishu_seg = feishu_toolbar_html_fragment()
     return HTML(
         ' '
         f'{web_badge}'
@@ -347,6 +353,8 @@ def _get_bottom_toolbar(engine: Any) -> Any:
         f'<ansibrightblack>Σ {f["total_tokens"]}</ansibrightblack>  '
         '<ansiblue>│</ansiblue>  '
         f'{team}  '
+        '<ansiblue>│</ansiblue>  '
+        f'{feishu_seg}  '
     )
 
 

@@ -1,22 +1,24 @@
-import os
-import json
-import threading
-import subprocess
-import warnings
 import ssl
-import time
-import re
-from pathlib import Path
-import lark_oapi as lark
-from lark_oapi.api.im.v1 import *
 
-# SSL 破壁补丁（开发环境兜底）
+# SSL 破壁补丁（开发环境兜底）：必须在 lark/httpx 等网络库 import 之前执行
 try:
     _create_unverified_https_context = ssl._create_unverified_context
 except AttributeError:
     pass
 else:
     ssl._create_default_https_context = _create_unverified_https_context
+
+import atexit
+import os
+import json
+import threading
+import subprocess
+import warnings
+import time
+import re
+from pathlib import Path
+import lark_oapi as lark
+from lark_oapi.api.im.v1 import *
 
 # 屏蔽第三方弃用告警，保持日志极客洁癖
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -30,11 +32,62 @@ ALLOW_INSECURE_SSL = os.getenv("FEISHU_INSECURE_SSL", "0").strip().lower() in ("
 # 初始化 API 客户端（仅用于发送回复）
 api_client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 
-LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "feishu.log"
-DOWNLOAD_DIR = Path(__file__).resolve().parent.parent / "logs" / "feishu_downloads"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOG_PATH = _PROJECT_ROOT / "logs" / "feishu.log"
+# 入站附件：与项目根隔离，避免污染仓库
+DOWNLOAD_DIR = (_PROJECT_ROOT / ".scream_cache" / "feishu_inbox").resolve()
+SCREAM_CACHE_OUTBOX = (_PROJECT_ROOT / ".scream_cache" / "feishu_outbox").resolve()
+FEISHU_SIDECAR_PID = (_PROJECT_ROOT / ".scream_cache" / "feishu_sidecar.pid").resolve()
 _FEISHU_FILE_TAG_RE = re.compile(r"\[FEISHU_FILE:\s*(.+?)\]")
 _pending_receive_id_type = "open_id"
 _pending_receive_id = ""
+
+
+def _ensure_scream_cache_dirs() -> None:
+    """创建入站/出站缓存目录（项目根 `.scream_cache/` 下）。"""
+    try:
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        SCREAM_CACHE_OUTBOX.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+
+def _write_feishu_sidecar_pid() -> None:
+    """供 TUI 状态栏检测侧车是否存活（与 ``pgrep`` 互补）。"""
+    try:
+        _ensure_scream_cache_dirs()
+        FEISHU_SIDECAR_PID.write_text(str(os.getpid()), encoding='ascii')
+    except OSError:
+        pass
+
+
+def _remove_feishu_sidecar_pid() -> None:
+    try:
+        FEISHU_SIDECAR_PID.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+atexit.register(_remove_feishu_sidecar_pid)
+
+
+def _gc_scream_cache_stale_files(max_age_days: int = 3) -> None:
+    """删除 inbox/outbox 中超过 ``max_age_days`` 的文件，防止磁盘撑满。"""
+    cutoff = time.time() - float(max(1, max_age_days)) * 86400.0
+    for base in (DOWNLOAD_DIR, SCREAM_CACHE_OUTBOX):
+        try:
+            if not base.is_dir():
+                continue
+            for p in base.iterdir():
+                if not p.is_file():
+                    continue
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
 
 def _log_error(text: str) -> None:
@@ -224,34 +277,50 @@ def process_and_reply_in_background(
     try:
         effective_user_text = (user_text or "").strip()
         if message_type in ("image", "file"):
+            if not effective_user_text:
+                effective_user_text = "请分析我刚发送的这个附件。"
             try:
                 content_dict = json.loads(message_content or "{}")
             except json.JSONDecodeError:
                 content_dict = {}
             local_path = _download_attachment_to_local(message_id, message_type, content_dict)
             if local_path:
-                effective_user_text = f"[用户上传了附件]: {local_path}"
+                effective_user_text = f"{effective_user_text}\n\n[用户上传了附件]: {local_path}"
             else:
-                effective_user_text = f"[用户上传了{message_type}，下载失败，请查看日志。]"
+                effective_user_text = (
+                    f"{effective_user_text}\n\n[用户上传了{message_type}，下载失败，请查看日志。]"
+                )
+
+        wrapped_prompt = f"""[SYSTEM_OVERRIDE: 飞书通道]
+注意：你正在飞书独立通道中与用户对话。
+
+【入站附件协议 (最高优先级)】：
+若下方用户的消息中包含 `[用户上传了附件]: <本地绝对路径>`，这代表物理文件已经被下载到了你的运行环境（.scream_cache/feishu_inbox/）中。
+1. 你【必须】立刻使用你的本地工具（如 bash、python、read_file 等）去主动读取、解压或分析这个路径下的文件！
+2. 绝不允许回答“我无法访问你电脑上的文件”或“我看不到文件”，文件就在你本地！
+3. 如果是压缩包请先用工具解压；如果是代码/文本请直接读取；如果是图片，请尝试使用你的视觉能力或图像处理工具进行分析。
+
+【出站文件协议】：
+若需发送文件给用户，请保存在 .scream_cache/feishu_outbox/ 中并严格输出 [FEISHU_FILE:/绝对路径]。
+
+[USER_MESSAGE]:
+{effective_user_text}"""
 
         cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        cmd = ["python3", "-m", "src.main", "repl", effective_user_text]
+        cmd = ["python3", "-m", "src.main", "repl", wrapped_prompt]
         current_session_id = (session_id or "").strip()
-        if not current_session_id:
-            try:
-                from src.session_store import most_recent_saved_session_id
-
-                current_session_id = (most_recent_saved_session_id() or "").strip()
-            except Exception:
-                current_session_id = ""
         if current_session_id:
             cmd.extend(["--session-id", current_session_id])
-        
+
+        env = os.environ.copy()
+        env["SCREAM_FRONTEND"] = "feishu"
+
         process = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            cwd=cwd
+            cwd=cwd,
+            env=env,
         )
         
         reply_text = process.stdout.strip()
@@ -297,6 +366,11 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
         chat_id = (data.event.message.chat_id or "").strip()
         receive_id_type = "chat_id" if chat_id else "open_id"
         receive_id = chat_id or open_id
+        feishu_session_id = f"feishu_{open_id or chat_id}".strip()
+
+        # 纯图片/文件无配文时不能当空消息丢弃；后台会再拼接入站附件行
+        if message_type in ("image", "file") and not user_text:
+            user_text = "请分析我刚发送的这个附件。"
         
         if message_type == "text" and not user_text:
             print("[飞书长连接] 空文本消息，忽略。")
@@ -313,7 +387,7 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
                 user_text,
                 receive_id_type,
                 receive_id,
-                chat_id or open_id,
+                feishu_session_id,
                 message_type,
                 message_id,
                 raw_content,
@@ -352,6 +426,9 @@ def _build_ws_client_options() -> list[object]:
         return []
 
 if __name__ == "__main__":
+    _ensure_scream_cache_dirs()
+    _gc_scream_cache_stale_files(max_age_days=3)
+    _write_feishu_sidecar_pid()
     print("🚀 Scream Code 飞书长连接侧车正在启动...")
     ws_options = _build_ws_client_options()
     cli = lark.ws.Client(

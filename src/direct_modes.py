@@ -71,6 +71,7 @@ def run_headless_query(
         else:
             engine = QueryEnginePort.from_workspace()
         engine.config = replace(engine.config, llm_enabled=llm_enabled)
+
         result = engine.submit_message(prompt)
         output = str(getattr(result, 'output', '') or '')
         if output:
@@ -79,6 +80,16 @@ def run_headless_query(
                 sys.stdout.write('\n')
             sys.stdout.flush()
         try:
+            # 与主通道一致：回合结束后再跑一次上下文压缩与滑动裁剪，再落盘（含 feishu_ 子会话），
+            # 避免无头侧车长驻导致 Token/消息条数堆积；不改变 StoredSession / JSON 字段结构。
+            from .llm_settings import read_llm_connection_settings
+
+            _settings = read_llm_connection_settings()
+            _model_override = (engine.config.llm_model or '').strip() or None
+            engine.check_and_compress_history(_settings, _model_override)
+            if getattr(engine, '_just_compressed', False):
+                engine._just_compressed = False
+            engine.compact_messages_if_needed()
             engine.persist_session()
         except OSError:
             pass

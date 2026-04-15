@@ -5,12 +5,13 @@ from typing import ClassVar
 from ..repl_slash_helpers import msg
 from ..scream_theme import ScreamTheme, skill_panel
 from ..services.feishu_manager import FeishuManager
+from ..session_store import purge_feishu_channel_artifacts
 from .base_skill import BaseSkill, ReplSkillContext, SkillOutcome
 
 
 class FeishuSkill(BaseSkill):
     name: ClassVar[str] = 'feishu'
-    description: ClassVar[str] = '🚀 飞书长连接侧车控制台 (config/start/stop/status/log)'
+    description: ClassVar[str] = '🚀 飞书侧车 (config/start/stop/delete/status/log)'
     category: ClassVar[str] = 'system'
 
     def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
@@ -31,12 +32,89 @@ class FeishuSkill(BaseSkill):
                 msg(context.console, '✅ 飞书凭据已保存至 .env', style='bold green')
                 return SkillOutcome()
             if cmd == 'start':
-                mgr.start()
-                msg(context.console, f'✅ 飞书侧车启动成功，{mgr.status()}', style='bold green')
+                outcome = mgr.start()
+                if context.console is not None:
+                    from rich.panel import Panel
+                    from rich.text import Text
+
+                    if outcome == 'already_running':
+                        context.console.print(
+                            Panel(
+                                Text(
+                                    '飞书侧车已在运行中，无需重复拉起。',
+                                    style='bold #a1a1aa',
+                                ),
+                                title='[dim]Feishu · 已在线[/dim]',
+                                border_style='#52525b',
+                                style='on #09090b',
+                            )
+                        )
+                    else:
+                        context.console.print(
+                            Panel(
+                                Text(
+                                    '🚀 飞书独立子通道已成功唤醒驻留后台',
+                                    style='bold #22c55e',
+                                ),
+                                subtitle=f'[dim]{mgr.status()}[/dim]',
+                                border_style='#22c55e',
+                                style='on #0c0c0f',
+                            )
+                        )
+                else:
+                    print('🚀 飞书独立子通道已成功唤醒驻留后台' if outcome == 'started' else '侧车已在运行')
                 return SkillOutcome()
             if cmd == 'stop':
                 mgr.stop()
-                msg(context.console, '🛑 飞书侧车已停止', style='bold yellow')
+                if context.console is not None:
+                    from rich.panel import Panel
+                    from rich.text import Text
+
+                    context.console.print(
+                        Panel(
+                            Text(
+                                '🛑 飞书通道已关闭并切断连接',
+                                style='bold #f59e0b',
+                            ),
+                            border_style='#f59e0b',
+                            style='on #0c0c0f',
+                        )
+                    )
+                else:
+                    print('🛑 飞书通道已关闭并切断连接')
+                return SkillOutcome()
+            if cmd in ('delete', 'clear'):
+                if mgr.is_sidecar_running():
+                    msg(
+                        context.console,
+                        '⚠️ 侧车进程仍在运行中，建议先执行 `/feishu stop` 以确保缓存彻底清理。',
+                        style='yellow',
+                    )
+                report = purge_feishu_channel_artifacts()
+                err_n = len(report.get('errors') or ())
+                if context.console is not None:
+                    from rich.panel import Panel
+                    from rich.text import Text
+
+                    markup = (
+                        '[bold #a78bfa]🗑️ 飞书子通道的所有记忆与物理缓存附件已彻底销毁！'
+                        '通道恢复为出厂状态。[/bold #a78bfa]'
+                    )
+                    if err_n:
+                        markup += (
+                            f'\n\n[dim yellow]部分路径清理时出现 {err_n} 条警告（可稍后重试）[/dim yellow]'
+                        )
+                    context.console.print(
+                        Panel(
+                            Text.from_markup(markup),
+                            title='[bold #7c3aed]Feishu · Purge[/bold #7c3aed]',
+                            subtitle=f'[dim]已删会话文件: {report.get("removed_feishu_session_files", 0)}[/dim]',
+                            border_style='#6366f1',
+                            style='on #09090b',
+                        )
+                    )
+                else:
+                    print('🗑️ 飞书子通道的所有记忆与物理缓存附件已彻底销毁！通道恢复为出厂状态。')
                 return SkillOutcome()
             if cmd == 'status':
                 msg(context.console, mgr.status(), style='bold cyan')
@@ -60,8 +138,9 @@ class FeishuSkill(BaseSkill):
             t.add_column('子命令', style=ScreamTheme.TABLE_COL_CMD, no_wrap=True, overflow='fold')
             t.add_column('说明', style=ScreamTheme.TABLE_COL_DESC, overflow='fold')
             t.add_row('/feishu config <AppID> <AppSecret>', '写入/更新飞书凭据到项目 .env 并同步环境变量')
-            t.add_row('/feishu start', '后台启动 bots/feishu_ws_bot.py 侧车进程')
-            t.add_row('/feishu stop', '安全终止侧车进程')
+            t.add_row('/feishu start', '后台启动侧车（已运行则跳过）')
+            t.add_row('/feishu stop', '终止侧车并切断连接')
+            t.add_row('/feishu delete 或 /feishu clear', '删除所有 feishu_*.json 会话并清空 inbox/outbox 缓存')
             t.add_row('/feishu status', '查看当前进程状态')
             t.add_row('/feishu log', '查看侧车后台运行日志')
             context.console.print(
@@ -78,6 +157,7 @@ class FeishuSkill(BaseSkill):
             '/feishu config <AppID> <AppSecret>\n'
             '/feishu start\n'
             '/feishu stop\n'
+            '/feishu delete | /feishu clear\n'
             '/feishu status\n'
             '/feishu log',
             style='dim',

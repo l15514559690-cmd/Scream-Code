@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,11 @@ def _workspace_data_root() -> Path:
 
 def _sessions_index_path() -> Path:
     return _workspace_data_root() / 'sessions.json'
+
+
+def _is_feishu_channel_session_id(session_id: str) -> bool:
+    """飞书侧车专用会话前缀；主通道自动续接时应排除，避免污染终端 TUI。"""
+    return (session_id or '').strip().startswith('feishu_')
 
 
 def _other_workspace_owner(session_id: str) -> str | None:
@@ -151,9 +157,13 @@ def list_saved_session_entries(
     directory: Path | None = None,
     *,
     limit: int = 64,
+    exclude_feishu_channel: bool = False,
 ) -> list[tuple[str, int, int, int, Path]]:
     """
     扫描本地会话目录，按修改时间新到旧排序。
+
+    ``exclude_feishu_channel=True`` 时跳过 ``feishu_`` 前缀会话（供主终端「最近会话」与自动续接，
+    不影响 :func:`load_session` 显式加载）。
 
     Returns:
         ``(session_id, message_count, input_tokens, output_tokens, path)`` 列表。
@@ -162,10 +172,11 @@ def list_saved_session_entries(
     if not target_dir.is_dir():
         return []
     rows: list[tuple[str, int, int, int, Path]] = []
-    for path in sorted(target_dir.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)[
-        :limit
-    ]:
+    paths = sorted(target_dir.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in paths:
         sid = path.stem
+        if exclude_feishu_channel and _is_feishu_channel_session_id(sid):
+            continue
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
             msgs = data.get('messages', [])
@@ -175,6 +186,8 @@ def list_saved_session_entries(
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             n, it, ot = -1, 0, 0
         rows.append((sid, n, it, ot, path))
+        if len(rows) >= limit:
+            break
     return rows
 
 
@@ -182,13 +195,18 @@ def most_recent_saved_session_id(directory: Path | None = None) -> str | None:
     """
     返回最近会话 ``session_id``：优先当前工作区 sessions 目录按 mtime；
     若目录为空则回读当前工作区 ``sessions.json`` 中的 ``latest_session_id``（文件仍存在时）。
+
+    **不包含** ``feishu_`` 前缀会话，避免飞书侧车写入的缓存被终端 TUI 自动续接。
+    显式 ``load_session('feishu_...')`` / 无头 ``--session-id feishu_...`` 不受影响。
     """
-    entries = list_saved_session_entries(directory=directory, limit=1)
+    target_dir = directory or resolve_session_dir()
+    entries = list_saved_session_entries(
+        directory=directory, limit=1, exclude_feishu_channel=True
+    )
     if entries:
         sid, n, _, _, _ = entries[0]
         if n >= 0:
             return sid
-    target_dir = directory or resolve_session_dir()
     idx = _sessions_index_path()
     if not idx.is_file():
         return None
@@ -197,6 +215,75 @@ def most_recent_saved_session_id(directory: Path | None = None) -> str | None:
         sid = str(data.get('latest_session_id') or '').strip()
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return None
-    if not sid or not (target_dir / f'{sid}.json').is_file():
+    if (
+        not sid
+        or _is_feishu_channel_session_id(sid)
+        or not (target_dir / f'{sid}.json').is_file()
+    ):
         return None
     return sid
+
+
+def _refresh_sessions_index_after_mutation() -> None:
+    """删除会话文件后重写 ``sessions.json``，使 ``latest_session_id`` 与磁盘一致。"""
+    target_dir = resolve_session_dir()
+    if not target_dir.is_dir():
+        return
+    paths = sorted(target_dir.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+    idx = _sessions_index_path()
+    if not paths:
+        try:
+            idx.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                'version': 1,
+                'workspace_root': str(workspace_root_for_sessions()),
+                'workspace_id': get_workspace_id(workspace_root_for_sessions()),
+                'latest_session_id': '',
+                'latest_session_path': '',
+                'sessions': [],
+            }
+            idx.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+                encoding='utf-8',
+            )
+        except OSError:
+            pass
+        return
+    latest = paths[0]
+    _write_scream_sessions_index(latest.stem, latest)
+
+
+def purge_feishu_channel_artifacts() -> dict[str, Any]:
+    """
+    物理删除当前工作区所有 ``feishu_*.json`` 会话文件；清空项目根下
+    ``.scream_cache/feishu_inbox`` 与 ``feishu_outbox`` 后重建空目录；刷新 ``sessions.json``。
+
+    会话落盘格式不变；仅删除匹配文件。各步骤独立 try/except，避免单文件锁死拖垮调用方。
+    """
+    removed_sessions = 0
+    errors: list[str] = []
+    target_dir = resolve_session_dir()
+    if target_dir.is_dir():
+        for path in target_dir.glob('feishu_*.json'):
+            try:
+                path.unlink()
+                removed_sessions += 1
+            except OSError as exc:
+                errors.append(f'{path}: {exc}')
+
+    root = get_workspace_root()
+    for sub in ('feishu_inbox', 'feishu_outbox'):
+        d = root / '.scream_cache' / sub
+        try:
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            errors.append(f'{d}: {exc}')
+
+    try:
+        _refresh_sessions_index_after_mutation()
+    except OSError as exc:
+        errors.append(f'sessions_index: {exc}')
+
+    return {'removed_feishu_session_files': removed_sessions, 'errors': errors}

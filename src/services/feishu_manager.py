@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -38,6 +40,44 @@ class FeishuManager:
     def _log_path(self) -> Path:
         return self._project_root / 'logs' / 'feishu.log'
 
+    @property
+    def _sidecar_pid_path(self) -> Path:
+        return self._project_root / '.scream_cache' / 'feishu_sidecar.pid'
+
+    def is_sidecar_running(self) -> bool:
+        """
+        侧车是否存活：本进程 ``Popen``、PID 文件 + ``kill(0)``、或 ``pgrep -f feishu_ws_bot.py``。
+        供 TUI 状态栏与 ``start`` 防重复拉起共用。
+        """
+        proc = self._bot_process
+        if proc is not None and proc.poll() is None:
+            return True
+        pid_path = self._sidecar_pid_path
+        try:
+            if pid_path.is_file():
+                raw = pid_path.read_text(encoding='ascii', errors='replace').strip()
+                pid = int(raw, 10)
+                try:
+                    os.kill(pid, 0)
+                    return True
+                except OSError as exc:
+                    if getattr(exc, 'errno', None) == errno.ESRCH:
+                        try:
+                            pid_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+        except (OSError, ValueError):
+            pass
+        try:
+            r = subprocess.run(
+                ['pgrep', '-f', 'feishu_ws_bot.py'],
+                capture_output=True,
+                timeout=0.25,
+            )
+            return r.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+
     def config(self, app_id: str, app_secret: str) -> None:
         app_id = (app_id or '').strip().strip("<>'\"")
         app_secret = (app_secret or '').strip().strip("<>'\"")
@@ -64,12 +104,18 @@ class FeishuManager:
         os.environ['FEISHU_APP_ID'] = app_id
         os.environ['FEISHU_APP_SECRET'] = app_secret
 
-    def start(self) -> None:
+    def start(self) -> str:
+        """
+        启动侧车。若进程已存在（含由其他终端拉起的侧车），返回 ``already_running``；
+        否则拉起子进程并返回 ``started``。
+        """
         script = self._bot_script_path
         if not script.is_file():
             raise FileNotFoundError(f'未找到飞书侧车脚本: {script}')
+        if self.is_sidecar_running():
+            return 'already_running'
         if self._bot_process is not None and self._bot_process.poll() is None:
-            return
+            return 'already_running'
         logs_dir = self._project_root / 'logs'
         os.makedirs(logs_dir, exist_ok=True)
         log_file = open(self._log_path, 'a', encoding='utf-8')
@@ -84,25 +130,54 @@ class FeishuManager:
             stderr=log_file,
         )
         self._log_file_handle = log_file
+        return 'started'
 
     def stop(self) -> None:
+        """终止本进程拉起的侧车；否则按 ``.scream_cache/feishu_sidecar.pid`` 尽力结束外部进程。"""
         proc = self._bot_process
-        if proc is None:
-            return
-        if proc.poll() is None:
-            proc.terminate()
-        self._bot_process = None
-        if self._log_file_handle is not None:
+        if proc is not None and proc.poll() is None:
             try:
-                self._log_file_handle.close()
+                proc.terminate()
             except OSError:
                 pass
-            self._log_file_handle = None
+            self._bot_process = None
+            if self._log_file_handle is not None:
+                try:
+                    self._log_file_handle.close()
+                except OSError:
+                    pass
+                self._log_file_handle = None
+        else:
+            self._bot_process = None
+            if self._log_file_handle is not None:
+                try:
+                    self._log_file_handle.close()
+                except OSError:
+                    pass
+                self._log_file_handle = None
+
+        pid_path = self._sidecar_pid_path
+        try:
+            if pid_path.is_file():
+                raw = pid_path.read_text(encoding='ascii', errors='replace').strip()
+                pid = int(raw, 10)
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                try:
+                    pid_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except (OSError, ValueError):
+            pass
 
     def status(self) -> str:
         proc = self._bot_process
         if proc is not None and proc.poll() is None:
             return f'🟢 运行中 (PID: {proc.pid})'
+        if self.is_sidecar_running():
+            return '🟢 运行中（侧车进程已检测到）'
         return '🔴 已停止'
 
     def tail_log(self, lines: int = 15) -> str:
