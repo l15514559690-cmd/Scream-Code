@@ -1,146 +1,251 @@
-# 🚀 Scream-Code (尖叫Agent终端)v1.1
+# Scream Code
 
-<img width="1085" height="438" alt="image" src="https://github.com/user-attachments/assets/d0d8a0f5-18d7-4575-a517-91d04d99b233" />
+> 一个中文友好、Local-First 的 AI 工程终端。  
+> 目标不是“聊天更花哨”，而是让 AI 在你的机器上接管真实生产力链路。
 
+Scream Code 面向开发者和高强度知识工作者，提供：
 
-> **“让 AI 走出网页聊天框，真正接管你的本地生产力。”**
-
-**Scream-Code** 是一款专为极客、开发者和高效办公族打造的**纯本地、全能力 AI Agent 终端**。它不仅能通过文字回答问题，更拥有“手”（执行代码）、“眼”（网页视觉）和“脑”（长期记忆）。
+- 本地优先：会话、记忆、技能、工具执行全部在你可控的工作区与主机环境
+- 中文优先：交互文案、命令语义、错误提示对中文工作流做过深度适配
+- 双通道网关：终端 TUI 主通道 + 飞书长连接侧车子通道，兼顾本地效率与移动协作
+- 可扩展架构：`SkillsRegistry`（斜杠技能）与 `ToolsRegistry`（LLM 工具）分层解耦
 
 ---
 
-## 🛠️ 第一步：保姆级一键安装指南 (The Magic Install)
+## 愿景与定位
 
-我们为所有用户（无论是小白还是大牛）准备了极其简单的安装流程，只需 3 分钟，即可完成部署。
+Scream Code 不是另一个“会说话的壳”。它的定位是：
 
-### 1. 环境准备 (只需一次)
-在开始之前，请确保你的 Mac 或 Linux 电脑上安装了：
-* **Python 3.10+** (必选)
-* **Git** (必选，用于下载代码)
-* **Docker** (可选，若需开启“绝对安全沙箱”功能则必装)
+- **个人本地生产力接管层**：从读写文件、执行命令、审查改动，到视觉分析、记忆注入，全链路闭环
+- **面向真实项目的工作终端**：有状态会话、会话恢复、长期记忆、沙箱隔离、工具调用治理
+- **中文工程团队默认入口**：降低英文 prompt 成本，让命令、反馈、排障都贴合中文开发语境
 
-### 2. 下载并执行“一键部署脚本”
-打开你的终端（Terminal），依次输入以下三行命令：
+---
+
+## 核心能力总览
+
+### 1) 终端智能体（TUI REPL）
+
+- 流式输出 + 终端 UI 状态栏
+- 历史会话落盘与恢复（支持跨回合上下文管理）
+- `/stop` 生成中断机制
+- Slash 自动补全，按能力域分类
+
+### 2) 本地工具执行与治理
+
+- 内置工具：读写文件、执行命令、记忆操作、文件回传等
+- 工具统一由 `src/tools_registry.py` 注册、分发与执行
+- 技能层与工具层解耦：斜杠技能不直接污染 LLM 函数工具池
+
+### 3) 长期记忆系统
+
+- SQLite 长期记忆槽位（`/memory list/set/drop`）
+- `/memo` 可把当前对话提炼后写入长期记忆
+- 记忆内容可注入系统提示，形成“项目级个性化行为”
+
+### 4) 视觉能力（Playwright）
+
+- `/look <url> [说明]` 获取网页视觉快照
+- 截图可直接进入多模态输入，供模型进行结构/UI/可访问性分析
+
+### 5) 沙箱与系统控制
+
+- `/sandbox on|off|status` 切换 Docker 隔离执行
+- `/doctor`、`/report`、`/status` 提供运行与配置诊断
+
+### 6) 双通道分布式网关（TUI + Feishu Sidecar）
+
+- 主通道：本地终端高频交互
+- 子通道：飞书侧车长连接，支持远程消息和附件收发
+- 飞书会话与主会话隔离（`feishu_` 前缀会话、独立 inbox/outbox）
+- 附件协议：通过 `[FEISHU_FILE:绝对路径]` 标签由侧车转发
+
+---
+
+## 快速开始
+
+### 环境要求
+
+- Python 3.10+
+- Git
+- 可选：Docker（启用沙箱时需要）
+
+### 安装
+
+在仓库根目录执行：
 
 ```bash
-# 1. 下载代码库
-git clone https://github.com/LIUTod/Scream-Code.git
-
-# 2. 进入项目文件夹
-cd Scream-Code
-
-# 3. 运行全自动安装脚本
-bash install.sh
+chmod +x install.sh && ./install.sh
 ```
 
-### Windows 用户一键安装（PowerShell）
-如果你使用 Windows，请在项目根目录执行下面这行命令（可绕过执行策略限制）：
+Windows PowerShell：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-> 若你的终端权限较严，可用“以管理员身份运行 PowerShell”后再执行。安装脚本会自动检测 Python / pip、创建 `.venv`、安装依赖、下载 Playwright Chromium，并在完成后自动启动 `scream`。
+安装脚本会自动完成：
 
-**☕ 这时脚本会自动完成以下动作：**
-* 🔍 **环境体检**：自动检查 Python 和 Pip 是否就绪。
-* 📦 **无污染安装**：创建一个隐藏的虚拟环境 (`.venv`)，绝不弄乱你电脑原本的 Python。
-* 👁️ **视觉内核下载**：静默下载 Playwright 浏览器引擎（AI 的眼睛）。
-* 📂 **私人空间创建**：在你的家目录生成 `~/.scream` 文件夹，用于存放你的 API 密钥和私人记忆。
+- 虚拟环境创建与依赖安装
+- `scream` 可编辑安装
+- Playwright Chromium 准备（视觉能力）
+- 用户目录初始化（`~/.scream`）
 
-### 3. 首次配置与唤醒
-安装完成后，脚本会自动弹出**配置向导**：
-1. 按照提示输入你的 **API Key** (推荐 GLM5.1 或 CLAUDE 系列)。
-2. 配置完成后，直接输入 `scream` 即可起飞！
+### 启动
 
----
-
-## 🎮 核心指令与使用姿势 (How to Play)
-
-Scream-Code 的交互分为三个维度：**系统入口**、**超能力指令**和**人话任务**。
-
-### 维度一：系统控制台 (CLI)
-在任何文件夹下，你都可以直接通过系统命令调用：
-* `scream` —— **启动终端**。一秒进入沉浸式 AI 交互界面。
-* `scream config` —— **设置中心**。随时修改模型型号或更换 API Key。
-* `scream help` —— **极客说明书**。查看更多进阶启动参数。
-
-### 维度二：TUI 内置超能力 (斜杠指令)
-进入 `scream` 终端后，输入 **`/`** 即可触发自动补全菜单：
-
-| 指令 | 能力描述 | 💡 白话文示例 |
-| :--- | :--- | :--- |
-| `/look <网址>` | **视觉洞察** | “帮我看看 `https://apple.com` 最近有什么新产品？” (AI 会截图并分析) |
-| `/mcp browser` | **浏览器MCP模式** | “开启浏览器实时联网控制。” 开启后模型会优先调用 Browser MCP 工具执行搜索/导航。 |
-| `/sandbox on/off`| **物理沙箱** | “穿上防弹衣跑代码。” 开启后，AI 执行的所有危险命令都在 Docker 容器内，绝不伤及主机。 |
-| `/team` | **群狼模式** | “我要打群架！” 召唤 Planner（规划师）和 Coder（程序员）多个 Agent 协作完成复杂大项目。 |
-| `/memory` | **记忆管理** | “看看你记住了我什么偏好。” 查看、删除或清理 AI 学习到的私人开发规矩。 |
-| `/diff` | **代码审计** | “帮我看看我刚才改了啥。” 自动对比 Git 变动，并为你写好 Commit 信息。 |
-| `/clear` | **净化思绪** | “我们换个话题。” 清空当前会话的短期上下文，释放内存。 |
-
-> 使用 `/mcp browser` 前，请先在浏览器扩展商店安装并连接 `browser-mcp` 插件（点击 Connect）。
-
-### 维度三：自然语言下达任务
-**除了斜杠指令，你完全可以用“人话”吩咐它：**
-* *“帮我把下载文件夹里所有的 PDF 文件按日期重命名。”*
-* *“在我当前目录下建一个 FastAPI 的 Demo，并写好 Dockerfile。”*
-* *“以后你写代码时，必须使用 Google 的缩进规范，帮我记住这条。”* (它会自动永久保存进记忆库)
-
----
-
-## 🌟 四大核心引擎：Scream-Code 为什么牛逼？
-
-1.  **🛡️ 绝对安全的 Docker 沙箱 (The Shield)**
-    AI 的代码执行能力是双刃剑。我们通过底层 `sandbox_env.py` 实现了一套镜像隔离系统。AI 在里面随便折腾，你的本地文件系统依然安全。
-2.  **👁️ 睁眼看世界的视觉引擎 (The Vision)**
-    基于 Playwright 深度定制。当 AI 遇到无法通过代码获取的网页信息时，它会主动通过视觉快照捕捉 DOM 结构和 UI 布局。
-3.  **🧠 越用越聪明的长期记忆 (The Brain)**
-    不同于普通的 Chat 机器人，我们内置了 SQLite 数据库。你的每一条反馈、每一个纠正，都会被转化为“潜意识”注入 System Prompt，实现真正的**个性化定制 AI**。
-4.  **⚡ 极速 TUI 交互 (The Interface)**
-    我们解决了终端渲染“抖动”的难题。通过 30fps 的流式缓冲和虚拟代码块闭合技术，让 AI 吐字像丝绸般顺滑，不再有屏幕狂闪的困扰。
-
----
-
-## 🧩 近期引擎层能力（长会话 · 流式 · 稳定）
-
-以下为 Python TUI / `query_engine` 路径上的增强，便于你理解「后台在干什么」：
-
-| 能力 | 说明 |
-| :--- | :--- |
-| **无感上下文压缩** | 当发往模型的非 `system` 消息条数超过阈值时，会在**本轮用户消息写入会话前**对 `llm_conversation_messages` 做摘要折叠（`src/context_compressor.py` + `check_and_compress_history`）。成功则落盘会话 JSON，终端可出现一行 `[🧠 历史记忆已折叠，释放上下文空间...]`；摘要请求失败则静默跳过，不影响当轮对话。 |
-| **流式时仍可打断** | 大模型生成时底部输入区保持可用；仅允许提交 `/stop` 终止当前生成（`replLauncher` 并发路径）。回合结束后会清空 `PromptSession.validator`，避免下一轮仍卡在「只能输 /stop」的假象。 |
-| **LLM 网络熔断** | `llm_settings` 中配置连接/读超时；超时或网络异常时以友好文案结束当轮，而不是无限挂死（详见 `llm_client`）。 |
-| **助手定稿去重** | 流式结束写入 scrollback 前，对相邻重复的段落/行做一次折叠，减轻自我介绍等内容的「重影」感。 |
-| **人设与系统提示** | 核心人格与工具纪律集中在 `src/agent/prompt_builder.py` 的 `SYSTEM_PROMPT_CORE`，由 `system_init.build_system_init_message` 与项目记忆、沙箱策略等运行时片段拼接后注入每条 system。 |
-
----
-
-## 👨‍💻 开发者进阶：定制你的专属 Skill
-
-仓库根目录下的 `skills/` **默认可为空**（仅保留占位 `.gitkeep`）；推荐把自定义斜杠技能放在用户目录 **`~/.scream/skills/`**，与项目仓库解耦、升级时不易冲突。
-
-你可以像堆乐高一样给 Scream-Code 加功能。在 `~/.scream/skills/` 下新建一个 Python 文件，例如：
-
-```python
-from src.skills.base_skill import BaseSkill
-
-class MyCoolTool(BaseSkill):
-    name = "coffee"  # 指令词：/coffee
-    description = "帮我点一杯咖啡"
-    
-    def execute(self, flavor: str):
-        # 在这里写你的自动化逻辑
-        return f"已为你下单一杯 {flavor} 咖啡！"
+```bash
+scream
 ```
 
-**重启 `scream`，你的 AI 就瞬间进化了。**
+常用入口：
+
+- `scream`：进入主交互
+- `scream config`：配置模型与密钥
+- `scream help`：查看 CLI 帮助
 
 ---
 
-## 📜 结语
-**Scream-Code** 不只是一个工具，它是你的**数字分身**。它在你的终端里静静待命，懂你的规矩，看你的屏幕，干你的苦活。
+## 配置与安全边界
 
-*现在，可以尝试运行 `./install.sh`，感受本地 AI 的终极力量吧！*
+### 配置位置（用户级）
 
-## ☀️ 关于
-**Scream-Code**  中的部分逻辑，参考了Claude、Claw、Hermes等Agent，并加以改进，强化了中文场景下的各类指令调用与工作流定制，本项目仅供学习参考，欢迎大家交流沟通
+- `~/.scream/llm_config.json`：模型与路由配置
+- `~/.scream/.env`：密钥等敏感配置
+
+### 仓库忽略策略
+
+仓库默认忽略敏感/运行态目录（如 `.env`、`/.scream_cache/`），避免误提交密钥和缓存。
+
+### 飞书侧车缓存
+
+- 入站：`.scream_cache/feishu_inbox/`
+- 出站：`.scream_cache/feishu_outbox/`
+- PID：`.scream_cache/feishu_sidecar.pid`
+
+---
+
+## 斜杠命令总表（完整）
+
+> 说明：以下命令来自当前代码注册表；`/` 补全会按分类展示。
+
+### Core
+
+| 命令 | 说明 | 典型用法 |
+| --- | --- | --- |
+| `/help` | 指令总览（别名 `/?`） | `/help` |
+| `/clear` | 清屏（不等于清空会话） | `/clear` |
+| `/exit` | 退出 | `/exit` |
+| `/quit` | 退出（同 `/exit`） | `/quit` |
+
+### Memory / Context
+
+| 命令 | 说明 | 典型用法 |
+| --- | --- | --- |
+| `/summary` | 生成项目与会话摘要，可选择写入长期记忆 | `/summary` |
+| `/memo` | 提炼并保存当前对话核心记忆；可直接写入文本 | `/memo` / `/memo 团队偏好：默认先写测试` |
+| `/new` | 硬重置会话（新 session） | `/new` |
+| `/flush` | 清空当前对话并重置 token 累计 | `/flush` |
+| `/stop` | 中断当前生成/工具链 | `/stop` |
+| `/sessions` | 查看本地会话列表 | `/sessions` |
+| `/load <session_id>` | 加载指定会话 | `/load 8f2a...` |
+
+### Vision
+
+| 命令 | 说明 | 典型用法 |
+| --- | --- | --- |
+| `/look <url> [说明]` | 网页视觉快照并可触发后续分析 | `/look https://example.com 检查可读性` |
+
+### System & Ops
+
+| 命令 | 说明 | 典型用法 |
+| --- | --- | --- |
+| `/memory` | SQLite 长期记忆管理 | `/memory list` / `/memory set code_style 统一ruff` / `/memory drop code_style` |
+| `/sandbox` | Docker 沙箱开关/状态 | `/sandbox status` / `/sandbox on` / `/sandbox off` |
+| `/diff` | Git 工作区变更摘要 | `/diff` |
+| `/mcp` | MCP 状态、重启、工具、浏览器模式 | `/mcp status` / `/mcp restart` / `/mcp tools` / `/mcp browser` |
+| `/feishu` | 飞书侧车控制台 | 见下方子命令 |
+| `/audit` | 项目对齐度审查 | `/audit` |
+| `/report` | setup-report 体检 | `/report` |
+| `/subsystems` | 顶层子系统视图 | `/subsystems` |
+| `/graph` | bootstrap + command 图谱 | `/graph` |
+| `/config` | 当前模型配置 JSON 展示 | `/config` |
+| `/skills` | 已挂载技能/插件列表 | `/skills` |
+| `/doctor` | 运行环境与依赖体检 | `/doctor` |
+| `/cost` | token 与费用估算 | `/cost` |
+| `/status` | 当前运行状态总览 | `/status` |
+| `/team` | 切换多 Agent 团队模式 | `/team` |
+| `$team <prompt>` | 单条消息走团队模式 | `$team 先评审再改` |
+
+### `/feishu` 子命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `/feishu config <AppID> <AppSecret>` | 写入或更新飞书凭据 |
+| `/feishu start` | 启动侧车（已运行则跳过） |
+| `/feishu stop` | 停止侧车 |
+| `/feishu delete` | 清理飞书会话与缓存 |
+| `/feishu clear` | 同 `delete` |
+| `/feishu status` | 查看侧车状态 |
+| `/feishu log` | 查看侧车日志 |
+| `/feishu help` | 查看帮助 |
+
+> 建议：执行 `/feishu delete` 前先 `/feishu stop`，避免运行中的侧车继续写入缓存。
+
+---
+
+## 架构分层（实现视角）
+
+- `src/main.py`：CLI 入口与路由
+- `src/tui_app.py` / `src/replLauncher.py`：TUI 与 REPL 主循环
+- `src/query_engine.py`：会话、模型交互、工具编排核心
+- `src/skills_registry.py` + `src/skills/`：斜杠技能系统
+- `src/tools_registry.py`：LLM 工具注册与执行
+- `src/session_store.py`：会话落盘、索引、隔离与清理
+- `bots/feishu_ws_bot.py`：飞书长连接侧车
+- `src/services/feishu_manager.py`：侧车生命周期管理
+
+---
+
+## 可扩展性
+
+### 自定义斜杠技能
+
+将技能文件放入 `~/.scream/skills/`，重启后自动加载（覆盖同名内置技能）。
+
+### 自定义 LLM 工具
+
+将工具模块放到项目根 `skills/*.py`，导出：
+
+- `TOOL_SCHEMA`
+- `execute(**kwargs)`
+
+工具会被 `ToolsRegistry` 自动发现并注册。
+
+---
+
+## 研发与验证
+
+常用本地验证：
+
+```bash
+python3 -m pytest -q
+```
+
+Rust 工作区验证（如需）：
+
+```bash
+cd rust
+cargo fmt
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+---
+
+## 许可证
+
+MIT License。详见 `LICENSE`。
+
+---
+
+Scream Code 的核心理念：**让 AI 真正成为你本地生产系统的一部分，而不是浏览器里的临时聊天窗口。**
