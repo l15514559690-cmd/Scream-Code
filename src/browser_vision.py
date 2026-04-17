@@ -10,8 +10,51 @@ from typing import Any
 from urllib.parse import urlparse
 
 _DEFAULT_NAV_TIMEOUT_MS = 15_000
-_POST_DOM_LOAD_PAUSE_SEC = 0.35
+_POST_DOM_LOAD_PAUSE_SEC = 1.0
+_POST_LOAD_EXTRA_WAIT_MS = 8_000
+_NETWORK_IDLE_WAIT_MS = 5_000
 _VIEWPORT = {'width': 1280, 'height': 720}
+# 当调用方请求「长图」模式时，仍避免 Playwright full_page 超长图导致下游压缩失真：默认只截顶区。
+_DEFAULT_MAX_CAPTURE_HEIGHT = 2400
+
+
+def _sanitize_css_token_value(value: Any, *, depth: int = 0) -> Any:
+    """将 ``page.evaluate`` 返回值整理为 JSON 安全结构，控制嵌套深度。"""
+    if depth > 8:
+        return None
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        return s if s else None
+    if isinstance(value, list):
+        out: list[Any] = []
+        for item in value[:64]:
+            v = _sanitize_css_token_value(item, depth=depth + 1)
+            if v is not None:
+                out.append(v)
+        return out
+    if isinstance(value, dict):
+        out_d: dict[str, Any] = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                continue
+            kk = k.strip()
+            if not kk:
+                continue
+            vv = _sanitize_css_token_value(v, depth=depth + 1)
+            if vv is not None:
+                out_d[kk] = vv
+        return out_d if out_d else None
+    return None
+
+
+def _sanitize_css_tokens(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    cleaned = _sanitize_css_token_value(raw, depth=0)
+    return cleaned if isinstance(cleaned, dict) else {}
+
 
 # 唯一允许的截图根目录（绝对路径，禁止写入桌面或其它任意路径）
 def _screenshots_root() -> Path:
@@ -204,8 +247,11 @@ def _capture_with_playwright_impl(
     normalized: str,
     out_file: Path,
     console: Any | None,
-) -> Path:
-    """Playwright 无头 Chromium 仅截取 **网页 DOM**；成功返回绝对路径。"""
+    *,
+    full_page: bool,
+    max_capture_height: int | None,
+) -> tuple[Path, dict[str, Any]]:
+    """Playwright 无头 Chromium 截取 **网页 DOM**；成功返回 ``(绝对路径, css_tokens)``。"""
     try:
         with _rich_status(console, '📸 正在捕获网页快照…'):
             with sync_playwright() as p:
@@ -229,15 +275,142 @@ def _capture_with_playwright_impl(
                     except Exception as exc:
                         raise BrowserVisionError(_format_nav_error(exc)) from exc
 
+                    # 先等 DOM 就绪，再等资源与网络相对稳定，避免页面未加载完全就截图。
+                    try:
+                        page.wait_for_load_state('load', timeout=_POST_LOAD_EXTRA_WAIT_MS)
+                    except Exception:
+                        pass
+                    try:
+                        page.wait_for_load_state('networkidle', timeout=_NETWORK_IDLE_WAIT_MS)
+                    except Exception:
+                        pass
                     time.sleep(_POST_DOM_LOAD_PAUSE_SEC)
 
-                    out_file.parent.mkdir(parents=True, exist_ok=True)
+                    # 在截图前提取用于复刻 UI 的 CSS Design Tokens（失败不影响截图）。
+                    tokens: Any = {}
                     try:
-                        page.screenshot(
-                            path=str(out_file),
-                            full_page=True,
-                            type='png',
+                        tokens = page.evaluate(
+                            r"""
+() => {
+  const pick = (v) => (typeof v === 'string' ? v.trim() : '');
+  const root = document.documentElement;
+  const body = document.body;
+  const rootStyle = root ? getComputedStyle(root) : null;
+  const bodyStyle = body ? getComputedStyle(body) : null;
+
+  const bodyTokens = {
+    background_color: bodyStyle ? pick(bodyStyle.backgroundColor) : '',
+    color: bodyStyle ? pick(bodyStyle.color) : '',
+    font_family: bodyStyle ? pick(bodyStyle.fontFamily) : '',
+    font_size: bodyStyle ? pick(bodyStyle.fontSize) : '',
+    line_height: bodyStyle ? pick(bodyStyle.lineHeight) : '',
+    letter_spacing: bodyStyle ? pick(bodyStyle.letterSpacing) : '',
+  };
+
+  const rootTokens = {
+    background_color: rootStyle ? pick(rootStyle.backgroundColor) : '',
+    color: rootStyle ? pick(rootStyle.color) : '',
+    font_family: rootStyle ? pick(rootStyle.fontFamily) : '',
+    font_size: rootStyle ? pick(rootStyle.fontSize) : '',
+  };
+
+  const sampleEl = (el) => {
+    if (!el) return null;
+    const cs = getComputedStyle(el);
+    return {
+      tag: (el.tagName || '').toLowerCase(),
+      className: typeof el.className === 'string' ? pick(el.className).slice(0, 120) : '',
+      text_preview: pick((el.textContent || '').replace(/\s+/g, ' ')).slice(0, 80),
+      background_color: pick(cs.backgroundColor),
+      color: pick(cs.color),
+      border_radius: pick(cs.borderRadius),
+      box_shadow: pick(cs.boxShadow),
+      padding: pick(cs.padding),
+      margin: pick(cs.margin),
+      font_size: pick(cs.fontSize),
+      font_weight: pick(cs.fontWeight),
+      font_family: pick(cs.fontFamily),
+    };
+  };
+
+  const btnSelectors =
+    'button, [role="button"], input[type="button"], input[type="submit"], a.button, .btn, [class*="btn"]';
+  const buttonNodes = Array.from(document.querySelectorAll(btnSelectors)).slice(0, 12);
+  const buttons_sample = buttonNodes.map(sampleEl).filter(Boolean);
+
+  const linkNodes = Array.from(document.querySelectorAll('a[href]')).slice(0, 10);
+  const links_sample = linkNodes.map(sampleEl).filter(Boolean);
+
+  let theme_button_background = '';
+  for (const row of buttons_sample) {
+    const bg = row.background_color || '';
+    if (bg && !/rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)|transparent/i.test(bg)) {
+      theme_button_background = bg;
+      break;
+    }
+  }
+  const firstLink = document.querySelector('a[href]');
+  const theme_link_color = firstLink ? pick(getComputedStyle(firstLink).color) : '';
+
+  return {
+    body: bodyTokens,
+    root: rootTokens,
+    buttons_sample,
+    links_sample,
+    theme_candidate: {
+      button_background: theme_button_background,
+      link_color: theme_link_color,
+    },
+  };
+}
+                            """
                         )
+                    except Exception:
+                        tokens = {}
+
+                    out_file.parent.mkdir(parents=True, exist_ok=True)
+                    screenshot_kwargs: dict[str, Any] = {
+                        'path': str(out_file),
+                        'type': 'png',
+                    }
+                    if full_page:
+                        # 不使用 Playwright ``full_page=True`` 拼接超长整页图，改为从视口顶向下裁剪，质量更稳。
+                        height_limit = (
+                            max_capture_height
+                            if isinstance(max_capture_height, int) and max_capture_height > 0
+                            else _DEFAULT_MAX_CAPTURE_HEIGHT
+                        )
+                        try:
+                            page_w = (
+                                int(page.viewport_size['width'])
+                                if page.viewport_size
+                                else _VIEWPORT['width']
+                            )
+                        except Exception:
+                            page_w = _VIEWPORT['width']
+                        try:
+                            page_h = int(
+                                page.evaluate(
+                                    """
+() => Math.max(
+  document.documentElement?.scrollHeight || 0,
+  document.body?.scrollHeight || 0,
+  document.documentElement?.clientHeight || 0
+)
+                                    """
+                                )
+                            )
+                        except Exception:
+                            page_h = height_limit
+                        clip_h = max(1, min(page_h, height_limit))
+                        screenshot_kwargs['clip'] = {
+                            'x': 0,
+                            'y': 0,
+                            'width': page_w,
+                            'height': clip_h,
+                        }
+                    try:
+                        page.screenshot(**screenshot_kwargs)
                     except OSError as exc:
                         raise BrowserVisionError(
                             f'[BrowserVision] 无法写入截图文件: {type(exc).__name__}: {exc}'
@@ -265,15 +438,17 @@ def _capture_with_playwright_impl(
         resolved.relative_to(root)
     except ValueError as exc:
         raise BrowserVisionError('[BrowserVision] 内部错误: 截图未写入受控目录。') from exc
-    return resolved
+    cleaned_tokens = _sanitize_css_tokens(tokens)
+    return resolved, cleaned_tokens
 
 
 class BrowserVisionEngine:
     """
-    基于 Playwright Chromium（**无头**）的整页 **网页 DOM** 截图。
+    基于 Playwright Chromium（**无头**）的 **网页 DOM** 截图。
 
     - **绝不**使用系统原生截屏（screencapture / ImageGrab / pyautogui 等）。
     - 输出 **仅** 写入 ``~/.scream/screenshots/``。
+    - 默认截取当前视口；可选「长图」模式为自顶向下裁剪（有高度上限），避免超长整页图在下游被压缩。
     """
 
     def capture_page(
@@ -281,12 +456,16 @@ class BrowserVisionEngine:
         url: str,
         *,
         console: Any | None = None,
-    ) -> str:
+        full_page: bool = False,
+        max_capture_height: int | None = None,
+    ) -> dict[str, Any]:
         """
-        打开 ``url`` 并保存整页截图。
+        打开 ``url`` 并保存截图，同时在截图前提取 CSS Design Tokens。
 
         Returns:
-            成功时为 ``~/.scream/screenshots/`` 下文件的绝对路径字符串。
+            ``{"screenshot_path": "<绝对路径>", "css_tokens": {...}}``。
+            默认仅截取当前视口（``full_page=False``），以提高 LLM 读图清晰度。
+            ``full_page=True`` 时从页面顶部向下裁剪，高度上限为 ``max_capture_height`` 或内置默认。
 
         Raises:
             BrowserVisionFatalInstallError: 自动安装失败（已绘制 Fatal Panel）。
@@ -314,8 +493,13 @@ class BrowserVisionEngine:
                 )
 
         try:
-            path = _capture_with_playwright_impl(
-                sync_pw, normalized, out_file, console
+            path, css_tokens = _capture_with_playwright_impl(
+                sync_pw,
+                normalized,
+                out_file,
+                console,
+                full_page=full_page,
+                max_capture_height=max_capture_height,
             )
         except BrowserVisionError as first:
             if not _is_chromium_launch_failure(first):
@@ -328,10 +512,18 @@ class BrowserVisionEngine:
                     detail or f'退出码 {code}',
                     prior=str(first),
                 )
-            path = _capture_with_playwright_impl(
-                sync_pw, normalized, out_file, console
+            path, css_tokens = _capture_with_playwright_impl(
+                sync_pw,
+                normalized,
+                out_file,
+                console,
+                full_page=full_page,
+                max_capture_height=max_capture_height,
             )
-        return str(path)
+        return {
+            'screenshot_path': str(path),
+            'css_tokens': css_tokens,
+        }
 
 
 __all__ = [
