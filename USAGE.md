@@ -121,6 +121,20 @@ Runtime config is loaded in this order, with later entries overriding earlier on
 4. `<repo>/.claw/settings.json`
 5. `<repo>/.claw/settings.local.json`
 
+## Human-in-the-loop approvals and allowlist
+
+Scream Code TUI enables human-in-the-loop approval for sensitive tool calls (for example file writes, patch operations, and shell execution). When a sensitive tool is about to run, the terminal asks for explicit `y/n` confirmation.
+
+For trusted high-frequency actions, you can add a project-level allowlist in `<repo>/.claw.json`:
+
+```json
+{
+  "auto_approve_tools": ["write_local_file", "patch"]
+}
+```
+
+Tools listed in `auto_approve_tools` are silently approved for that repository; other sensitive tools still require manual confirmation.
+
 ## Mock parity harness
 
 The workspace includes a deterministic Anthropic-compatible mock service and parity harness.

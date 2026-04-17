@@ -27,6 +27,12 @@ _BRAND_SOFT = '#A5B4FC'
 _ASSISTANT_SURFACE = '#161622'
 _USER_ACCENT = '#c4b5fd'
 _current_team_agent: str | None = None
+_FEISHU_STATUS_CACHE: dict[str, Any] = {
+    'status': False,
+    'raw_status': False,
+    'last_raw_change': 0.0,
+}
+_FEISHU_STATUS_DEBOUNCE_SEC = 3.0
 
 
 def set_current_team_agent(agent_name: str | None) -> None:
@@ -52,6 +58,7 @@ def _build_tui_prompt_session() -> Any:
     """
     try:
         from prompt_toolkit import PromptSession
+        from prompt_toolkit.shortcuts import CompleteStyle
         from prompt_toolkit.completion import ThreadedCompleter
         from prompt_toolkit.history import InMemoryHistory
     except ImportError as exc:  # pragma: no cover
@@ -87,6 +94,8 @@ def _build_tui_prompt_session() -> Any:
         'history': history,
         'completer': completer,
         'complete_while_typing': True,
+        'complete_style': CompleteStyle.MULTI_COLUMN,
+        'reserve_space_for_menu': 8,
         'validate_while_typing': False,
         # 禁用鼠标协议，滚动交给 macOS Terminal / iTerm 等原生处理，避免滚轮「卡死」
         'mouse_support': False,
@@ -235,10 +244,83 @@ def neural_status_fields(engine: Any) -> dict[str, Any]:
     }
 
 
-def neural_status_stream_footer_markup(engine: Any) -> str:
-    """Rich ``Text.from_markup`` 单行；与底栏语义对齐，嵌入 ``Live`` 底部。"""
-    from .ui.status_bar import feishu_stream_rich_fragment
+def _token_progress_bar(token_pct: int) -> dict[str, Any]:
+    """
+    10 格 Token 进度条（``█`` / ``░``），并给出 HTML/Rich 对应色。
 
+    - <50%: Safe (green)
+    - 50%-85%: Warning (yellow)
+    - >85%: Danger (red)
+    """
+    pct = max(0, min(100, int(token_pct)))
+    filled = min(10, max(0, (pct + 5) // 10))
+    empty = 10 - filled
+    filled_bar = '█' * filled
+    empty_bar = '░' * empty
+    if pct < 50:
+        level = 'safe'
+        html_color = 'ansigreen'
+        rich_color = '#4ade80'
+    elif pct <= 85:
+        level = 'warning'
+        html_color = 'ansiyellow'
+        rich_color = '#facc15'
+    else:
+        level = 'danger'
+        html_color = 'ansired'
+        rich_color = '#f87171'
+    return {
+        'pct': pct,
+        'filled': filled_bar,
+        'empty': empty_bar,
+        'level': level,
+        'html_color': html_color,
+        'rich_color': rich_color,
+    }
+
+
+def _debounced_feishu_running() -> bool:
+    from .ui.status_bar import is_feishu_running
+
+    now = time.monotonic()
+    raw = bool(is_feishu_running())
+    if raw != bool(_FEISHU_STATUS_CACHE.get('raw_status', False)):
+        _FEISHU_STATUS_CACHE['raw_status'] = raw
+        _FEISHU_STATUS_CACHE['last_raw_change'] = now
+    effective = raw
+    if (
+        not raw
+        and bool(_FEISHU_STATUS_CACHE.get('status', False))
+        and (now - float(_FEISHU_STATUS_CACHE.get('last_raw_change', 0.0)))
+        < _FEISHU_STATUS_DEBOUNCE_SEC
+    ):
+        # 短时间 OFF 抖动：维持上一帧 ON，避免底栏闪烁。
+        effective = True
+    _FEISHU_STATUS_CACHE['status'] = bool(effective)
+    return bool(effective)
+
+
+def _feishu_stream_fragment_debounced() -> str:
+    on = _debounced_feishu_running()
+    if on:
+        return '  ·  [bold #4F46E5 on #09090b][● Feishu: ON][/bold #4F46E5 on #09090b]'
+    return (
+        '  ·  [dim #71717a][○ Feishu: OFF][/dim #71717a] '
+        '[dim #52525b]（/feishu start）[/dim #52525b]'
+    )
+
+
+def _feishu_toolbar_fragment_debounced() -> str:
+    if _debounced_feishu_running():
+        return '<style fg="#4F46E5"><b>[● Feishu: ON]</b></style>'
+    return (
+        '<style fg="#71717a"><b>[○ Feishu: OFF]</b></style>  '
+        '<style fg="#52525b">· /feishu start 开启侧车</style>'
+    )
+
+
+def neural_status_stream_footer_markup(engine: Any) -> str:
+    """Rich ``Text.from_markup`` 双行仪表盘；与底栏语义/层级对齐，嵌入 ``Live`` 底部。"""
     f = neural_status_fields(engine)
     sb_on = (
         '[bold #4ade80]🛡️ 沙箱: ON[/bold #4ade80]'
@@ -246,16 +328,23 @@ def neural_status_stream_footer_markup(engine: Any) -> str:
         else '[bold #f87171]🔓 沙箱: OFF[/bold #f87171]'
     )
     team = '[bold #fbbf24]🐺 TEAM[/bold #fbbf24]' if f['team'] else '[dim]单人[/dim]'
-    pct = f['token_pct']
-    pct_style = '#fbbf24' if pct >= 85 else '#34d399' if pct < 50 else '#2dd4bf'
-    feishu_seg = feishu_stream_rich_fragment()
+    tok = _token_progress_bar(f['token_pct'])
+    feishu_seg = _feishu_stream_fragment_debounced()
+    level_txt = (
+        'Safe'
+        if tok['level'] == 'safe'
+        else 'Warning'
+        if tok['level'] == 'warning'
+        else 'Danger'
+    )
     return (
-        f'[{_BRAND_HEX}]◈ NEURAL·BAR[/]  '
-        f'[bold #2dd4bf][{f["model"]}][/bold #2dd4bf]  ·  {sb_on}  ·  '
-        f'[bold #5eead4]🧠 记忆: {f["memory_n"]}条[/bold #5eead4]  ·  '
-        f'[bold {pct_style}]📊 Token: {pct}%[/bold {pct_style}] '
-        f'[dim](Σ {f["total_tokens"]})[/dim]  ·  {team}'
-        f'{feishu_seg}'
+        '[dim #6b7280]╭─ Neural Console ───────────────────────────────────────────────[/dim #6b7280]\n'
+        f'[{_BRAND_HEX}]◈[/] [bold #2dd4bf][{f["model"]}][/bold #2dd4bf]  │  {sb_on}  │  '
+        f'[bold #5eead4]🧠 记忆: {f["memory_n"]}条[/bold #5eead4]  │  {team}{feishu_seg}\n'
+        f'[dim #6b7280]╰─[/dim #6b7280] '
+        f'[bold {tok["rich_color"]}]📊 Token [{tok["filled"]}{tok["empty"]}] {tok["pct"]}%[/bold {tok["rich_color"]}] '
+        f'[dim](Σ {f["total_tokens"]})[/dim]  [dim]|[/dim]  '
+        f'[bold {tok["rich_color"]}]{level_txt}[/bold {tok["rich_color"]}]'
     )
 
 
@@ -322,39 +411,75 @@ def _get_bottom_toolbar(engine: Any) -> Any:
     import html as html_mod
 
     from .main import render_mcp_online_toolbar_badge
-    from .ui.status_bar import feishu_toolbar_html_fragment
 
     f = neural_status_fields(engine)
     m = html_mod.escape(f['model'])
     sb_txt = '🛡️ 沙箱: ON' if f['sandbox_on'] else '🔓 沙箱: OFF'
     sb_cls = 'ansigreen' if f['sandbox_on'] else 'ansired'
-    pct = f['token_pct']
-    pct_cls = 'ansiyellow' if pct >= 85 else 'ansigreen' if pct < 50 else 'ansicyan'
+    tok = _token_progress_bar(f['token_pct'])
+    token_bar = f'[{tok["filled"]}{tok["empty"]}] {tok["pct"]}%'
     team = (
         '<ansiyellow><b>🐺 TEAM</b></ansiyellow>'
         if f['team']
         else '<ansibrightblack>单人</ansibrightblack>'
     )
     web_badge = render_mcp_online_toolbar_badge(engine)
-    feishu_seg = feishu_toolbar_html_fragment()
+    feishu_seg = _feishu_toolbar_fragment_debounced()
     return HTML(
         ' '
+        '<ansibrightblack>╭─ Neural Console ───────────────────────────────────────────────</ansibrightblack>\n'
         f'{web_badge}'
         '<ansicyan><b>◈</b></ansicyan> '
         f'<ansigreen><b>[{m}]</b></ansigreen>  '
-        '<ansiblue>│</ansiblue>  '
+        '<ansiblue>║</ansiblue>  '
         f'<{sb_cls}><b>{html_mod.escape(sb_txt)}</b></{sb_cls}>  '
-        '<ansiblue>│</ansiblue>  '
+        '<ansiblue>║</ansiblue>  '
         '<ansicyan><b>🧠 记忆</b></ansicyan> '
         f'<ansigreen><b>{f["memory_n"]}条</b></ansigreen>  '
-        '<ansiblue>│</ansiblue>  '
-        '<ansicyan><b>📊 Token</b></ansicyan> '
-        f'<{pct_cls}><b>{pct}%</b></{pct_cls}>  '
-        f'<ansibrightblack>Σ {f["total_tokens"]}</ansibrightblack>  '
-        '<ansiblue>│</ansiblue>  '
+        '<ansiblue>║</ansiblue>  '
         f'{team}  '
-        '<ansiblue>│</ansiblue>  '
-        f'{feishu_seg}  '
+        '<ansiblue>║</ansiblue>  '
+        f'{feishu_seg}\n'
+        ' '
+        '<ansibrightblack>╰─</ansibrightblack> '
+        '<ansicyan><b>📊 Token</b></ansicyan> '
+        f'<{tok["html_color"]}><b>{html_mod.escape(token_bar)}</b></{tok["html_color"]}>  '
+        f'<ansibrightblack>Σ {f["total_tokens"]}</ansibrightblack>  '
+        '<ansibrightblack>|</ansibrightblack>  '
+        f'<{tok["html_color"]}>'
+        + ('Safe' if tok['level'] == 'safe' else 'Warning' if tok['level'] == 'warning' else 'Danger')
+        + f'</{tok["html_color"]}>'
+    )
+
+
+def _active_context_files(engine: Any) -> list[str]:
+    raw = getattr(engine, 'active_context_files', None)
+    if not isinstance(raw, set) or not raw:
+        return []
+    rows = [x for x in raw if isinstance(x, str) and x.strip()]
+    rows.sort()
+    return rows[:6]
+
+
+def _render_context_tray_html(engine: Any) -> str:
+    import html as html_mod
+
+    items = _active_context_files(engine)
+    if not items:
+        return ''
+    max_tray_files = 5
+    shown = items[:max_tray_files]
+    remain = max(0, len(items) - max_tray_files)
+    chips = '  '.join(
+        f'<style fg="ansicyan">📎 {html_mod.escape(p)}</style>' for p in shown
+    )
+    if remain > 0:
+        chips += (
+            f'  <style fg="ansibrightblack">...另有 {remain} 个文件</style>'
+        )
+    return (
+        '<style fg="ansibrightblack">🗂️ Context:</style> '
+        f'{chips}\n'
     )
 
 
@@ -446,7 +571,14 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
         _invalidate_prompt()
 
     # 靛蓝品牌提示符：须为严格 XML（勿用 `<style ... bold>` 无值属性，会触发 ExpatError）
-    prompt_html = HTML(f'<style fg="{_BRAND_HEX}"><b>尖叫&gt; </b></style>')
+    input_divider = '<style fg="ansibrightblack">╭─ Input ─────────────────────────────────────────────────────</style>'
+
+    def idle_prompt_html() -> Any:
+        tray = _render_context_tray_html(engine)
+        return HTML(
+            f'{tray}{input_divider}\n'
+            f'<style fg="{_BRAND_HEX}"><b>尖叫&gt; </b></style>'
+        )
 
     def generating_prompt_html() -> Any:
         team_agent = get_current_team_agent()
@@ -470,13 +602,14 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
             '\n'
             f'{tip}'
             f'{err}\n'
+            f'{_render_context_tray_html(engine)}{input_divider}\n'
             f'<style fg="{_BRAND_HEX}"><b> 尖叫&gt; </b></style>'
         )
 
     while True:
         try:
             line = session.prompt(
-                prompt_html,
+                idle_prompt_html(),
                 bottom_toolbar=lambda: _get_bottom_toolbar(engine),
             ).strip()
         except (EOFError, KeyboardInterrupt) as exc:

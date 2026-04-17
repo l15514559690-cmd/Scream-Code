@@ -40,6 +40,29 @@ def reload_project_claw_json() -> dict[str, Any]:
     return load_project_claw_json(force_reload=True)
 
 
+def get_auto_approve_tools(*, force_reload: bool = False) -> set[str]:
+    """
+    读取 ``.claw.json`` 中 ``auto_approve_tools`` 白名单。
+
+    约定格式：
+    ``{"auto_approve_tools": ["write_local_file", "patch"]}``
+
+    返回值始终为小写工具名集合；缺失或格式不合法时返回空集合。
+    """
+    cfg = load_project_claw_json(force_reload=force_reload)
+    raw = cfg.get('auto_approve_tools')
+    if not isinstance(raw, list):
+        return set()
+    out: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        t = item.strip().lower()
+        if t:
+            out.add(t)
+    return out
+
+
 def is_product_session_ready() -> bool:
     """
     产品入口用：大模型侧（API Key 等）是否已就绪。

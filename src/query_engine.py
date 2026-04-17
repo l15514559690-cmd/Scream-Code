@@ -771,6 +771,9 @@ class QueryEnginePort:
         多代理编排：Planner（无工具）→ Coder（全量工具）→ Reviewer（无工具），
         顺序调用 ``iter_agent_executor_events``，共享 ``llm_conversation_messages``。
         """
+        import re
+
+        from .coordinator.team_roles import TeamRole, get_team_role_prompt
         from .llm_client import iter_agent_executor_events
         from .llm_settings import read_llm_connection_settings
 
@@ -802,28 +805,27 @@ class QueryEnginePort:
         self.check_and_compress_history(settings, model_override)
         self._emit_pre_llm_context_soft_warning()
 
-        phases: tuple[tuple[str, str, bool], ...] = (
-            (
-                'Planner',
-                base_user
-                + '\n\n【多代理·Planner】你是项目的首席架构师。请对用户的需求进行拆解，只输出简洁的 Todo 任务列表（Markdown Checkbox格式）。绝对不要写具体的代码，绝对不要调用工具。',
-                False,
-            ),
-            (
-                'Coder',
-                '【多代理·Coder】你是核心开发工程师。请严格按照上述 Planner 的任务拆解，逐步实现代码或执行系统命令。你有权调用所有系统工具。不要推脱，立即执行落地。',
-                True,
-            ),
-            (
-                'Reviewer',
-                "【多代理·Reviewer】你是代码审查专家。请对 Coder 刚刚输出的代码和执行结果进行 Review，指出潜在的安全隐患、Bug 或性能问题。如果一切完美，请输出'审查通过'。不要调用任何工具。",
-                False,
-            ),
-        )
-
         combined_chunks: list[str] = []
+        analyst_delta_chunks: list[str] = []
+        analyst_full_text = ''
+        planner_seed = ''
+        planner_plan = ''
         phase_in = 0
         phase_out = 0
+        max_iterations = 3
+
+        def _extract_analyst_deliverable(full_text: str) -> str:
+            raw = str(full_text or '').strip()
+            if not raw:
+                return ''
+            m = re.search(
+                r'<deliverable>\s*(.*?)\s*</deliverable>', raw, flags=re.I | re.S
+            )
+            if m:
+                body = (m.group(1) or '').strip()
+                if body:
+                    return body
+            return raw
 
         self.mark_stream_generation_start()
         try:
@@ -836,17 +838,112 @@ class QueryEnginePort:
                         ),
                     }
                     self._just_compressed = False
-                for agent_label, user_text, use_tools in phases:
-                    yield {'type': 'team_agent', 'agent': agent_label}
-                    msgs = self._assemble_messages_for_team_phase(user_text)
-                    tools_kw: list[dict[str, Any]] | None = None if use_tools else []
-                    if use_tools:
-                        tools_kw = self._merged_openai_tools()
+                # Phase 1: Analyst -> Planner (线性前置)
+                analyst_delta_chunks = []
+                yield {'type': 'team_agent', 'agent': 'Analyst'}
+                analyst_msgs = self._assemble_messages_for_team_phase(base_user)
+                analyst_system = get_team_role_prompt(TeamRole.ANALYST)
+                analyst_msgs.insert(
+                    max(len(analyst_msgs) - 1, 0),
+                    {'role': 'system', 'content': analyst_system},
+                )
+                for ev in iter_agent_executor_events(
+                    analyst_msgs,
+                    settings,
+                    model=model_override,
+                    tools=[],
+                    mcp_client=self._mcp_client,
+                ):
+                    et = ev.get('type')
+                    if et == 'executor_complete':
+                        snap = ev.get('conversation_messages')
+                        if isinstance(snap, list):
+                            self.llm_conversation_messages = snap
+                        phase_in += int(ev.get('input_tokens', 0))
+                        phase_out += int(ev.get('output_tokens', 0))
+                        body = str(ev.get('assistant_text', '') or '').strip()
+                        if analyst_delta_chunks and not body:
+                            body = ''.join(analyst_delta_chunks).strip()
+                        analyst_full_text = body
+                        planner_seed = _extract_analyst_deliverable(analyst_full_text)
+                        analyst_note = (
+                            '【来自 Analyst 的需求拆解】\n'
+                            + (planner_seed or '（Analyst 未给出有效 deliverable）')
+                        )
+                        self.llm_conversation_messages.append(
+                            {'role': 'system', 'content': analyst_note}
+                        )
+                        combined_chunks.append(f'[Analyst]\n{body}')
+                        break
+                    if et == 'llm_error':
+                        yield ev
+                        return
+                    if et == 'text_delta':
+                        analyst_delta_chunks.append(str(ev.get('text', '') or ''))
+                    yield ev
+
+                yield {'type': 'team_agent', 'agent': 'Planner'}
+                planner_user = (
+                    f'{base_user}\n\n【来自 Analyst 的需求拆解】\n{planner_seed or "（无）"}'
+                )
+                planner_msgs = self._assemble_messages_for_team_phase(planner_user)
+                planner_system = get_team_role_prompt(TeamRole.PLANNER)
+                planner_msgs.insert(
+                    max(len(planner_msgs) - 1, 0),
+                    {'role': 'system', 'content': planner_system},
+                )
+                for ev in iter_agent_executor_events(
+                    planner_msgs,
+                    settings,
+                    model=model_override,
+                    tools=[],
+                    mcp_client=self._mcp_client,
+                ):
+                    et = ev.get('type')
+                    if et == 'executor_complete':
+                        snap = ev.get('conversation_messages')
+                        if isinstance(snap, list):
+                            self.llm_conversation_messages = snap
+                        phase_in += int(ev.get('input_tokens', 0))
+                        phase_out += int(ev.get('output_tokens', 0))
+                        planner_plan = str(ev.get('assistant_text', '') or '').strip()
+                        combined_chunks.append(f'[Planner]\n{planner_plan}')
+                        break
+                    if et == 'llm_error':
+                        yield ev
+                        return
+                    yield ev
+
+                # Phase 2: Coder <-> Reviewer feedback loop (最多 3 轮)
+                merged_tools = self._merged_openai_tools()
+                coder_instruction = (
+                    '【来自 Planner 的执行计划，请严格执行】\n'
+                    + (planner_plan or '（无）')
+                )
+                approved = False
+                for attempt in range(1, max_iterations + 1):
+                    yield {
+                        'type': 'team_agent',
+                        'agent': 'Coder',
+                        'round': attempt,
+                        'max_rounds': max_iterations,
+                    }
+                    coder_user = (
+                        f'{coder_instruction}\n\n【执行要求】\n'
+                        f'当前是第 {attempt} 轮，请严格按计划与修复意见落地执行并给出结果。'
+                    )
+                    coder_msgs = self._assemble_messages_for_team_phase(coder_user)
+                    coder_system = get_team_role_prompt(TeamRole.CODER)
+                    coder_msgs.insert(
+                        max(len(coder_msgs) - 1, 0),
+                        {'role': 'system', 'content': coder_system},
+                    )
+                    coder_report = ''
                     for ev in iter_agent_executor_events(
-                        msgs,
+                        coder_msgs,
                         settings,
                         model=model_override,
-                        tools=tools_kw,
+                        tools=merged_tools,
                         mcp_client=self._mcp_client,
                     ):
                         et = ev.get('type')
@@ -856,13 +953,71 @@ class QueryEnginePort:
                                 self.llm_conversation_messages = snap
                             phase_in += int(ev.get('input_tokens', 0))
                             phase_out += int(ev.get('output_tokens', 0))
-                            body = str(ev.get('assistant_text', '') or '').strip()
-                            combined_chunks.append(f'[{agent_label}]\n{body}')
+                            coder_report = str(ev.get('assistant_text', '') or '').strip()
+                            combined_chunks.append(f'[Coder#{attempt}]\n{coder_report}')
                             break
                         if et == 'llm_error':
                             yield ev
                             return
                         yield ev
+
+                    yield {
+                        'type': 'team_agent',
+                        'agent': 'Reviewer',
+                        'round': attempt,
+                        'max_rounds': max_iterations,
+                    }
+                    reviewer_user = (
+                        f'【Coder 第 {attempt} 轮的执行报告，请审查】\n'
+                        f'{coder_report or "（无）"}\n\n'
+                        '请给出明确裁决：[APPROVE] 或 [REJECT: ...]。'
+                    )
+                    reviewer_msgs = self._assemble_messages_for_team_phase(reviewer_user)
+                    reviewer_system = get_team_role_prompt(TeamRole.REVIEWER)
+                    reviewer_msgs.insert(
+                        max(len(reviewer_msgs) - 1, 0),
+                        {'role': 'system', 'content': reviewer_system},
+                    )
+                    reviewer_report = ''
+                    for ev in iter_agent_executor_events(
+                        reviewer_msgs,
+                        settings,
+                        model=model_override,
+                        tools=merged_tools,
+                        mcp_client=self._mcp_client,
+                    ):
+                        et = ev.get('type')
+                        if et == 'executor_complete':
+                            snap = ev.get('conversation_messages')
+                            if isinstance(snap, list):
+                                self.llm_conversation_messages = snap
+                            phase_in += int(ev.get('input_tokens', 0))
+                            phase_out += int(ev.get('output_tokens', 0))
+                            reviewer_report = str(ev.get('assistant_text', '') or '').strip()
+                            combined_chunks.append(
+                                f'[Reviewer#{attempt}]\n{reviewer_report}'
+                            )
+                            break
+                        if et == 'llm_error':
+                            yield ev
+                            return
+                        yield ev
+
+                    reviewer_lower = reviewer_report.lower()
+                    if '[approve]' in reviewer_lower:
+                        approved = True
+                        break
+                    coder_instruction = (
+                        '【来自 Reviewer 的打回意见，请务必修复以下问题】\n'
+                        + (reviewer_report or '（Reviewer 未给出有效建议）')
+                    )
+
+                if not approved:
+                    warn = (
+                        '⚠️ 团队模式达到最大迭代次数，未获得 Reviewer 最终批准，流程强制终止，请人类介入。'
+                    )
+                    combined_chunks.append(f'[System]\n{warn}')
+                    yield {'type': 'text_delta', 'text': f'\n[bold red]{warn}[/bold red]\n'}
 
                 if phase_in > 0 or phase_out > 0:
                     self.total_usage = UsageSummary(

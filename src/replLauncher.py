@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import itertools
 import json
+import os
 import sys
 import time
 from typing import Any
@@ -58,6 +59,153 @@ REPL_MEMORY_WARN_REPEAT_TURN_DELTA = 40
 TOKEN_WARNING_THRESHOLD = REPL_MEMORY_WARN_TOTAL_TOKENS
 # session_id -> (上次预警时的累计 tokens, 上次预警时的用户轮次数)
 _REPL_MEMORY_WARN_LAST: dict[str, tuple[int, int]] = {}
+
+
+_CONTEXT_FILE_TOOL_NAMES = frozenset(
+    {
+        'read_local_file',
+        'write_local_file',
+        'read_file',
+        'write_file',
+        'cat',
+        'patch',
+        'apply_patch',
+        'open_file',
+    }
+)
+
+# 高危工具：命中后需要用户审批（Human-in-the-loop）。
+_SENSITIVE_TOOLS = frozenset(
+    {
+        'execute_mac_bash',
+        'run_bash_command',
+        'execute_shell',
+        'write_local_file',
+        'write_file',
+        'patch',
+        'apply_patch',
+    }
+)
+
+
+def _ensure_active_context_files(engine: Any) -> set[str]:
+    cur = getattr(engine, 'active_context_files', None)
+    if isinstance(cur, set):
+        return cur
+    s: set[str] = set()
+    try:
+        setattr(engine, 'active_context_files', s)
+    except Exception:
+        pass
+    return s
+
+
+def _normalize_context_path(raw: str) -> str:
+    t = (raw or '').strip()
+    if not t:
+        return ''
+    p = t.replace('\\', '/')
+    if p.startswith('~'):
+        p = os.path.expanduser(p)
+    if os.path.isabs(p):
+        try:
+            rel = os.path.relpath(p, os.getcwd())
+            if not rel.startswith('..'):
+                p = rel
+        except Exception:
+            pass
+    return p.replace('\\', '/')
+
+
+def _extract_context_paths_from_args(tool_name: str, raw_args: str) -> list[str]:
+    if tool_name not in _CONTEXT_FILE_TOOL_NAMES:
+        return []
+    out: list[str] = []
+    try:
+        args = json.loads(raw_args or '{}')
+    except json.JSONDecodeError:
+        args = {}
+    if not isinstance(args, dict):
+        return out
+    for key in ('file_path', 'path', 'target_file', 'source_file'):
+        v = args.get(key)
+        if isinstance(v, str):
+            n = _normalize_context_path(v)
+            if n:
+                out.append(n)
+    paths = args.get('paths')
+    if isinstance(paths, list):
+        for p in paths:
+            if isinstance(p, str):
+                n = _normalize_context_path(p)
+                if n:
+                    out.append(n)
+    # 去重并保持顺序
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for p in out:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq.append(p)
+    return uniq
+
+
+def _track_active_context_files(engine: Any, tool_name: str, raw_args: str) -> None:
+    files = _ensure_active_context_files(engine)
+    for p in _extract_context_paths_from_args(tool_name, raw_args):
+        files.add(p)
+
+
+_DIFFABLE_WRITE_TOOL_NAMES = frozenset({'write_local_file', 'write_file'})
+
+
+def _pick_first_file_path_from_args(raw_args: str) -> str:
+    try:
+        args = json.loads(raw_args or '{}')
+    except json.JSONDecodeError:
+        return ''
+    if not isinstance(args, dict):
+        return ''
+    for key in ('file_path', 'path', 'target_file'):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ''
+
+
+def _extract_new_content_from_args(raw_args: str) -> str:
+    try:
+        args = json.loads(raw_args or '{}')
+    except json.JSONDecodeError:
+        return ''
+    if not isinstance(args, dict):
+        return ''
+    v = args.get('content')
+    return v if isinstance(v, str) else ''
+
+
+def _safe_json_object(raw_args: str) -> dict[str, Any]:
+    try:
+        obj = json.loads(raw_args or '{}')
+    except json.JSONDecodeError:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _read_old_file_content_for_diff(raw_path: str) -> tuple[str, str]:
+    shown = _normalize_context_path(raw_path)
+    p = raw_path
+    if p.startswith('~'):
+        p = os.path.expanduser(p)
+    abs_path = p if os.path.isabs(p) else os.path.join(os.getcwd(), p)
+    try:
+        from pathlib import Path
+
+        old = Path(abs_path).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        old = ''
+    return shown or p, old
 
 
 def _ensure_stdio_utf8() -> None:
@@ -454,6 +602,51 @@ class _StreamingTurnSession:
         self.round_saw_tool_json_stream = False
         self.last_render_time = 0.0
         self.last_painted_display_len = 0
+        self.approval_future: Any = None
+        self.is_hidden_analyst = False
+
+    def _is_sensitive_tool(self, tool_name: str) -> bool:
+        name = (tool_name or '').strip().lower()
+        if not name or name not in _SENSITIVE_TOOLS:
+            return False
+        if getattr(self.engine, 'session_auto_approve_all', False):
+            return False
+        try:
+            from .claw_config import get_auto_approve_tools
+
+            auto = get_auto_approve_tools()
+        except Exception:
+            auto = set()
+        return name not in auto
+
+    def _request_tool_approval_sync(self, tool_name: str, tool_args: str) -> bool:
+        from .repl_ui_render import render_approval_card
+
+        args_obj = _safe_json_object(tool_args)
+        self.console.print(render_approval_card(tool_name, args_obj))
+        try:
+            ans = input('同意执行吗？[y/a/N]: ').strip().lower()
+        except EOFError:
+            ans = 'n'
+        if ans == 'a':
+            setattr(self.engine, 'session_auto_approve_all', True)
+            self.console.print(
+                '[dim green]🚀 已开启最高权限，本次会话将自动放行所有操作。[/dim green]'
+            )
+            return True
+        if ans in ('y', 'yes'):
+            return True
+        # 将拒绝反馈给系统：复用现有中断链路，让后续 tool 调用收到中断标记。
+        try:
+            self.engine.request_stream_abort()
+        except Exception:
+            pass
+        self._drain_queue_after_interrupt()
+        self.console.print(
+            f'[bold red]✗ 已拒绝高危工具执行: {tool_name}[/bold red]\n'
+            '[dim red]本次工具调用已被用户拦截，已请求中断当前工具链。[/dim red]'
+        )
+        return False
 
     def start_worker(self) -> None:
         import threading
@@ -544,7 +737,7 @@ class _StreamingTurnSession:
                 frame,
                 console=self.console,
                 auto_refresh=True,
-                refresh_per_second=35,
+                refresh_per_second=12,
                 transient=True,
                 vertical_overflow='visible',
             )
@@ -571,6 +764,39 @@ class _StreamingTurnSession:
         self.live = None
         self.last_render_time = 0.0
         self.last_painted_display_len = 0
+
+    def _show_hidden_analyst_spinner(self) -> None:
+        from rich.live import Live
+        from rich.spinner import Spinner
+        from rich.text import Text
+
+        if not self.use_live:
+            self.console.print(
+                '[dim cyan]🤔 PM 正在深度拆解需求，排查风险...[/dim cyan]'
+            )
+            return
+        spinner = Spinner(
+            'dots12',
+            text=Text.from_markup(
+                '[dim cyan]🤔 PM 正在深度拆解需求，排查风险...[/dim cyan]'
+            ),
+            style='cyan',
+        )
+        if self.live is None:
+            self.live = Live(
+                spinner,
+                console=self.console,
+                auto_refresh=True,
+                refresh_per_second=14,
+                transient=True,
+                vertical_overflow='visible',
+            )
+            self.live.start(refresh=True)
+        else:
+            try:
+                self.live.update(spinner)
+            except BaseException:
+                pass
 
     @staticmethod
     def _queue_try_get(outq: Any) -> tuple[str, Any] | None:
@@ -673,6 +899,8 @@ class _StreamingTurnSession:
                 )
             )
         if body or show_tool_collapse:
+            self.console.print('[dim #6b7280]╰─ Output ─────────────────────────────────────────[/dim #6b7280]')
+        if body or show_tool_collapse:
             self.console.print()
         print_cyber_turn_divider(self.console)
 
@@ -681,6 +909,7 @@ class _StreamingTurnSession:
         self._stop_live()
         # 给终端驱动一个最小调度片段，确保擦除帧先落地再打印定稿。
         time.sleep(0.05)
+        _repl_terminal_soft_reset(self.console)
         self._render_finish_turn_success(ev)
 
     async def _finish_turn_success_async(self, ev: dict[str, Any]) -> None:
@@ -688,12 +917,13 @@ class _StreamingTurnSession:
 
         self._stop_live()
         await asyncio.sleep(0.05)
+        _repl_terminal_soft_reset(self.console)
         self._render_finish_turn_success(ev)
 
     def run_sync_loop(self) -> None:
         from .repl_ui_render import (
-            build_api_tool_op_renderable,
             print_cyber_turn_divider,
+            render_inline_diff,
             tool_execution_status_message,
         )
 
@@ -723,16 +953,28 @@ class _StreamingTurnSession:
                         self.on_team_agent(ev.get('agent'))
                     except Exception:
                         pass
+                base_agent = str(ev.get('agent', 'Agent'))
+                self.is_hidden_analyst = base_agent == 'Analyst'
                 self._squash_live_for_halt()
                 self._stop_live()
-                agent = str(ev.get('agent', 'Agent'))
+                if self.is_hidden_analyst:
+                    self._show_hidden_analyst_spinner()
+                    pending = self._poll_sync()
+                    continue
                 styles = {
                     'Planner': 'bold cyan',
                     'Coder': 'bold green',
                     'Reviewer': 'bold yellow',
                 }
-                st = styles.get(agent, 'bold white')
-                self.console.print(f'[{st}]━━ {agent} ━━[/{st}]')
+                st = styles.get(base_agent, 'bold white')
+                current_round = ev.get('round')
+                max_rounds = ev.get('max_rounds')
+                if current_round is not None and max_rounds is not None:
+                    self.console.print(
+                        f'[{st}]━━ {base_agent} (Round {current_round}/{max_rounds}) ━━[/{st}]'
+                    )
+                else:
+                    self.console.print(f'[{st}]━━ {base_agent} ━━[/{st}]')
                 pending = self._poll_sync()
                 continue
             if et == 'non_llm':
@@ -756,17 +998,52 @@ class _StreamingTurnSession:
                     _print_assistant_output(self.console, self.buffer)
                 self.buffer = ''
                 self.tool_streaming_buffer = ''
-                self.console.print(build_api_tool_op_renderable(ev))
-                self.console.print()
                 tool_name = str(ev.get('tool_name', 'tool'))
+                tool_args = str(ev.get('arguments', '') or '')
+                if self._is_sensitive_tool(tool_name):
+                    approved = self._request_tool_approval_sync(tool_name, tool_args)
+                    if not approved:
+                        return
+                diff_preview: tuple[str, str, str] | None = None
+                if tool_name in _DIFFABLE_WRITE_TOOL_NAMES:
+                    raw_path = _pick_first_file_path_from_args(tool_args)
+                    new_content = _extract_new_content_from_args(tool_args)
+                    if raw_path and new_content:
+                        shown_path, old_content = _read_old_file_content_for_diff(raw_path)
+                        diff_preview = (shown_path, old_content, new_content)
                 with self.console.status(
                     tool_execution_status_message(tool_name),
                     spinner='dots12',
                     spinner_style='cyan',
                 ):
                     pending = self._poll_sync()
+                if pending is not None and pending.get('type') == 'tool_error':
+                    pass
+                else:
+                    _track_active_context_files(self.engine, tool_name, tool_args)
+                    self.console.print(
+                        f'[dim green]✓ 工具执行完毕: {tool_name}[/dim green]'
+                    )
+                    if diff_preview is not None:
+                        fp, old_c, new_c = diff_preview
+                        self.console.print(render_inline_diff(fp, old_c, new_c))
+                continue
+            if et == 'tool_error':
+                self._squash_live_for_halt()
+                self._stop_live()
+                tool_name = str(ev.get('tool_name', 'tool'))
+                detail = str(
+                    ev.get('error') or ev.get('message') or ev.get('output') or '(无详细错误输出)'
+                ).strip()
+                self.console.print(
+                    f'[bold red]✗ 工具执行失败: {tool_name}[/bold red]\n'
+                    f'[dim red]{detail}[/dim red]'
+                )
                 continue
             if et in ('text_delta', 'tool_delta'):
+                if self.is_hidden_analyst and et == 'text_delta':
+                    pending = self._poll_sync()
+                    continue
                 self._process_stream_deltas(ev)
                 pending = self._poll_sync()
                 continue
@@ -778,8 +1055,9 @@ class _StreamingTurnSession:
 
     async def run_async_loop(self) -> None:
         from .repl_ui_render import (
-            build_api_tool_op_renderable,
             print_cyber_turn_divider,
+            render_approval_card,
+            render_inline_diff,
             tool_execution_status_message,
         )
 
@@ -809,16 +1087,28 @@ class _StreamingTurnSession:
                         self.on_team_agent(ev.get('agent'))
                     except Exception:
                         pass
+                base_agent = str(ev.get('agent', 'Agent'))
+                self.is_hidden_analyst = base_agent == 'Analyst'
                 self._squash_live_for_halt()
                 self._stop_live()
-                agent = str(ev.get('agent', 'Agent'))
+                if self.is_hidden_analyst:
+                    self._show_hidden_analyst_spinner()
+                    pending = await self._poll_async()
+                    continue
                 styles = {
                     'Planner': 'bold cyan',
                     'Coder': 'bold green',
                     'Reviewer': 'bold yellow',
                 }
-                st = styles.get(agent, 'bold white')
-                self.console.print(f'[{st}]━━ {agent} ━━[/{st}]')
+                st = styles.get(base_agent, 'bold white')
+                current_round = ev.get('round')
+                max_rounds = ev.get('max_rounds')
+                if current_round is not None and max_rounds is not None:
+                    self.console.print(
+                        f'[{st}]━━ {base_agent} (Round {current_round}/{max_rounds}) ━━[/{st}]'
+                    )
+                else:
+                    self.console.print(f'[{st}]━━ {base_agent} ━━[/{st}]')
                 pending = await self._poll_async()
                 continue
             if et == 'non_llm':
@@ -842,17 +1132,82 @@ class _StreamingTurnSession:
                     _print_assistant_output(self.console, self.buffer)
                 self.buffer = ''
                 self.tool_streaming_buffer = ''
-                self.console.print(build_api_tool_op_renderable(ev))
-                self.console.print()
                 tool_name = str(ev.get('tool_name', 'tool'))
+                tool_args = str(ev.get('arguments', '') or '')
+                if self._is_sensitive_tool(tool_name):
+                    import asyncio
+
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    self.console.print(
+                        render_approval_card(tool_name, _safe_json_object(tool_args))
+                    )
+                    self.console.print()
+
+                    self.approval_future = asyncio.get_running_loop().create_future()
+                    answer = await self.approval_future
+                    self.approval_future = None
+                    ans = str(answer).strip().lower()
+                    if ans == 'a':
+                        setattr(self.engine, 'session_auto_approve_all', True)
+                        self.console.print(
+                            '[dim green]🚀 已开启最高权限，本次会话将自动放行所有操作。[/dim green]'
+                        )
+                    elif ans == 'y':
+                        self.console.print(
+                            f'[dim green]✓ 已同意执行: {tool_name}[/dim green]'
+                        )
+                    else:
+                        try:
+                            self.engine.request_stream_abort()
+                        except Exception:
+                            pass
+                        self._drain_queue_after_interrupt()
+                        self.console.print(
+                            f'[bold red]✗ 已拒绝高危工具执行: {tool_name}[/bold red]\n'
+                            '[dim red]本次工具调用已被用户拦截，已请求中断当前工具链。[/dim red]'
+                        )
+                        return
+                diff_preview: tuple[str, str, str] | None = None
+                if tool_name in _DIFFABLE_WRITE_TOOL_NAMES:
+                    raw_path = _pick_first_file_path_from_args(tool_args)
+                    new_content = _extract_new_content_from_args(tool_args)
+                    if raw_path and new_content:
+                        shown_path, old_content = _read_old_file_content_for_diff(raw_path)
+                        diff_preview = (shown_path, old_content, new_content)
                 with self.console.status(
                     tool_execution_status_message(tool_name),
                     spinner='dots12',
                     spinner_style='cyan',
                 ):
                     pending = await self._poll_async()
+                if pending is not None and pending.get('type') == 'tool_error':
+                    pass
+                else:
+                    _track_active_context_files(self.engine, tool_name, tool_args)
+                    self.console.print(
+                        f'[dim green]✓ 工具执行完毕: {tool_name}[/dim green]'
+                    )
+                    if diff_preview is not None:
+                        fp, old_c, new_c = diff_preview
+                        self.console.print(render_inline_diff(fp, old_c, new_c))
+                continue
+            if et == 'tool_error':
+                self._squash_live_for_halt()
+                self._stop_live()
+                tool_name = str(ev.get('tool_name', 'tool'))
+                detail = str(
+                    ev.get('error') or ev.get('message') or ev.get('output') or '(无详细错误输出)'
+                ).strip()
+                self.console.print(
+                    f'[bold red]✗ 工具执行失败: {tool_name}[/bold red]\n'
+                    f'[dim red]{detail}[/dim red]'
+                )
                 continue
             if et in ('text_delta', 'tool_delta'):
+                if self.is_hidden_analyst and et == 'text_delta':
+                    pending = await self._poll_async()
+                    continue
                 self._process_stream_deltas(ev)
                 pending = await self._poll_async()
                 continue
@@ -874,6 +1229,7 @@ _REPL_HISTORY_MAX_ITEMS = 512
 def _build_prompt_session() -> Any | None:
     try:
         from prompt_toolkit import PromptSession
+        from prompt_toolkit.shortcuts import CompleteStyle
         from prompt_toolkit.completion import ThreadedCompleter
         from prompt_toolkit.history import InMemoryHistory
     except ImportError:
@@ -914,6 +1270,8 @@ def _build_prompt_session() -> Any | None:
         'history': history,
         'completer': ThreadedCompleter(SlashCommandCompleter()),
         'complete_while_typing': True,
+        'complete_style': CompleteStyle.MULTI_COLUMN,
+        'reserve_space_for_menu': 8,
         'validate_while_typing': False,
         'mouse_support': False,
         'enable_suspend': False,
@@ -968,7 +1326,14 @@ def _consume_llm_events_plain(
         for ev in gen:
             et = ev.get('type')
             if et == 'team_agent':
-                print(f"\n>>> [{ev.get('agent')}]\n", flush=True)
+                agent = str(ev.get('agent', 'Agent'))
+                current_round = ev.get('round')
+                max_rounds = ev.get('max_rounds')
+                if current_round is not None and max_rounds is not None:
+                    label = f'{agent} Round {current_round}/{max_rounds}'
+                else:
+                    label = agent
+                print(f"\n>>> [{label}]\n", flush=True)
                 continue
             if et == 'text_delta':
                 piece = str(ev.get('text', '') or '')
@@ -1173,6 +1538,9 @@ def _run_streaming_turn_tui_concurrent(
                 active_prompt_task = None
                 if turn_done.is_set():
                     return
+                if getattr(sess, 'approval_future', None) is not None and not sess.approval_future.done():
+                    sess.approval_future.set_result(text.strip())
+                    continue
                 if (text or '').strip() == '/stop':
                     try:
                         engine.request_stream_abort()

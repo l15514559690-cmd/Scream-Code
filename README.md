@@ -112,6 +112,20 @@ scream
 - `~/.scream/llm_config.json`：模型与路由配置
 - `~/.scream/.env`：密钥等敏感配置
 
+### 🛡️ 高危操作审批与白名单 (`.claw.json`)
+
+Scream Code 默认启用 Human-in-the-loop (HITL) 审批机制：当 Agent 尝试执行写文件、打补丁、运行脚本等高危工具时，终端会弹出审批卡片，要求你手动 `y/n` 确认。
+
+如果你对某些高频操作已完全信任，可在**项目根目录**的 `.claw.json` 配置自动放行白名单（仅对当前项目生效）：
+
+```json
+{
+  "auto_approve_tools": ["write_local_file", "patch"]
+}
+```
+
+配置后，命中的工具将跳过人工审批直接执行；未在白名单中的高危工具仍会继续弹窗拦截。
+
 ### 仓库忽略策略
 
 仓库默认忽略敏感/运行态目录（如 `.env`、`/.scream_cache/`），避免误提交密钥和缓存。

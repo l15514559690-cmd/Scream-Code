@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ScreamGo - 尖叫搜索</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Noto+Sans+SC:wght@300;400;700&display=swap');
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      background: #0a0a0f;
+      font-family: 'Noto Sans SC', sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* 背景网格 */
+    body::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: 
+        linear-gradient(90deg, rgba(0,255,255,0.03) 1px, transparent 1px),
+        linear-gradient(rgba(0,255,255,0.03) 1px, transparent 1px);
+      background-size: 50px 50px;
+      pointer-events: none;
+    }
+
+    /* 霓虹光晕 */
+    .glow-orb {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(80px);
+      opacity: 0.4;
+      animation: float 8s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    .glow-1 {
+      width: 400px;
+      height: 400px;
+      background: #00ffff;
+      top: -100px;
+      left: -100px;
+      animation-delay: 0s;
+    }
+
+    .glow-2 {
+      width: 350px;
+      height: 350px;
+      background: #ff00ff;
+      bottom: -100px;
+      right: -100px;
+      animation-delay: -4s;
+    }
+
+    .glow-3 {
+      width: 250px;
+      height: 250px;
+      background: #00ff88;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      animation-delay: -2s;
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translate(0, 0) scale(1); }
+      25% { transform: translate(30px, -30px) scale(1.1); }
+      50% { transform: translate(-20px, 20px) scale(0.95); }
+      75% { transform: translate(-30px, -20px) scale(1.05); }
+    }
+
+    /* Logo 区域 */
+    .logo-container {
+      text-align: center;
+      margin-bottom: 60px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .logo {
+      font-family: 'Orbitron', monospace;
+      font-size: 4.5rem;
+      font-weight: 900;
+      background: linear-gradient(135deg, #00ffff 0%, #ff00ff 50%, #00ffff 100%);
+      background-size: 200% 200%;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      animation: gradient-shift 3s ease infinite;
+      text-shadow: 0 0 40px rgba(0, 255, 255, 0.3);
+      letter-spacing: 8px;
+    }
+
+    @keyframes gradient-shift {
+      0%, 100% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+    }
+
+    .tagline {
+      font-size: 1.1rem;
+      color: rgba(255, 255, 255, 0.5);
+      margin-top: 15px;
+      letter-spacing: 12px;
+      text-transform: uppercase;
+    }
+
+    /* 搜索框 */
+    .search-container {
+      width: 100%;
+      max-width: 720px;
+      padding: 0 20px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .search-box {
+      display: flex;
+      align-items: center;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 60px;
+      padding: 8px 8px 8px 28px;
+      backdrop-filter: blur(20px);
+      transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 
+        0 0 0 1px rgba(0, 255, 255, 0.1),
+        0 20px 50px rgba(0, 0, 0, 0.5),
+        inset 0 0 30px rgba(0, 255, 255, 0.02);
+    }
+
+    .search-box:hover, .search-box:focus-within {
+      border-color: rgba(0, 255, 255, 0.5);
+      box-shadow: 
+        0 0 0 1px rgba(0, 255, 255, 0.3),
+        0 0 40px rgba(0, 255, 255, 0.15),
+        0 20px 60px rgba(0, 0, 0, 0.5),
+        inset 0 0 30px rgba(0, 255, 255, 0.05);
+      transform: translateY(-2px);
+    }
+
+    .search-icon {
+      width: 24px;
+      height: 24px;
+      stroke: #00ffff;
+      stroke-width: 2;
+      fill: none;
+      flex-shrink: 0;
+      filter: drop-shadow(0 0 8px rgba(0, 255, 255, 0.5));
+    }
+
+    .search-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      font-size: 1.2rem;
+      color: #fff;
+      padding: 12px 20px;
+      font-family: 'Noto Sans SC', sans-serif;
+    }
+
+    .search-input::placeholder {
+      color: rgba(255, 255, 255, 0.35);
+    }
+
+    .search-btn {
+      background: linear-gradient(135deg, #00ffff 0%, #00cccc 100%);
+      border: none;
+      border-radius: 50px;
+      padding: 14px 36px;
+      font-family: 'Orbitron', monospace;
+      font-size: 0.9rem;
+      font-weight: 700;
+      color: #0a0a0f;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+    }
+
+    .search-btn:hover {
+      transform: scale(1.05);
+      box-shadow: 0 0 30px rgba(0, 255, 255, 0.5);
+    }
+
+    /* 快捷链接 */
+    .shortcuts {
+      display: flex;
+      gap: 20px;
+      margin-top: 50px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .shortcut-link {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: rgba(255, 255, 255, 0.6);
+      transition: all 0.3s ease;
+      padding: 15px 25px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid transparent;
+    }
+
+    .shortcut-link:hover {
+      color: #fff;
+      background: rgba(255, 255, 255, 0.05);
+      border-color: rgba(0, 255, 255, 0.2);
+      transform: translateY(-5px);
+    }
+
+    .shortcut-icon {
+      width: 32px;
+      height: 32px;
+      stroke: currentColor;
+      stroke-width: 1.5;
+      fill: none;
+    }
+
+    .shortcut-link span {
+      font-size: 0.85rem;
+      font-weight: 300;
+    }
+
+    /* 底部信息 */
+    .footer {
+      position: absolute;
+      bottom: 30px;
+      color: rgba(255, 255, 255, 0.25);
+      font-size: 0.8rem;
+      text-align: center;
+      z-index: 1;
+    }
+
+    .footer a {
+      color: rgba(0, 255, 255, 0.5);
+      text-decoration: none;
+      transition: color 0.3s;
+    }
+
+    .footer a:hover {
+      color: #00ffff;
+    }
+
+    /* 扫描线动画 */
+    .scanline {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, #00ffff, transparent);
+      opacity: 0.3;
+      animation: scan 4s linear infinite;
+      pointer-events: none;
+    }
+
+    @keyframes scan {
+      0% { top: 0; }
+      100% { top: 100%; }
+    }
+
+    /* 响应式 */
+    @media (max-width: 768px) {
+      .logo {
+        font-size: 2.8rem;
+        letter-spacing: 4px;
+      }
+
+      .tagline {
+        font-size: 0.8rem;
+        letter-spacing: 6px;
+      }
+
+      .search-btn {
+        padding: 12px 24px;
+        font-size: 0.8rem;
+      }
+
+      .shortcuts {
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 10px;
+      }
+
+      .shortcut-link {
+        padding: 12px 18px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- 背景光晕 -->
+  <div class="glow-orb glow-1"></div>
+  <div class="glow-orb glow-2"></div>
+  <div class="glow-orb glow-3"></div>
+  
+  <!-- 扫描线 -->
+  <div class="scanline"></div>
+
+  <!-- Logo -->
+  <div class="logo-container">
+    <h1 class="logo">SCREAMGO</h1>
+    <p class="tagline">尖叫搜索 · 极速体验</p>
+  </div>
+
+  <!-- 搜索框 -->
+  <div class="search-container">
+    <form class="search-box" onsubmit="handleSearch(event)">
+      <svg class="search-icon" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="8"/>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      <input 
+        type="text" 
+        class="search-input" 
+        placeholder="探索无限，尖叫开始..." 
+        autofocus
+        id="searchInput"
+      >
+      <button type="submit" class="search-btn">搜索</button>
+    </form>
+  </div>
+
+  <!-- 快捷链接 -->
+  <div class="shortcuts">
+    <a href="https://github.com" class="shortcut-link" target="_blank">
+      <svg class="shortcut-icon" viewBox="0 0 24 24">
+        <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>
+      </svg>
+      <span>GitHub</span>
+    </a>
+    <a href="https://www.youtube.com" class="shortcut-link" target="_blank">
+      <svg class="shortcut-icon" viewBox="0 0 24 24">
+        <path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"/>
+        <polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
+      </svg>
+      <span>YouTube</span>
+    </a>
+    <a href="https://twitter.com" class="shortcut-link" target="_blank">
+      <svg class="shortcut-icon" viewBox="0 0 24 24">
+        <path d="M4 4l11.733 16h4.267l-11.733 -16z"/>
+        <path d="M4 20l6.768 -6.768m2.46 -2.46l6.772 -6.772"/>
+      </svg>
+      <span>Twitter</span>
+    </a>
+    <a href="https://wikipedia.org" class="shortcut-link" target="_blank">
+      <svg class="shortcut-icon" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="10"/>
+        <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/>
+        <path d="M2 12h20"/>
+      </svg>
+      <span>维基百科</span>
+    </a>
+    <a href="https://translate.google.com" class="shortcut-link" target="_blank">
+      <svg class="shortcut-icon" viewBox="0 0 24 24">
+        <path d="M5 8l6 6"/>
+        <path d="M4 14l6-6 2-3"/>
+        <path d="M2 5h12"/>
+        <path d="M7 2h1"/>
+        <path d="M22 22l-5-10-5 10"/>
+        <path d="M14 18h6"/>
+      </svg>
+      <span>翻译</span>
+    </a>
+  </div>
+
+  <!-- 底部 -->
+  <div class="footer">
+    <p>© 2025 <a href="#">ScreamGo</a> · 用科技重新定义搜索</p>
+  </div>
+
+  <script>
+    function handleSearch(e) {
+      e.preventDefault();
+      const query = document.getElementById('searchInput').value.trim();
+      if (query) {
+        // 这里可以替换成实际的搜索引擎 URL
+        window.location.href = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+      }
+    }
+
+    // 聚焦时发光效果
+    const input = document.getElementById('searchInput');
+    input.addEventListener('focus', () => {
+      document.querySelector('.search-box').style.boxShadow = `
+        0 0 0 2px rgba(0, 255, 255, 0.4),
+        0 0 60px rgba(0, 255, 255, 0.2),
+        0 20px 60px rgba(0, 0, 0, 0.5)
+      `;
+    });
+    input.addEventListener('blur', () => {
+      document.querySelector('.search-box').style.boxShadow = '';
+    });
+  </script>
+</body>
+</html>

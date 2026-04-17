@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -135,12 +136,12 @@ def print_slash_help(console: Any | None, registry: Any) -> None:
     """按分类列出斜杠技能；``/look`` 等可在首次调用时自动安装 Playwright/Chromium（需网络）。补全菜单打开时 Enter 仅写入补全、不提交整行。"""
     core_static: list[tuple[str, str]] = [
         ('/help', '📖 查看所有可用指令与说明'),
-        ('/clear', '🧽 清空当前屏幕显示 (保留记忆)'),
+        ('/clear', '🧽 清空屏幕显示 (不丢失记忆)'),
         ('/exit', '🚪 退出 Scream Code (同 /quit)'),
         ('/quit', '🚪 退出 Scream Code (同 /exit)'),
     ]
     system_tail: list[tuple[str, str]] = [
-        ('$team <提示>', '仅本条走团队模式'),
+        ('$team <提示>', '🐺 仅当前这句使用团队模式思考'),
     ]
 
     if console is not None:
@@ -628,15 +629,35 @@ class SlashCommandCompleter:
         from .skills_registry import get_skills_registry
 
         text = document.text_before_cursor
-        slash = text.rfind('/')
-        if slash < 0:
+        line = text.split('\n')[-1]
+        # 仅在「行首 /」或「空白后 /」触发；避免 URL（如 http://）误触发。
+        trigger = re.search(r'(^|\s)(/[^\n]*)$', line)
+        if trigger is None:
             return
-        fragment = text[slash:]
-        if not fragment.startswith('/'):
+        fragment = trigger.group(2)
+        if not fragment:
             return
+
+        def _fuzzy_subsequence_match(needle: str, haystack: str) -> bool:
+            """子序列模糊匹配：``st`` 可匹配 ``status`` / ``stop``。"""
+            n = needle.strip().lower()
+            h = haystack.strip().lower()
+            if not n:
+                return True
+            i = 0
+            for ch in h:
+                if i < len(n) and ch == n[i]:
+                    i += 1
+                    if i >= len(n):
+                        return True
+            return i >= len(n)
+
+        # 去掉前导 ``/`` 后做 fuzzy，兼容 ``/feishu s`` 这类带空格子命令输入。
+        fuzzy_query = fragment[1:] if fragment.startswith('/') else fragment
+
         base_commands: list[tuple[str, str]] = [
             ('/help', '📖 查看所有可用指令与说明'),
-            ('/clear', '🧽 清空当前屏幕显示 (保留记忆)'),
+            ('/clear', '🧽 清空屏幕显示 (不丢失记忆)'),
             ('/exit', '🚪 退出 Scream Code (同 /quit)'),
             ('/quit', '🚪 退出 Scream Code (同 /exit)'),
         ]
@@ -645,7 +666,7 @@ class SlashCommandCompleter:
             if cmd in seen:
                 continue
             seen.add(cmd)
-            if cmd.startswith(fragment):
+            if _fuzzy_subsequence_match(fuzzy_query, cmd[1:]):
                 yield Completion(
                     cmd,
                     start_position=-len(fragment),
@@ -655,7 +676,7 @@ class SlashCommandCompleter:
             if cmd in seen:
                 continue
             seen.add(cmd)
-            if cmd.startswith(fragment):
+            if _fuzzy_subsequence_match(fuzzy_query, cmd[1:]):
                 yield Completion(
                     cmd,
                     start_position=-len(fragment),
@@ -675,7 +696,7 @@ class SlashCommandCompleter:
         for cmd, meta in feishu_subcommands:
             if cmd in seen:
                 continue
-            if cmd.startswith(fragment):
+            if _fuzzy_subsequence_match(fuzzy_query, cmd[1:]):
                 seen.add(cmd)
                 yield Completion(
                     cmd,

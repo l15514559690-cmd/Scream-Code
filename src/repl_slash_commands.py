@@ -9,6 +9,19 @@ from .skills.base_skill import ReplSkillContext, SkillOutcome
 from .skills_registry import get_skills_registry
 
 
+def _clear_active_context_files(engine: QueryEnginePort | None) -> None:
+    if engine is None:
+        return
+    raw = getattr(engine, 'active_context_files', None)
+    if isinstance(raw, set):
+        raw.clear()
+        return
+    try:
+        setattr(engine, 'active_context_files', set())
+    except Exception:
+        pass
+
+
 def dispatch_repl_slash_command(
     line: str,
     *,
@@ -46,4 +59,7 @@ def dispatch_repl_slash_command(
         target.llm_conversation_messages.extend(
             copy.deepcopy(m) for m in outcome.append_llm_messages
         )
+    # UX: 新会话或显式清理时一并清空 Context Tray。
+    if key in ('new', 'clear'):
+        _clear_active_context_files(target)
     return True, outcome.new_engine, outcome
