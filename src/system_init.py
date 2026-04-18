@@ -7,6 +7,7 @@ from .memory_store import format_project_long_term_memory_xml_block
 from .project_memory import project_memory_system_suffix, project_memory_workspace_root
 from .setup import run_setup
 from .tools import get_tools
+from .utils.workspace import generate_lightweight_repo_map
 
 # 兼容旧导入名：与 ``SYSTEM_PROMPT_CORE`` 同源。
 LLM_META_PROMPT_IDENTITY = SYSTEM_PROMPT_CORE
@@ -69,6 +70,21 @@ def build_system_init_message(trusted: bool = True) -> str:
         LLM_COT_LANGUAGE_REQUIREMENT,
     ]
     base = '\n'.join(lines) + project_memory_system_suffix(project_memory_workspace_root())
+
+    # ── Repo Map 注入 ─────────────────────────────────────────────────────────
+    # 在 System Prompt 末尾注入当前工作区的轻量代码地图，
+    # 让 Agent 在盲人摸象之前就能看到全局目录结构，不再瞎猜路径。
+    _REPO_MAP_SECTION = '\n\n【当前工作区代码地图 (Repo Map)】\n以下是项目的目录结构（最大深度 3 层），请在打算读取或修改文件前，务必参考此地图，不要瞎猜路径：\n```text\n{repo_map}\n```'
+
+    try:
+        ws_root = project_memory_workspace_root()
+        repo_map = generate_lightweight_repo_map(ws_root, max_depth=3)
+    except Exception:
+        repo_map = '（无法生成代码地图，工作区路径解析失败）'
+
+    base += _REPO_MAP_SECTION.format(repo_map=repo_map)
+    # ── /Repo Map 注入 ────────────────────────────────────────────────────────
+
     ltm = format_project_long_term_memory_xml_block()
     if ltm:
         return f'{base}\n\n{ltm}'

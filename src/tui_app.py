@@ -576,7 +576,7 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
     def idle_prompt_html() -> Any:
         tray = _render_context_tray_html(engine)
         return HTML(
-            f'{tray}{input_divider}\n'
+            f'\n{tray}{input_divider}\n'
             f'<style fg="{_BRAND_HEX}"><b>尖叫&gt; </b></style>'
         )
 
@@ -601,7 +601,7 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
         return HTML(
             '\n'
             f'{tip}'
-            f'{err}\n'
+            f'{err}\n\n'
             f'{_render_context_tray_html(engine)}{input_divider}\n'
             f'<style fg="{_BRAND_HEX}"><b> 尖叫&gt; </b></style>'
         )

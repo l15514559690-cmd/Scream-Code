@@ -313,3 +313,57 @@ class TeamSkill(BaseSkill):
         state = '开启' if context.engine.repl_team_mode else '关闭'
         msg(context.console, f'多代理团队模式已{state}（Planner → Coder → Reviewer）。', style='bold green')
         return SkillOutcome()
+
+
+class UndoSkill(BaseSkill):
+    """
+    /undo — 一键撤销：恢复上轮 Agent 所做文件修改，并裁剪 LLM 对话上下文。
+
+    1. 调用 SnapshotManager.restore_last_snapshot() 恢复/删除文件。
+    2. 将 engine.llm_conversation_messages 裁剪到用户上一次输入之前的状态
+       （剔除最后一条 role=user 的消息及其后续产生的所有消息）。
+    """
+
+    name: ClassVar[str] = 'undo'
+    description: ClassVar[str] = '↩️ 撤销上一次执行所做的全部文件修改，并回滚大模型对话上下文'
+    category: ClassVar[str] = 'core'
+    aliases: ClassVar[tuple[str, ...]] = ()
+
+    def execute(self, context: ReplSkillContext, args: str) -> SkillOutcome:
+        from ..project_memory import project_memory_workspace_root
+        from ..utils.snapshot_manager import restore_last_snapshot
+
+        ws_root = project_memory_workspace_root()
+        restored = restore_last_snapshot(ws_root)
+
+        # ── 裁剪 LLM 对话上下文 ─────────────────────────────────────────────
+        # 找到 llm_conversation_messages 中最后一条 role=user 的消息位置，
+        # 及其后续所有消息一并剔除（包括 assistant 响应、tool 调用记录）。
+        llm_msgs = context.engine.llm_conversation_messages
+        last_user_idx = -1
+        for i in range(len(llm_msgs) - 1, -1, -1):
+            if llm_msgs[i].get('role', '') == 'user':
+                last_user_idx = i
+                break
+        if last_user_idx >= 0:
+            del llm_msgs[last_user_idx:]
+            trimmed = True
+        else:
+            trimmed = False
+        # ── /裁剪 LLM 对话上下文 ────────────────────────────────────────────
+
+        if not restored and not trimmed:
+            msg(context.console, '/undo：无内容可撤销（本轮未修改任何文件）。', style='yellow')
+            return SkillOutcome()
+
+        if restored:
+            paths_str = ', '.join(restored) if len(restored) <= 5 else ', '.join(restored[:5]) + f'…（共 {len(restored)} 个）'
+            msg(
+                context.console,
+                f'[bold green]↩️ 已撤销上一次执行。恢复了以下文件：{paths_str}[/bold green]',
+                style='bold green',
+            )
+        else:
+            msg(context.console, '↩️ 已回滚对话上下文（无文件需恢复）。', style='bold green')
+
+        return SkillOutcome()

@@ -22,8 +22,10 @@ from rich.text import Text
 
 # TUI / 助手 Markdown 品牌与代码区（与 tui_app 靛紫系一致）
 _BRAND_BORDER_HEX = '#4F46E5'
-# 流式定稿与 Live 内代码块统一使用同一暗色 Pygments 主题（可改为 "dracula" 等）
-STREAMING_CODE_THEME = 'monokai'
+# 流式定稿与 Live 内代码块统一使用同一暗色 Pygments 主题
+# one-dark: Atom One Dark — 经典极客暗黑风，代码高亮对比度高，背景与普通文字分离清晰
+# 可选替代: 'dracula'（偏紫）、'github-dark'（偏灰）、'nord'（冷灰蓝）
+STREAMING_CODE_THEME = 'one-dark'
 
 # ── Live 神经帧调度：与 refresh_per_second≈30 对齐；过小会每 token 全量 Markdown 重排烧 CPU ──
 STREAM_LIVE_MIN_INTERVAL_SEC = 1.0 / 30.0

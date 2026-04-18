@@ -17,6 +17,48 @@ from .llm_settings import project_root
 
 _log = logging.getLogger(__name__)
 
+# ------------------------------------------------------------
+# 自我保护协议 (Self-Preservation Protocol)
+# 防止 Agent 幻觉时篡改 Scream Code 自身的底层核心源码
+# ------------------------------------------------------------
+
+# DANGER_ALLOW_SELF_EDIT: 环境变量后门，允许开发者在用 Scream Code 开发 Scream Code 时正常编辑自身
+_DANGER_ALLOW_SELF_EDIT = bool(os.environ.get('DANGER_ALLOW_SELF_EDIT', '').strip())
+
+
+def _scream_code_root() -> Path:
+    """
+    获取 Scream Code 自身的代码根目录。
+    通过本模块的 __file__ 向上两级定位到 src/ 的父目录（即 Scream Code 根）。
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+def _is_self_preservation_triggered(target_path: Path) -> bool:
+    """
+    检查 target_path 是否位于 Scream Code 自身的核心源码目录之下。
+
+    若返回 True，说明这笔操作指向 Scream Code 自身，会造成自毁，必须拦截。
+    除非 DANGER_ALLOW_SELF_EDIT 环境变量被显式设为非空字符串，否则不会放行。
+
+    工作区根目录（_workspace_root）不受此限制，即使恰好是 Scream Code 本身；
+    该限制仅针对 Scream Code 的核心运行时目录结构。
+    """
+    if _DANGER_ALLOW_SELF_EDIT:
+        return False
+    root = _scream_code_root()
+    try:
+        target_path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+_SELF_PRESERVATION_BLOCKED_MESSAGE = (
+    '[拒绝访问] 系统级安全拦截：禁止 Agent 修改 Scream Code 自身的底层核心文件！'
+    '若你正在用 Scream Code 开发 Scream Code，请设置环境变量 DANGER_ALLOW_SELF_EDIT=1 来解锁。'
+)
+
 
 def _allow_global_access() -> bool:
     from . import model_manager
@@ -111,6 +153,13 @@ def write_local_file(file_path: str, content: str) -> str:
         OSError: 创建目录或写入失败。
     """
     path = _resolved_file_path(file_path)
+    # 自我保护协议：禁止修改 Scream Code 自身核心源码
+    if _is_self_preservation_triggered(path):
+        return _SELF_PRESERVATION_BLOCKED_MESSAGE
+    # 快照备份：修改前先备份（自我保护拦截之后、实际写入之前）
+    from .utils.snapshot_manager import backup_file_before_edit
+
+    backup_file_before_edit(path, _workspace_root())
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding='utf-8')
     return f'已写入 {path}（{len(content)} 字符）。'
@@ -139,6 +188,22 @@ def execute_mac_bash(command: str) -> str:
 
     if SandboxManager.instance().is_sandbox_enabled:
         return SandboxManager.instance().execute_in_sandbox(command, str(_workspace_root()))
+
+    # 自我保护协议：检查危险命令是否指向 Scream Code 自身核心文件
+    safe_cmd = command.strip().lower()
+    if any(pattern in safe_cmd for pattern in ('rm -rf', 'rm -fr', 'rm -r', 'chmod -r', 'chown -r')):
+        # 二次解析：尝试从命令中提取路径，检查是否指向 Scream Code 根
+        import shlex
+        try:
+            parts = shlex.split(command)
+        except Exception:
+            parts = []
+        for part in parts:
+            p = Path(part).expanduser()
+            if not p.is_absolute():
+                continue
+            if _is_self_preservation_triggered(p):
+                return _SELF_PRESERVATION_BLOCKED_MESSAGE
 
     bash = Path('/bin/bash')
     if not bash.is_file():
