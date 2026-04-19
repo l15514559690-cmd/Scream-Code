@@ -258,6 +258,92 @@ class QueryEnginePort:
         self.mcp_online_mode = not self.mcp_online_mode
         return self.mcp_online_mode
 
+    # ── @ 文件静默挂载 ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_at_file_mounts(prompt: str) -> tuple[str, tuple[str, ...]]:
+        """
+        扫描 prompt 中的 ``@<filepath>`` 引用，将其替换为文件内容注入段，
+        并返回 (净化后的 prompt, 成功挂载的文件路径元组)。
+
+        挂载格式::
+            【用户通过 @ 挂载的参考文件：<filepath>】
+            ```<语言>
+            <文件内容>
+            ```
+        """
+        import re
+
+        at_pattern = re.compile(r'@([^\s]+)')
+        refs = at_pattern.findall(prompt)
+        if not refs:
+            return prompt, ()
+
+        mounted: list[str] = []
+        suffix_parts: list[str] = []
+        ws_root = Path.cwd().resolve()
+        # 黑名单（与 _AT_COMPLETE_EXCLUDE 保持一致）
+        EXCLUDE = frozenset({
+            '.git', 'node_modules', '__pycache__', 'venv', '.venv',
+            'target', 'dist', 'build', '.scream_cache', '.idea', '.vscode',
+        })
+
+        for ref in refs:
+            raw = ref.strip()
+            if not raw:
+                continue
+            # 支持 @src/main.py 或 @src/main.py:10:20（行范围）
+            line_range = None
+            if ':' in raw and not raw.startswith('@'):
+                parts2 = raw.rsplit(':', 2)
+                if len(parts2) == 3 and parts2[1].isdigit() and parts2[2].isdigit():
+                    raw, l_start, l_end = parts2
+                    line_range = (int(l_start), int(l_end))
+            p = (ws_root / raw).resolve()
+            try:
+                p.relative_to(ws_root)
+            except ValueError:
+                continue  # 逃出工作区的路径直接跳过
+            if not p.is_file():
+                continue
+            # 读取内容
+            try:
+                content = p.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            if line_range:
+                lines = content.splitlines()
+                l1, l2 = line_range
+                lines = lines[max(0, l1 - 1):l2]
+                content = '\n'.join(lines)
+            lang = p.suffix.lstrip('.') or 'text'
+            mounted.append(raw)
+            suffix_parts.append(
+                f'【用户通过 @ 挂载的参考文件：{raw}】\n```{lang}\n{content}\n```'
+            )
+        # 替换 prompt 中的 @ 引用为干净的文件名（便于大模型阅读）
+        cleaned = at_pattern.sub(lambda m: m.group(1).split(':')[0].split('/')[-1], prompt)
+        if suffix_parts:
+            cleaned = cleaned.rstrip() + '\n\n' + '\n\n'.join(suffix_parts)
+        return cleaned, tuple(mounted)
+
+    def _register_at_mounted_context(self, paths: tuple[str, ...]) -> None:
+        """
+        将成功挂载的文件路径注册到 engine.active_context_files，
+        这样 Context Tray UI 能实时刷新显示。
+        """
+        ctx = getattr(self, 'active_context_files', None)
+        if ctx is None:
+            ctx = set()
+            try:
+                setattr(self, 'active_context_files', ctx)
+            except Exception:
+                return
+        for p in paths:
+            ctx.add(p)
+
+    # ── /@ 文件静默挂载 ─────────────────────────────────────────────────────────
+
     def restart_mcp_client(self) -> bool:
         with self._mcp_lock:
             old = self._mcp_client
@@ -518,6 +604,13 @@ class QueryEnginePort:
         """
         组装发往 API 的 messages：首轮含 system（含项目记忆，仅一次）；后续轮在深拷贝历史上追加本轮 user。
         """
+        # ── @ 文件引用解析 ────────────────────────────────────────────────────
+        # 静默挂载：用户可通过 @src/xx 语法在 prompt 中直接挂载参考文件内容。
+        prompt, mounted_files = self._resolve_at_file_mounts(prompt)
+        if mounted_files:
+            self._register_at_mounted_context(mounted_files)
+        # ── /@ 文件引用解析 ───────────────────────────────────────────────────
+
         user_msg: dict[str, Any] = {
             'role': 'user',
             'content': self._format_turn_user_content(

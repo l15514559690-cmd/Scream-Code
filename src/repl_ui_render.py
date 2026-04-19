@@ -40,6 +40,134 @@ _CODE_PANEL_BG = '#09090B'
 _StockMarkdownContext = _rich_markdown_mod.MarkdownContext
 
 
+# ------------------------------------------------------------
+# 增量静态渲染器 (StreamChunker)
+# 解决 rich.Live 全量渲染 O(N²) 卡顿 + 终端坐标失效 + 幽灵帧问题
+# ------------------------------------------------------------
+
+class StreamChunker:
+    """
+    增量静态渲染器：防止 Live 组件高度超限，并解决 O(N^2) 渲染卡顿。
+
+    算法逻辑：
+    - 每次 text_delta 到来，先拼入 full_buffer。
+    - 从未刷新部分（ unflushed = full_buffer[flushed_length:]）寻找最近的安全分割点
+     （两个连续换行符 ``\\n\\n``，且不在代码块内 — 即 ````` 计数为偶数）。
+    - 安全段落通过 console.print(Markdown(...)) 静态落盘，flushed_length 前移。
+    - 返回剩下未完成的尾巴（tail）供 Live 渲染，Live 里永远只有几行字。
+    - 流结束时 flush_remaining() 将最后尾巴也静态打印。
+    """
+
+    def __init__(self, console: Any, code_theme: str = STREAMING_CODE_THEME) -> None:
+        self.console = console
+        self.code_theme = code_theme
+        self.full_buffer = ''
+        self.flushed_length = 0
+
+    def process_and_flush(self, delta: str) -> str:
+        """
+        处理新的 delta，将已确定的安全段落静态打印，返回未完成的尾巴供 Live 渲染。
+        """
+        self.full_buffer += delta
+        unflushed = self.full_buffer[self.flushed_length:]
+
+        last_double_newline = unflushed.rfind('\n\n')
+
+        if last_double_newline != -1:
+            text_up_to_split = self.full_buffer[: self.flushed_length + last_double_newline]
+            if text_up_to_split.count('```') % 2 == 0:
+                chunk_to_flush = unflushed[:last_double_newline].strip()
+                if chunk_to_flush:
+                    # thinking 折叠：把 <thinking>...</thinking> 替换为带左边框的暗色斜体段落
+                    chunk_to_flush = self._render_thinking_fold(chunk_to_flush)
+                    self.console.print(
+                        Markdown(chunk_to_flush, code_theme=self.code_theme)
+                    )
+                self.flushed_length += last_double_newline + 2
+
+        return self.full_buffer[self.flushed_length:]
+
+    @staticmethod
+    def _render_thinking_fold(text: str) -> str:
+        """
+        将 <thinking>...</thinking> 标签包裹的内容替换为带左边框指示符的暗色斜体文本。
+
+        样式: │ [dim italic]thinking 内容[/dim italic]
+        这样用户在 scrollback 里一眼就能区分「中间过程」和「最终答案」。
+        """
+        import re
+
+        THINKING_OPEN = '<thinking>'
+        THINKING_CLOSE = '</thinking>'
+        FOLD_MARKER = '│ '
+
+        result = text
+
+        # 策略一：处理完整闭合的 <thinking> 块（多行）
+        if THINKING_OPEN in result and THINKING_CLOSE in result:
+            pattern = re.compile(
+                r'<thinking>\s*(.*?)\s*</thinking>',
+                re.DOTALL | re.IGNORECASE,
+            )
+            def replacer(m: re.Match) -> str:
+                inner = m.group(1).strip()
+                if not inner:
+                    return ''
+                lines = inner.splitlines()
+                folded = '\n'.join(f'{FOLD_MARKER}[dim italic]{line}[/dim italic]' for line in lines)
+                return f'\n{folded}\n'
+            result = pattern.sub(replacer, result)
+
+        # 策略二：检测左对齐的「中间推算」型文字（以 │ 开头或类似思考链特征）
+        # 把连续多行、每行以特定关键词开头的段落（尚未被策略一处理）做降亮处理
+        # 识别特征：连续 3 行以上、以 → / => / 推断 / 分析 等开头的段落
+        lines = result.splitlines()
+        processed: list[str] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # 跳过已是 thinking 替换结果的行
+            if line.startswith(FOLD_MARKER) or line.startswith('│'):
+                processed.append(line)
+                i += 1
+                continue
+            # 检测是否是思考链候选行（非空、以 →/=>/推/分析/拆解/逐步 等开头）
+            strip = line.lstrip()
+            if strip and any(strip.startswith(p) for p in ('→', '=>', '▸', '●', '◉', '推断', '分析', '拆解', '逐步', '步骤', '(', '（')):
+                # 收集连续段落
+                block_lines = [line]
+                j = i + 1
+                while j < len(lines):
+                    nxt = lines[j]
+                    nstrip = nxt.lstrip()
+                    # 遇到空行或非思考链特征行就停止
+                    if not nstrip or not any(nstrip.startswith(p) for p in ('→', '=>', '▸', '●', '◉', '推断', '分析', '拆解', '逐步', '步骤', '(', '（')):
+                        break
+                    block_lines.append(nxt)
+                    j += 1
+                if len(block_lines) >= 2:
+                    # 整体加左边框 + dim italic
+                    for bl in block_lines:
+                        processed.append(f'{FOLD_MARKER}[dim italic]{bl}[/dim italic]')
+                    i = j
+                    continue
+            processed.append(line)
+            i += 1
+
+        return '\n'.join(processed)
+
+    def flush_remaining(self) -> None:
+        """流结束时，将最后剩下的尾巴打印出来。"""
+        remaining = self.full_buffer[self.flushed_length:].strip()
+        if remaining:
+            self.console.print(Markdown(remaining, code_theme=self.code_theme))
+        self.flushed_length = len(self.full_buffer)
+
+
+# ------------------------------------------------------------
+# 原有工具函数
+# ------------------------------------------------------------
+
 def _get_dynamic_thinking_title() -> str:
     try:
         from .tui_app import get_current_team_agent

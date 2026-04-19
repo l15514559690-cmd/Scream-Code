@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from rich.spinner import Spinner
+from rich.markdown import Markdown
 
 from .agent_cancel import reset_agent_cancel
 
@@ -849,9 +850,23 @@ class _StreamingTurnSession:
             pass
 
     def _process_stream_deltas(self, ev: dict[str, Any]) -> None:
+        from .repl_ui_render import (
+            STREAMING_CODE_THEME,
+            _force_soft_close_fence_if_unbalanced,
+            stabilize_streaming_markdown_fences,
+        )
+
         et = ev['type']
         if et == 'text_delta':
-            self.buffer += ev.get('text', '')
+            delta = ev.get('text', '')
+            self.buffer += delta
+            safe_buf = stabilize_streaming_markdown_fences(self.buffer)
+            safe_buf = _force_soft_close_fence_if_unbalanced(safe_buf)
+            if safe_buf.strip() and self.live is not None:
+                try:
+                    self.live.update(Markdown(safe_buf, code_theme=STREAMING_CODE_THEME))
+                except Exception:
+                    pass
         else:
             self.tool_streaming_buffer += ev.get('fragment', '')
             self.round_saw_tool_json_stream = True
@@ -862,7 +877,17 @@ class _StreamingTurnSession:
                 if kind == 'ok' and payload.get('type') in ('text_delta', 'tool_delta'):
                     self.outq.get_nowait()
                     if payload['type'] == 'text_delta':
-                        self.buffer += payload.get('text', '')
+                        text = payload.get('text', '')
+                        self.buffer += text
+                        safe_buf = stabilize_streaming_markdown_fences(self.buffer)
+                        safe_buf = _force_soft_close_fence_if_unbalanced(safe_buf)
+                        if safe_buf.strip() and self.live is not None:
+                            try:
+                                self.live.update(
+                                    Markdown(safe_buf, code_theme=STREAMING_CODE_THEME)
+                                )
+                            except Exception:
+                                pass
                     else:
                         self.tool_streaming_buffer += payload.get('fragment', '')
                         self.round_saw_tool_json_stream = True
@@ -911,8 +936,7 @@ class _StreamingTurnSession:
         time.sleep(0.05)
         _repl_terminal_soft_reset(self.console)
         self._render_finish_turn_success(ev)
-        # 回合结束打空行，把即将弹出的输入提示符往下推，隔绝本轮输出与下一轮输入。
-        self.console.print()
+        # 一个空行隔开输出区与下一轮输入
         self.console.print()
 
     async def _finish_turn_success_async(self, ev: dict[str, Any]) -> None:
@@ -923,8 +947,6 @@ class _StreamingTurnSession:
         _repl_terminal_soft_reset(self.console)
         self._render_finish_turn_success(ev)
         self.console.print()
-        self.console.print()
-        self._render_finish_turn_success(ev)
 
     def run_sync_loop(self) -> None:
         import traceback as _tb

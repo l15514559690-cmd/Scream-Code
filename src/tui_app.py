@@ -52,9 +52,10 @@ def _prompt_toolkit_style() -> Any:
     return prompt_toolkit_scream_slash_style()
 
 
-def _build_tui_prompt_session() -> Any:
+def _build_tui_prompt_session(engine: Any) -> Any:
     """
     与 ``replLauncher._build_prompt_session`` 对齐的 stdin/stdout 绑定，并挂载斜杠补全与样式。
+    engine 作为必传参数，供给 rprompt lambda 闭包使用。
     """
     try:
         from prompt_toolkit import PromptSession
@@ -544,7 +545,7 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
         engine.config = replace(engine.config, llm_enabled=True)
     engine.ui_console = console
 
-    session = _build_tui_prompt_session()
+    session = _build_tui_prompt_session(engine)
     current_error_msg = ''
     _thinking_emojis = ['🤔', '💭', '💡', '✨', '⚡️']
 
@@ -576,7 +577,7 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
     def idle_prompt_html() -> Any:
         tray = _render_context_tray_html(engine)
         return HTML(
-            f'\n{tray}{input_divider}\n'
+            f'{tray}{input_divider}\n'
             f'<style fg="{_BRAND_HEX}"><b>尖叫&gt; </b></style>'
         )
 
@@ -594,14 +595,13 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                 '(输入 /stop 终止)</style>'
             )
         err = (
-            f'\n<style fg="ansired"><b>{current_error_msg}</b></style>'
+            f'<style fg="ansired"><b>{current_error_msg}</b></style>'
             if current_error_msg
             else ''
         )
         return HTML(
-            '\n'
             f'{tip}'
-            f'{err}\n\n'
+            f'{err}\n'
             f'{_render_context_tray_html(engine)}{input_divider}\n'
             f'<style fg="{_BRAND_HEX}"><b> 尖叫&gt; </b></style>'
         )

@@ -615,6 +615,62 @@ def prompt_toolkit_slash_completion_enter_bindings() -> Any:
     return kb
 
 
+# ── @ 文件补全工作区文件缓存 ──────────────────────────────────────────────
+
+_WORKSPACE_FILES_CACHE: list[str] = []
+_WORKSPACE_FILES_CACHE_CWD: str = ''
+
+# 黑名单目录（与 Repo Map 和 workspace.py 保持一致）
+_AT_COMPLETE_EXCLUDE = frozenset({
+    '.git',
+    'node_modules',
+    '__pycache__',
+    'venv',
+    '.venv',
+    'target',
+    'dist',
+    'build',
+    '.scream_cache',
+    '.idea',
+    '.vscode',
+    '.pytest_cache',
+    '.mypy_cache',
+    '.ruff_cache',
+    '.tox',
+    '.nox',
+    'site-packages',
+    'eggs',
+})
+
+
+def _get_workspace_files_cached() -> list[str]:
+    """
+    返回当前工作区的相对路径文件列表（含子目录），带缓存（按 cwd 失效）。
+    跳过所有黑名单目录和以 '.' 开头的文件/目录。
+    """
+    global _WORKSPACE_FILES_CACHE, _WORKSPACE_FILES_CACHE_CWD
+
+    cwd = str(Path.cwd().resolve())
+    if cwd != _WORKSPACE_FILES_CACHE_CWD or not _WORKSPACE_FILES_CACHE:
+        _WORKSPACE_FILES_CACHE_CWD = cwd
+        _WORKSPACE_FILES_CACHE.clear()
+        root = Path(cwd)
+        for p in root.rglob('*'):
+            if not p.is_file():
+                continue
+            parts = p.parts
+            # 跳过任何祖先为黑名单的路径
+            if any(part in _AT_COMPLETE_EXCLUDE for part in parts):
+                continue
+            # 跳过隐藏文件/目录（.env 等用户需要时可以主动敲全名）
+            if any(part.startswith('.') and part not in ('.env',) for part in parts):
+                continue
+            rel = p.relative_to(root).as_posix()
+            _WORKSPACE_FILES_CACHE.append(rel)
+        _WORKSPACE_FILES_CACHE.sort(key=lambda x: (not x.endswith('.py'), x))
+    return _WORKSPACE_FILES_CACHE
+
+
 class SlashCommandCompleter:
     """
     当光标前文本从某处起以 ``/`` 为前缀时，按前缀过滤
@@ -703,3 +759,18 @@ class SlashCommandCompleter:
                     start_position=-len(fragment),
                     display_meta=meta,
                 )
+
+        # ── @ 文件补全 ──────────────────────────────────────────────────────────
+        # 当行内以 @ 开头时，触发工作区文件模糊补全。
+        # 例：输入 "@src/ma" → 补全为 "src/main.py"
+        at_trigger = re.search(r'(^|\s)(@[^\s]*)$', line)
+        if at_trigger is not None:
+            search_fragment = at_trigger.group(2)  # e.g. "@src/ma"
+            query = search_fragment[1:] if search_fragment.startswith('@') else search_fragment
+            for fpath in _get_workspace_files_cached():
+                if _fuzzy_subsequence_match(query, fpath):
+                    yield Completion(
+                        fpath,
+                        start_position=-len(search_fragment),
+                        display_meta='📎 挂载文件',
+                    )
