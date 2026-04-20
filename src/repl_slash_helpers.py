@@ -714,6 +714,15 @@ class SlashCommandCompleter:
         base_commands: list[tuple[str, str]] = [
             ('/help', '📖 查看所有可用指令与说明'),
             ('/clear', '🧽 清空屏幕显示 (不丢失记忆)'),
+            ('/undo', '↩️ 撤销上一次执行的代码修改并回滚上下文'),
+            ('/new', '✨ 清空记忆，开启全新会话'),
+            ('/memo', '🧠 提取当前会话摘要存入长期记忆'),
+            ('/doctor', '🩺 运行系统体检，检查环境状态'),
+            ('/cost', '💰 查看 Token 消耗与估算费用'),
+            ('/diff', '📝 查看当前工作区待处理的代码 Diff'),
+            ('/status', '📊 查看引擎运行状态与模型配置'),
+            ('/sessions', '📂 查看并管理历史会话记录'),
+            ('/load', '📥 加载指定的历史会话'),
             ('/exit', '🚪 退出 Scream Code (同 /quit)'),
             ('/quit', '🚪 退出 Scream Code (同 /exit)'),
         ]
@@ -762,7 +771,7 @@ class SlashCommandCompleter:
 
         # ── @ 文件补全 ──────────────────────────────────────────────────────────
         # 当行内以 @ 开头时，触发工作区文件模糊补全。
-        # 例：输入 "@src/ma" → 补全为 "src/main.py"
+        # 例：输入 "@src/ma" → 补全为 "@src/main.py"（插入时保留 @）
         at_trigger = re.search(r'(^|\s)(@[^\s]*)$', line)
         if at_trigger is not None:
             search_fragment = at_trigger.group(2)  # e.g. "@src/ma"
@@ -770,7 +779,8 @@ class SlashCommandCompleter:
             for fpath in _get_workspace_files_cached():
                 if _fuzzy_subsequence_match(query, fpath):
                     yield Completion(
-                        fpath,
+                        text='@' + fpath,
                         start_position=-len(search_fragment),
+                        display=fpath,
                         display_meta='📎 挂载文件',
                     )

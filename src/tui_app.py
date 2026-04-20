@@ -27,12 +27,9 @@ _BRAND_SOFT = '#A5B4FC'
 _ASSISTANT_SURFACE = '#161622'
 _USER_ACCENT = '#c4b5fd'
 _current_team_agent: str | None = None
-_FEISHU_STATUS_CACHE: dict[str, Any] = {
-    'status': False,
-    'raw_status': False,
-    'last_raw_change': 0.0,
-}
 _FEISHU_STATUS_DEBOUNCE_SEC = 3.0
+_feishu_last_raw: bool = False
+_feishu_last_change: float = 0.0
 
 
 def set_current_team_agent(agent_name: str | None) -> None:
@@ -280,73 +277,57 @@ def _token_progress_bar(token_pct: int) -> dict[str, Any]:
     }
 
 
+def neural_status_stream_footer_markup(engine: Any) -> str:
+    """极简单行状态栏：去装饰线，字段用 │ 分隔。"""
+    f = neural_status_fields(engine)
+    m = f['model']
+
+    mcp_on = getattr(engine, 'mcp_online_mode', False)
+    mcp_txt = '[#4ade80]🛜 浏览器MCP.on[/#4ade80]' if mcp_on else '[dim]🛜 浏览器MCP.off[/dim]'
+
+    sb_txt = '[#4ade80]🔒沙箱.on[/#4ade80]' if f['sandbox_on'] else '[dim]🔒沙箱.off[/dim]'
+    team_txt = '[#facc15]🐺群狼.on[/#facc15]' if f['team'] else '[dim]🐺群狼.off[/dim]'
+
+    fs_on = _debounced_feishu_running()
+    fs_txt = '[#818cf8]📟飞书.on[/#818cf8]' if fs_on else '[dim]📟飞书.off[/dim]'
+
+    total = f['total_tokens']
+    try:
+        budget = int(getattr(getattr(engine, 'config', None), 'max_budget_tokens', 12000000))
+    except Exception:
+        budget = 12000000
+    budget_disp = f'{budget / 1_000_000:.0f}M' if budget >= 1_000_000 else f'{budget // 1000}K'
+
+    tok_color = _token_progress_bar(f['token_pct'])['rich_color']
+    tok_txt = f'[{tok_color}]💰Token（{total}/{budget_disp}）[/{tok_color}]'
+
+    sep = ' │ '
+
+    return (
+        f'{mcp_txt}{sep}'
+        f'[bold #2dd4bf]【{m}】[/bold #2dd4bf]{sep}'
+        f'{sb_txt}{sep}'
+        f'[#5eead4]🧠记忆.{f["memory_n"]}条[/#5eead4]{sep}'
+        f'{team_txt}{sep}'
+        f'{fs_txt}{sep}'
+        f'{tok_txt}'
+    )
+
+
 def _debounced_feishu_running() -> bool:
+    global _feishu_last_raw, _feishu_last_change
     from .ui.status_bar import is_feishu_running
 
     now = time.monotonic()
+    prev_raw = _feishu_last_raw
     raw = bool(is_feishu_running())
-    if raw != bool(_FEISHU_STATUS_CACHE.get('raw_status', False)):
-        _FEISHU_STATUS_CACHE['raw_status'] = raw
-        _FEISHU_STATUS_CACHE['last_raw_change'] = now
+    if raw != _feishu_last_raw:
+        _feishu_last_raw = raw
+        _feishu_last_change = now
     effective = raw
-    if (
-        not raw
-        and bool(_FEISHU_STATUS_CACHE.get('status', False))
-        and (now - float(_FEISHU_STATUS_CACHE.get('last_raw_change', 0.0)))
-        < _FEISHU_STATUS_DEBOUNCE_SEC
-    ):
-        # 短时间 OFF 抖动：维持上一帧 ON，避免底栏闪烁。
+    if not raw and prev_raw and (now - _feishu_last_change) < _FEISHU_STATUS_DEBOUNCE_SEC:
         effective = True
-    _FEISHU_STATUS_CACHE['status'] = bool(effective)
     return bool(effective)
-
-
-def _feishu_stream_fragment_debounced() -> str:
-    on = _debounced_feishu_running()
-    if on:
-        return '  ·  [bold #4F46E5 on #09090b][● Feishu: ON][/bold #4F46E5 on #09090b]'
-    return (
-        '  ·  [dim #71717a][○ Feishu: OFF][/dim #71717a] '
-        '[dim #52525b]（/feishu start）[/dim #52525b]'
-    )
-
-
-def _feishu_toolbar_fragment_debounced() -> str:
-    if _debounced_feishu_running():
-        return '<style fg="#4F46E5"><b>[● Feishu: ON]</b></style>'
-    return (
-        '<style fg="#71717a"><b>[○ Feishu: OFF]</b></style>  '
-        '<style fg="#52525b">· /feishu start 开启侧车</style>'
-    )
-
-
-def neural_status_stream_footer_markup(engine: Any) -> str:
-    """Rich ``Text.from_markup`` 双行仪表盘；与底栏语义/层级对齐，嵌入 ``Live`` 底部。"""
-    f = neural_status_fields(engine)
-    sb_on = (
-        '[bold #4ade80]🛡️ 沙箱: ON[/bold #4ade80]'
-        if f['sandbox_on']
-        else '[bold #f87171]🔓 沙箱: OFF[/bold #f87171]'
-    )
-    team = '[bold #fbbf24]🐺 TEAM[/bold #fbbf24]' if f['team'] else '[dim]单人[/dim]'
-    tok = _token_progress_bar(f['token_pct'])
-    feishu_seg = _feishu_stream_fragment_debounced()
-    level_txt = (
-        'Safe'
-        if tok['level'] == 'safe'
-        else 'Warning'
-        if tok['level'] == 'warning'
-        else 'Danger'
-    )
-    return (
-        '[dim #6b7280]╭─ Neural Console ───────────────────────────────────────────────[/dim #6b7280]\n'
-        f'[{_BRAND_HEX}]◈[/] [bold #2dd4bf][{f["model"]}][/bold #2dd4bf]  │  {sb_on}  │  '
-        f'[bold #5eead4]🧠 记忆: {f["memory_n"]}条[/bold #5eead4]  │  {team}{feishu_seg}\n'
-        f'[dim #6b7280]╰─[/dim #6b7280] '
-        f'[bold {tok["rich_color"]}]📊 Token [{tok["filled"]}{tok["empty"]}] {tok["pct"]}%[/bold {tok["rich_color"]}] '
-        f'[dim](Σ {f["total_tokens"]})[/dim]  [dim]|[/dim]  '
-        f'[bold {tok["rich_color"]}]{level_txt}[/bold {tok["rich_color"]}]'
-    )
 
 
 def _tui_load_dotenv_layers() -> None:
@@ -406,50 +387,41 @@ def _print_user_message(console: Any, text: str) -> None:
 
 
 def _get_bottom_toolbar(engine: Any) -> Any:
-    """紧贴输入行下方、全宽持久渲染；由 ``Style`` 铺深蓝近黑底。"""
+    """极简单行底部栏：字段用 │ 分隔，无装饰线。"""
     from prompt_toolkit.formatted_text import HTML
 
-    import html as html_mod
-
-    from .main import render_mcp_online_toolbar_badge
-
     f = neural_status_fields(engine)
-    m = html_mod.escape(f['model'])
-    sb_txt = '🛡️ 沙箱: ON' if f['sandbox_on'] else '🔓 沙箱: OFF'
-    sb_cls = 'ansigreen' if f['sandbox_on'] else 'ansired'
-    tok = _token_progress_bar(f['token_pct'])
-    token_bar = f'[{tok["filled"]}{tok["empty"]}] {tok["pct"]}%'
-    team = (
-        '<ansiyellow><b>🐺 TEAM</b></ansiyellow>'
-        if f['team']
-        else '<ansibrightblack>单人</ansibrightblack>'
-    )
-    web_badge = render_mcp_online_toolbar_badge(engine)
-    feishu_seg = _feishu_toolbar_fragment_debounced()
+    m = f['model']
+
+    mcp_on = getattr(engine, 'mcp_online_mode', False)
+    mcp_txt = '<ansigreen>🛜 浏览器MCP.on</ansigreen>' if mcp_on else '<ansibrightblack>🛜 浏览器MCP.off</ansibrightblack>'
+
+    sb_txt = '<ansigreen>🔒沙箱.on</ansigreen>' if f['sandbox_on'] else '<ansibrightblack>🔒沙箱.off</ansibrightblack>'
+    team_txt = '<ansiyellow>🐺群狼.on</ansiyellow>' if f['team'] else '<ansibrightblack>🐺群狼.off</ansibrightblack>'
+
+    fs_on = _debounced_feishu_running()
+    fs_txt = '<ansipurple>📟飞书.on</ansipurple>' if fs_on else '<ansibrightblack>📟飞书.off</ansibrightblack>'
+
+    total = f['total_tokens']
+    try:
+        budget = int(getattr(getattr(engine, 'config', None), 'max_budget_tokens', 12000000))
+    except Exception:
+        budget = 12000000
+    budget_disp = f'{budget / 1_000_000:.0f}M' if budget >= 1_000_000 else f'{budget // 1000}K'
+
+    tok_color = _token_progress_bar(f['token_pct'])['html_color']
+    tok_txt = f'<{tok_color}><b>💰Token（{total}/{budget_disp}）</b></{tok_color}>'
+
+    sep = ' │ '
+
     return HTML(
-        ' '
-        '<ansibrightblack>╭─ Neural Console ───────────────────────────────────────────────</ansibrightblack>\n'
-        f'{web_badge}'
-        '<ansicyan><b>◈</b></ansicyan> '
-        f'<ansigreen><b>[{m}]</b></ansigreen>  '
-        '<ansiblue>║</ansiblue>  '
-        f'<{sb_cls}><b>{html_mod.escape(sb_txt)}</b></{sb_cls}>  '
-        '<ansiblue>║</ansiblue>  '
-        '<ansicyan><b>🧠 记忆</b></ansicyan> '
-        f'<ansigreen><b>{f["memory_n"]}条</b></ansigreen>  '
-        '<ansiblue>║</ansiblue>  '
-        f'{team}  '
-        '<ansiblue>║</ansiblue>  '
-        f'{feishu_seg}\n'
-        ' '
-        '<ansibrightblack>╰─</ansibrightblack> '
-        '<ansicyan><b>📊 Token</b></ansicyan> '
-        f'<{tok["html_color"]}><b>{html_mod.escape(token_bar)}</b></{tok["html_color"]}>  '
-        f'<ansibrightblack>Σ {f["total_tokens"]}</ansibrightblack>  '
-        '<ansibrightblack>|</ansibrightblack>  '
-        f'<{tok["html_color"]}>'
-        + ('Safe' if tok['level'] == 'safe' else 'Warning' if tok['level'] == 'warning' else 'Danger')
-        + f'</{tok["html_color"]}>'
+        f'{mcp_txt}{sep}'
+        f'<ansicyan>【{m}】</ansicyan>{sep}'
+        f'{sb_txt}{sep}'
+        f'<ansicyan>🧠记忆.{f["memory_n"]}条</ansicyan>{sep}'
+        f'{team_txt}{sep}'
+        f'{fs_txt}{sep}'
+        f'{tok_txt}'
     )
 
 
@@ -547,7 +519,6 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
 
     session = _build_tui_prompt_session(engine)
     current_error_msg = ''
-    _thinking_emojis = ['🤔', '💭', '💡', '✨', '⚡️']
 
     def _set_stream_input_feedback(msg: str) -> None:
         nonlocal current_error_msg
@@ -567,18 +538,50 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
         except Exception:
             pass
 
+    _stream_toolbar_sig: tuple[Any, ...] | None = None
+
+    def _toolbar_refresh_signature() -> tuple[Any, ...]:
+        """与底部状态栏展示相关的字段快照；仅当变化时才应触发 invalidate，避免流式期间整屏闪烁。"""
+        f = neural_status_fields(engine)
+        mcp_on = getattr(engine, 'mcp_online_mode', False)
+        fs_on = _debounced_feishu_running()
+        try:
+            budget = int(getattr(getattr(engine, 'config', None), 'max_budget_tokens', 12000000))
+        except Exception:
+            budget = 12000000
+        return (
+            f['model'],
+            f['sandbox_on'],
+            f['memory_n'],
+            f['token_pct'],
+            f['total_tokens'],
+            f['team'],
+            mcp_on,
+            fs_on,
+            budget,
+        )
+
+    def _on_stream_heartbeat_refresh_if_changed() -> None:
+        nonlocal _stream_toolbar_sig
+        try:
+            sig = _toolbar_refresh_signature()
+            if _stream_toolbar_sig is None:
+                _stream_toolbar_sig = sig
+                return
+            if sig != _stream_toolbar_sig:
+                _stream_toolbar_sig = sig
+                _invalidate_prompt()
+        except Exception:
+            pass
+
     def _on_team_agent(agent_name: str | None) -> None:
         set_current_team_agent(agent_name)
         _invalidate_prompt()
 
-    # 靛蓝品牌提示符：须为严格 XML（勿用 `<style ... bold>` 无值属性，会触发 ExpatError）
-    input_divider = '<style fg="ansibrightblack">╭─ Input ─────────────────────────────────────────────────────</style>'
-
     def idle_prompt_html() -> Any:
         tray = _render_context_tray_html(engine)
         return HTML(
-            f'{tray}{input_divider}\n'
-            f'<style fg="{_BRAND_HEX}"><b>尖叫&gt; </b></style>'
+            f'{tray}<style fg="{_BRAND_HEX}"><b>尖叫&gt; </b></style>'
         )
 
     def generating_prompt_html() -> Any:
@@ -589,21 +592,24 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                 '(输入 /stop 终止)</style>'
             )
         else:
-            idx = int(time.time() * 2.5) % len(_thinking_emojis)
+            # 固定文案，避免与 heartbeat 叠加时因时间片轮换 emoji 导致整行闪烁
             tip = (
-                f'<style fg="ansibrightblack">{_thinking_emojis[idx]} 神经链路生成中... '
+                '<style fg="ansibrightblack">✨ 神经链路生成中... '
                 '(输入 /stop 终止)</style>'
             )
-        err = (
-            f'<style fg="ansired"><b>{current_error_msg}</b></style>'
+        err_html = (
+            f'<style fg="ansired"><b>{current_error_msg}</b></style>\n'
             if current_error_msg
             else ''
         )
+        is_approving = getattr(engine, 'pending_tool_approval', None) is not None
+        if is_approving:
+            prompt_str = '<style fg="ansired"><b>[Y/n/a] 审批&gt; </b></style>'
+        else:
+            prompt_str = f'<style fg="{_BRAND_HEX}"><b> 尖叫&gt; </b></style>'
         return HTML(
-            f'{tip}'
-            f'{err}\n'
-            f'{_render_context_tray_html(engine)}{input_divider}\n'
-            f'<style fg="{_BRAND_HEX}"><b> 尖叫&gt; </b></style>'
+            f'{tip}\n{err_html}{_render_context_tray_html(engine)}'
+            f'{prompt_str}'
         )
 
     while True:
@@ -654,7 +660,7 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                         prompt_message_html=generating_prompt_html,
                         bottom_toolbar=lambda: _get_bottom_toolbar(engine),
                         on_stream_input_feedback=_set_stream_input_feedback,
-                        on_stream_heartbeat=_invalidate_prompt,
+                        on_stream_heartbeat=_on_stream_heartbeat_refresh_if_changed,
                         on_team_agent=_on_team_agent,
                     )
                 except KeyboardInterrupt:
@@ -699,7 +705,7 @@ def run_python_tui_repl(*, llm_enabled: bool = True, route_limit: int = 5) -> in
                 prompt_message_html=generating_prompt_html,
                 bottom_toolbar=lambda: _get_bottom_toolbar(engine),
                 on_stream_input_feedback=_set_stream_input_feedback,
-                on_stream_heartbeat=_invalidate_prompt,
+                on_stream_heartbeat=_on_stream_heartbeat_refresh_if_changed,
                 on_team_agent=_on_team_agent,
             )
         except KeyboardInterrupt:

@@ -17,6 +17,7 @@ from typing import Any
 
 import rich.markdown as _rich_markdown_mod
 from rich.markdown import CodeBlock, Markdown
+from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -48,6 +49,8 @@ _StockMarkdownContext = _rich_markdown_mod.MarkdownContext
 class StreamChunker:
     """
     增量静态渲染器：防止 Live 组件高度超限，并解决 O(N^2) 渲染卡顿。
+    新增「动态思考折叠」：<thinking>...</thinking> 流式标签在 Live 内被拦截，
+    仅在静态历史中留下单行耗时提示，Diff 为唯一焦点。
 
     算法逻辑：
     - 每次 text_delta 到来，先拼入 full_buffer。
@@ -58,34 +61,118 @@ class StreamChunker:
     - 流结束时 flush_remaining() 将最后尾巴也静态打印。
     """
 
+    _THINKING_OPEN = '<thinking>'
+    _THINKING_CLOSE = '</thinking>'
+    _THINKING_TOKEN = '<THINKING_IN_PROGRESS>'
+
     def __init__(self, console: Any, code_theme: str = STREAMING_CODE_THEME) -> None:
         self.console = console
         self.code_theme = code_theme
         self.full_buffer = ''
         self.flushed_length = 0
+        self.in_thinking = False
+        self.think_start_time = 0.0
+        self._thinking_depth = 0  # 支持嵌套 thinking 标签
 
     def process_and_flush(self, delta: str) -> str:
         """
         处理新的 delta，将已确定的安全段落静态打印，返回未完成的尾巴供 Live 渲染。
+        当 in_thinking==True 时返回 _THINKING_TOKEN，调用方渲染暗色动画提示。
         """
+        import time as _time
+
         self.full_buffer += delta
         unflushed = self.full_buffer[self.flushed_length:]
 
+        # ── 思考链状态机 ─────────────────────────────────────────────────────
+        # 检测流式 token 切割：<thin / king> 可能跨 delta 到达
+        self._update_thinking_state(unflushed)
+        if self.in_thinking:
+            return self._THINKING_TOKEN
+
+        # ── 正常段落刷新 ─────────────────────────────────────────────────────
         last_double_newline = unflushed.rfind('\n\n')
 
         if last_double_newline != -1:
             text_up_to_split = self.full_buffer[: self.flushed_length + last_double_newline]
-            if text_up_to_split.count('```') % 2 == 0:
+            # 围栏计数需要排除当前 in_thinking 的 open tag
+            fence_safe = text_up_to_split.count('```') % 2 == 0
+            if fence_safe:
                 chunk_to_flush = unflushed[:last_double_newline].strip()
                 if chunk_to_flush:
-                    # thinking 折叠：把 <thinking>...</thinking> 替换为带左边框的暗色斜体段落
-                    chunk_to_flush = self._render_thinking_fold(chunk_to_flush)
-                    self.console.print(
-                        Markdown(chunk_to_flush, code_theme=self.code_theme)
-                    )
+                    chunk_to_flush = self._strip_thinking_blocks(chunk_to_flush)
+                    if chunk_to_flush:
+                        self.console.print(
+                            Markdown(chunk_to_flush, code_theme=self.code_theme)
+                        )
                 self.flushed_length += last_double_newline + 2
 
-        return self.full_buffer[self.flushed_length:]
+        tail = self.full_buffer[self.flushed_length:]
+        if self._has_open_thinking(tail):
+            return self._THINKING_TOKEN
+        return tail
+
+    def _update_thinking_state(self, text: str) -> None:
+        """
+        扫描 text 片段，维护 in_thinking 状态和嵌套深度。
+        处理 token 流式切割场景（<thin / king> 分片到达）。
+        """
+        import re
+
+        if self.in_thinking:
+            # 查找闭合标签（可能分片到达：</think /ing> 等）
+            # 用简单字符串查找向后扫描更稳健
+            close_idx = -1
+            search_from = max(0, len(self.full_buffer) - len(text) - 50)
+            window = self.full_buffer[search_from:]
+            ci = window.find(self._THINKING_CLOSE)
+            if ci != -1:
+                close_idx = search_from + ci
+                import time
+
+                duration = time.time() - self.think_start_time
+                self.in_thinking = False
+                self._thinking_depth = 0
+                flushed = self.full_buffer[max(0, self.flushed_length - 1):close_idx + len(self._THINKING_CLOSE)]
+                # 从已刷新部分剥离刚才闭合的 thinking 块，不静态打印内容
+                stripped = self._strip_thinking_blocks(flushed)
+                if stripped.strip():
+                    self.console.print(
+                        Markdown(stripped, code_theme=self.code_theme)
+                    )
+                self.console.print(
+                    f'[dim]✓ 深度推演 ({duration:.1f}s)[/dim]'
+                )
+        else:
+            # 尚未在 thinking 中，查找 opening tag（可能分片）
+            open_idx = -1
+            search_from = max(0, len(self.full_buffer) - len(text) - 50)
+            window = self.full_buffer[search_from:]
+            oi = window.find(self._THINKING_OPEN)
+            if oi != -1:
+                import time
+
+                open_idx = search_from + oi
+                self.in_thinking = True
+                self.think_start_time = time.time()
+                self._thinking_depth = 1
+
+    def _has_open_thinking(self, text: str) -> bool:
+        """检查 text 末尾是否有未闭合的 <thinking> 标签（可能分片）。"""
+        for i in range(len(text) - len(self._THINKING_OPEN), -1, -1):
+            if text[i:].startswith(self._THINKING_OPEN):
+                return True
+        return False
+
+    def _strip_thinking_blocks(self, text: str) -> str:
+        """从 text 中移除所有完整的 <thinking>...</thinking> 块，不打印内容。"""
+        import re
+
+        pattern = re.compile(
+            r'<thinking>[\s\S]*?</thinking>',
+            re.IGNORECASE,
+        )
+        return pattern.sub('', text)
 
     @staticmethod
     def _render_thinking_fold(text: str) -> str:
@@ -573,6 +660,62 @@ def render_approval_card(tool_name: str, arguments: dict[str, Any]) -> Any:
         border_style='#f59e0b',
         padding=(1, 2),
         expand=True,
+    )
+
+
+def render_and_print_file_diff(
+    console: Any,
+    file_path: str,
+    new_content: str,
+    *,
+    theme: str = 'ansi_dark',
+) -> None:
+    """
+    读取原文件，与新内容比对，打印高级 Git Unified Diff 视图。
+    使用 Rich Syntax + diff lexer，自动红绿背景高亮。
+    """
+    path = Path(file_path)
+    old_content = ''
+    if path.exists():
+        try:
+            old_content = path.read_text(encoding='utf-8')
+        except OSError:
+            old_content = ''
+
+    diff_lines = list(
+        difflib.unified_diff(
+            old_content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f'a/{file_path} (Original)',
+            tofile=f'b/{file_path} (Modified)',
+            n=3,
+        )
+    )
+
+    if not diff_lines:
+        console.print(
+            Panel(
+                '[dim]AI 尝试覆写文件，但内容与硬盘上完全一致，无实质性代码变更。[/dim]',
+                title=f'📝 [bold yellow]No Changes: {file_path}[/]',
+                border_style='yellow',
+            )
+        )
+        return
+
+    diff_str = ''.join(diff_lines)
+    diff_syntax = Syntax(
+        diff_str,
+        lexer='diff',
+        theme=theme,
+        background_color='default',
+        word_wrap=True,
+    )
+    console.print(
+        Panel(
+            diff_syntax,
+            title=f'📝 [bold cyan]Pending Changes: {file_path}[/]',
+            border_style='cyan',
+        )
     )
 
 

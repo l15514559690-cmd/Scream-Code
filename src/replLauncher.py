@@ -4,14 +4,47 @@ import io
 import itertools
 import json
 import os
+import queue
 import sys
 import time
+from contextlib import contextmanager
 from typing import Any
 
 from rich.spinner import Spinner
 from rich.markdown import Markdown
 
 from .agent_cancel import reset_agent_cancel
+from .repl_ui_render import (
+    STREAMING_CODE_THEME,
+    StreamChunker,
+    _force_soft_close_fence_if_unbalanced,
+    stabilize_streaming_markdown_fences,
+    render_and_print_file_diff,
+)
+
+
+@contextmanager
+def _safe_prompt_toolkit_exit_patch():
+    """仅在流式并发回合期间屏蔽 prompt_toolkit 双重退出竞态。"""
+    from prompt_toolkit.application.application import Application
+
+    original_exit = Application.exit
+
+    def _safe_app_exit(self, result=None, exception=None, style=''):
+        if self.future is not None and self.future.done():
+            return
+        try:
+            original_exit(self, result=result, exception=exception, style=style)
+        except Exception as e:
+            if 'Return value already set' in str(e):
+                return
+            raise
+
+    Application.exit = _safe_app_exit
+    try:
+        yield
+    finally:
+        Application.exit = original_exit
 
 # 引入活泼的 ASCII / 全角颜文字作为思考动画（与 _poll 内 Status.update 联动）
 KAWAII_FRAMES = [
@@ -605,6 +638,7 @@ class _StreamingTurnSession:
         self.last_painted_display_len = 0
         self.approval_future: Any = None
         self.is_hidden_analyst = False
+        self.chunker = StreamChunker(console, STREAMING_CODE_THEME)
 
     def _is_sensitive_tool(self, tool_name: str) -> bool:
         name = (tool_name or '').strip().lower()
@@ -621,10 +655,21 @@ class _StreamingTurnSession:
         return name not in auto
 
     def _request_tool_approval_sync(self, tool_name: str, tool_args: str) -> bool:
-        from .repl_ui_render import render_approval_card
+        from .repl_ui_render import render_and_print_file_diff, render_approval_card
 
         args_obj = _safe_json_object(tool_args)
-        self.console.print(render_approval_card(tool_name, args_obj))
+
+        # 写文件工具优先展示 Diff 视图，拒绝盲盒审查
+        if tool_name in _DIFFABLE_WRITE_TOOL_NAMES:
+            raw_path = _pick_first_file_path_from_args(tool_args)
+            new_content = _extract_new_content_from_args(tool_args)
+            if raw_path and new_content:
+                self.console.print()
+                render_and_print_file_diff(self.console, raw_path, new_content)
+                self.console.print()
+        else:
+            self.console.print(render_approval_card(tool_name, args_obj))
+
         try:
             ans = input('同意执行吗？[y/a/N]: ').strip().lower()
         except EOFError:
@@ -850,51 +895,72 @@ class _StreamingTurnSession:
             pass
 
     def _process_stream_deltas(self, ev: dict[str, Any]) -> None:
-        from .repl_ui_render import (
-            STREAMING_CODE_THEME,
-            _force_soft_close_fence_if_unbalanced,
-            stabilize_streaming_markdown_fences,
-        )
-
         et = ev['type']
         if et == 'text_delta':
             delta = ev.get('text', '')
             self.buffer += delta
-            safe_buf = stabilize_streaming_markdown_fences(self.buffer)
-            safe_buf = _force_soft_close_fence_if_unbalanced(safe_buf)
-            if safe_buf.strip() and self.live is not None:
-                try:
-                    self.live.update(Markdown(safe_buf, code_theme=STREAMING_CODE_THEME))
-                except Exception:
-                    pass
+            safe_tail = self.chunker.process_and_flush(delta)
+            if safe_tail == self.chunker._THINKING_TOKEN:
+                # 思考动画：单行暗色提示，不渲染长篇内容
+                if self.live is not None:
+                    try:
+                        self.live.update(
+                            Markdown('*⠋ Agent 正在深度思考...*', code_theme=STREAMING_CODE_THEME)
+                        )
+                    except Exception:
+                        pass
+            else:
+                safe_buf = stabilize_streaming_markdown_fences(safe_tail)
+                safe_buf = _force_soft_close_fence_if_unbalanced(safe_buf)
+                if safe_buf.strip() and self.live is not None:
+                    try:
+                        self.live.update(Markdown(safe_buf, code_theme=STREAMING_CODE_THEME))
+                    except Exception:
+                        pass
         else:
             self.tool_streaming_buffer += ev.get('fragment', '')
             self.round_saw_tool_json_stream = True
 
-        while not self.outq.empty():
+        while True:
             try:
-                kind, payload = self.outq.queue[0]
-                if kind == 'ok' and payload.get('type') in ('text_delta', 'tool_delta'):
-                    self.outq.get_nowait()
-                    if payload['type'] == 'text_delta':
-                        text = payload.get('text', '')
-                        self.buffer += text
-                        safe_buf = stabilize_streaming_markdown_fences(self.buffer)
-                        safe_buf = _force_soft_close_fence_if_unbalanced(safe_buf)
-                        if safe_buf.strip() and self.live is not None:
-                            try:
-                                self.live.update(
-                                    Markdown(safe_buf, code_theme=STREAMING_CODE_THEME)
-                                )
-                            except Exception:
-                                pass
-                    else:
-                        self.tool_streaming_buffer += payload.get('fragment', '')
-                        self.round_saw_tool_json_stream = True
-                else:
-                    break
+                kind, payload = self.outq.get_nowait()
+            except queue.Empty:
+                break
             except Exception:
                 break
+
+            if kind != 'ok' or payload.get('type') not in ('text_delta', 'tool_delta'):
+                try:
+                    self.outq.put_nowait((kind, payload))
+                except Exception:
+                    pass
+                break
+
+            if payload.get('type') == 'text_delta':
+                text = payload.get('text', '')
+                self.buffer += text
+                safe_tail = self.chunker.process_and_flush(text)
+                if safe_tail == self.chunker._THINKING_TOKEN:
+                    if self.live is not None:
+                        try:
+                            self.live.update(
+                                Markdown('*⠋ Agent 正在深度思考...*', code_theme=STREAMING_CODE_THEME)
+                            )
+                        except Exception:
+                            pass
+                else:
+                    safe_buf = stabilize_streaming_markdown_fences(safe_tail)
+                    safe_buf = _force_soft_close_fence_if_unbalanced(safe_buf)
+                    if safe_buf.strip() and self.live is not None:
+                        try:
+                            self.live.update(
+                                Markdown(safe_buf, code_theme=STREAMING_CODE_THEME)
+                            )
+                        except Exception:
+                            pass
+            else:
+                self.tool_streaming_buffer += payload.get('fragment', '')
+                self.round_saw_tool_json_stream = True
 
         queue_quiet = self.outq.empty()
         self._apply_streaming_live(force=False, queue_quiet=queue_quiet)
@@ -916,7 +982,13 @@ class _StreamingTurnSession:
             body = out.strip()
         body = _dedupe_assistant_scrollback_echoes(body) if body else body
         if body:
-            print_solidified_assistant_markdown(self.console, body)
+            # StreamChunker 已在流式过程中把「双换行安全段」静态落盘；此处只 flush 尾部，
+            # 避免再 print 整篇定稿 Panel 造成 scrollback 重复堆叠。
+            chunker_text = (getattr(self.chunker, 'full_buffer', None) or '').strip()
+            if chunker_text:
+                self.chunker.flush_remaining()
+            else:
+                print_solidified_assistant_markdown(self.console, body)
         if show_tool_collapse:
             self.console.print(
                 tool_params_stream_collapsed_panel(
@@ -1052,9 +1124,7 @@ class _StreamingTurnSession:
                         pass
                     else:
                         _track_active_context_files(self.engine, tool_name, tool_args)
-                        self.console.print(
-                            f'[dim green]✓ 工具执行完毕: {tool_name}[/dim green]'
-                        )
+                        # 幽灵模式：Diff 是唯一焦点，工具成功不留痕
                         if diff_preview is not None:
                             fp, old_c, new_c = diff_preview
                             self.console.print(render_inline_diff(fp, old_c, new_c))
@@ -1187,25 +1257,53 @@ class _StreamingTurnSession:
 
                         self._squash_live_for_halt()
                         self._stop_live()
-                        self.console.print(
-                            render_approval_card(tool_name, _safe_json_object(tool_args))
-                        )
-                        self.console.print()
+                        args_obj = _safe_json_object(tool_args)
+                        if hasattr(self, 'chunker'):
+                            self.chunker.process_and_flush('')
+                        # 写文件工具优先展示 Diff 视图，拒绝盲盒审查
+                        if tool_name in _DIFFABLE_WRITE_TOOL_NAMES:
+                            raw_path = _pick_first_file_path_from_args(tool_args)
+                            new_content = _extract_new_content_from_args(tool_args)
+                            if raw_path and new_content:
+                                self.console.print()
+                                render_and_print_file_diff(self.console, raw_path, new_content)
+                                self.console.print()
+                        else:
+                            self.console.print(render_approval_card(tool_name, args_obj))
+                            self.console.print()
 
                         self.approval_future = asyncio.get_running_loop().create_future()
+                        self.engine.pending_tool_approval = self.approval_future
+
+                        from prompt_toolkit.application import get_app
+                        try:
+                            get_app().invalidate()
+                        except Exception:
+                            pass
+
+                        await asyncio.sleep(0.05)
+
                         answer = await self.approval_future
                         self.approval_future = None
+                        self.engine.pending_tool_approval = None
+
+                        from prompt_toolkit.application import get_app
+                        try:
+                            get_app().invalidate()
+                        except Exception:
+                            pass
+
                         ans = str(answer).strip().lower()
-                        if ans == 'a':
+                        if ans in ('y', 'yes'):
+                            self.console.print(
+                                f'[dim green]✓ 已同意执行: {tool_name}[/dim green]'
+                            )
+                        elif ans in ('a', 'all'):
                             setattr(self.engine, 'session_auto_approve_all', True)
                             self.console.print(
                                 '[dim green]🚀 已开启最高权限，本次会话将自动放行所有操作。[/dim green]'
                             )
-                        elif ans == 'y':
-                            self.console.print(
-                                f'[dim green]✓ 已同意执行: {tool_name}[/dim green]'
-                            )
-                        else:
+                        elif ans in ('n', 'no', ''):
                             try:
                                 self.engine.request_stream_abort()
                             except Exception:
@@ -1216,6 +1314,12 @@ class _StreamingTurnSession:
                                 '[dim red]本次工具调用已被用户拦截，已请求中断当前工具链。[/dim red]'
                             )
                             return
+                        else:
+                            self.console.print(
+                                '[yellow]⚠️ 引擎已挂起：当前有修改代码的高危操作。请输入 [bold]Y[/] (允许) 或 [bold]N[/] (拒绝)。'
+                                '若要继续聊天，请先输入 [bold]N[/] 中断操作。[/yellow]'
+                            )
+                            continue
                     diff_preview: tuple[str, str, str] | None = None
                     if tool_name in _DIFFABLE_WRITE_TOOL_NAMES:
                         raw_path = _pick_first_file_path_from_args(tool_args)
@@ -1233,9 +1337,7 @@ class _StreamingTurnSession:
                         pass
                     else:
                         _track_active_context_files(self.engine, tool_name, tool_args)
-                        self.console.print(
-                            f'[dim green]✓ 工具执行完毕: {tool_name}[/dim green]'
-                        )
+                        # 幽灵模式：Diff 是唯一焦点，工具成功不留痕
                         if diff_preview is not None:
                             fp, old_c, new_c = diff_preview
                             self.console.print(render_inline_diff(fp, old_c, new_c))
@@ -1535,6 +1637,14 @@ def _run_streaming_turn_tui_concurrent(
         if t is None:
             return
         if not t.done():
+            t.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(t), timeout=0.15)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception:
+                pass
+        if not t.done():
             try:
                 buf = getattr(session, 'default_buffer', None)
                 if buf is not None:
@@ -1558,6 +1668,7 @@ def _run_streaming_turn_tui_concurrent(
 
     async def _drive_input() -> None:
         nonlocal active_prompt_task
+
         try:
             while not turn_done.is_set():
                 if callable(on_stream_input_feedback):
@@ -1672,7 +1783,8 @@ def _run_streaming_turn_tui_concurrent(
                 pass
 
     try:
-        asyncio.run(_runner())
+        with _safe_prompt_toolkit_exit_patch():
+            asyncio.run(_runner())
     except KeyboardInterrupt:
         _safe_close_generator(sess.gen)
         sess._drain_queue_after_interrupt()

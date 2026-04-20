@@ -289,7 +289,7 @@ class QueryEnginePort:
         })
 
         for ref in refs:
-            raw = ref.strip()
+            raw = ref.strip(' ,.;?!，。；？！').strip()
             if not raw:
                 continue
             # 支持 @src/main.py 或 @src/main.py:10:20（行范围）
@@ -305,6 +305,16 @@ class QueryEnginePort:
             except ValueError:
                 continue  # 逃出工作区的路径直接跳过
             if not p.is_file():
+                continue
+            # 体积拦截：防止误挂载超大文件导致 Token 爆炸
+            try:
+                if p.stat().st_size > 100 * 1024:  # 100KB
+                    suffix_parts.append(
+                        f'【⚠️ 挂载失败：参考文件 @{raw} 超过 100KB，为防止溢出已被拦截】'
+                    )
+                    mounted.append(raw)
+                    continue
+            except OSError:
                 continue
             # 读取内容
             try:
