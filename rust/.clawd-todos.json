@@ -1,0 +1,27 @@
+[
+  {
+    "content": "Architecture & dependency analysis",
+    "activeForm": "Complete",
+    "status": "completed"
+  },
+  {
+    "content": "Runtime crate deep analysis",
+    "activeForm": "Complete",
+    "status": "completed"
+  },
+  {
+    "content": "CLI & Tools analysis",
+    "activeForm": "Complete",
+    "status": "completed"
+  },
+  {
+    "content": "Code quality verification",
+    "activeForm": "Complete",
+    "status": "completed"
+  },
+  {
+    "content": "Synthesize findings into unified report",
+    "activeForm": "Writing report",
+    "status": "in_progress"
+  }
+]

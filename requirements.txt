@@ -1,0 +1,12 @@
+# Scream Code 1.0 — 运行 src/ 所需第三方库（与 import 对齐）
+# prompt_toolkit + rich：默认 REPL、src/tui_app.py 纯 Python TUI
+openai>=1.40.0,<2
+anthropic>=0.25.0,<1
+python-dotenv>=1.0.0,<2
+prompt_toolkit>=3.0.40,<4
+questionary>=2.0.0,<3
+rich>=13.7.0,<14
+# rich.Syntax / Markdown 代码高亮依赖（建议显式安装，避免环境缺省）
+pygments>=2.15.0,<3
+# 无头浏览器截图（browser_vision）
+playwright>=1.40.0

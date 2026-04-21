@@ -1,0 +1,80 @@
+# --- 密钥与本地环境（切勿提交）---
+# 发版防线显式项：.env · llm_config.json · .port_sessions/ · __pycache__/ · *.pyc · .DS_Store
+.env
+llm_config.json
+.env.local
+.env.*.local
+# 允许提交脱敏样板
+!.env.example
+!llm_config.json.example
+
+# --- 证书与杂项密钥文件 ---
+*.pem
+*.p12
+*.pfx
+secrets/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+*.cover
+.hypothesis/
+tox/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- 技能目录下的字节码 ---
+skills/__pycache__/
+
+# --- 日志与临时输出 ---
+*.log
+logs/
+tmp/
+temp/
+
+# --- 本地会话落盘（勿提交）---
+.port_sessions/
+.scream/
+
+# Agent / 飞书侧车缓存（截图、临时文件，勿提交）
+/.scream_cache/
+
+# --- 可选：编辑器 ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- 仓库既有规则（镜像与本地产物）---
+archive/
+.omx/
+.clawd-agents/
+# Claude Code local artifacts
+.claude/settings.local.json
+.claude/sessions/
+# Rust workspace / nested Claude artifacts (never ship local sessions)
+rust/.claude/
+**/.claw/sessions/

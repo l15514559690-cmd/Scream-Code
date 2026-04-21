@@ -1,0 +1,2332 @@
+from __future__ import annotations
+
+import io
+import itertools
+import json
+import os
+import queue
+import sys
+import time
+from contextlib import contextmanager
+from typing import Any
+
+from .agent_cancel import reset_agent_cancel
+from .repl_ui_render import (
+    STREAMING_CODE_THEME,
+    StreamChunker,
+    render_and_print_file_diff,
+    strip_thinking_blocks_for_display,
+)
+
+
+def _tui_set_stream_label(label: str) -> None:
+    """更新 Python TUI 底部固定状态块（无 tui_app 时静默）。"""
+    try:
+        from .tui_app import set_tui_stream_label
+
+        set_tui_stream_label(label)
+    except Exception:
+        pass
+
+
+def _tui_thinking_status_labels() -> tuple[str, str]:
+    """
+    返回 ``(短标签, 带省略号标签)``。
+    启用模型深度思考时（见 ``llm_settings.is_model_deep_thinking_enabled``）使用「深度思考中…」。
+    """
+    from .llm_settings import is_model_deep_thinking_enabled
+
+    if is_model_deep_thinking_enabled():
+        return ('深度思考中', '深度思考中...')
+    return ('思考中', '思考中...')
+
+
+@contextmanager
+def _safe_prompt_toolkit_exit_patch():
+    """仅在流式并发回合期间屏蔽 prompt_toolkit 双重退出竞态。"""
+    from prompt_toolkit.application.application import Application
+
+    original_exit = Application.exit
+
+    def _safe_app_exit(self, result=None, exception=None, style=''):
+        if self.future is not None and self.future.done():
+            return
+        try:
+            original_exit(self, result=result, exception=exception, style=style)
+        except Exception as e:
+            if 'Return value already set' in str(e):
+                return
+            raise
+
+    Application.exit = _safe_app_exit
+    try:
+        yield
+    finally:
+        Application.exit = original_exit
+
+# 引入活泼的 ASCII / 全角颜文字作为思考动画（与 _poll 内 Status.update 联动）
+KAWAII_FRAMES = [
+    '(>_<)',
+    '(^_^;)',
+    '(＠_＠;)',
+    '(T_T)',
+    '(-_-;)',
+    '(~_~;)',
+    '(*_*)',
+    '(°_o)',
+    '(•_•)',
+    '(@_@)',
+    '(╯°□°）╯',
+]
+_kawaii_cycle = itertools.cycle(KAWAII_FRAMES)
+
+# Slant 风格 ASCII（用户指定，勿改字符结构）
+_SLANT_LOGO_LINES = (
+    '   _____                                 ____      __     ',
+    '  / ___/_____________  ____ _____ ___   / ____/___/ /__   ',
+    '  \\__ \\/ ___/ ___/ _ \\/ __ `/ __ `__ \\ / /   / __  / _ \\  ',
+    ' ___/ / /__/ /  /  __/ /_/ / / / / / // /___/ /_/ /  __/  ',
+    '/____/\\___/_/   \\___/\\__,_/_/ /_/ /_/ \\____/\\__,_/\\___/   ',
+)
+
+
+def build_repl_banner() -> str:
+    return (
+        '当前为「仅说明」模式（例如使用了 `repl --no-llm`）。'
+        '要进入可对话的交互循环并调用大模型，请执行不带 `--no-llm` 的 `python3 -m src.main repl`'
+        '（密钥见 llm_config.json / .env）。也可使用 `summary` 或 `config`。'
+    )
+
+
+def _logo_plain() -> str:
+    return '\n'.join(_SLANT_LOGO_LINES)
+
+
+# 记忆水位（仅 REPL 展示层；不截断请求、不改写历史）
+REPL_MEMORY_WARN_TOTAL_TOKENS = 2_000_000
+REPL_MEMORY_WARN_USER_TURNS = 200
+REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA = 200_000
+REPL_MEMORY_WARN_REPEAT_TURN_DELTA = 40
+# 兼容旧名：默认 token 阈值
+TOKEN_WARNING_THRESHOLD = REPL_MEMORY_WARN_TOTAL_TOKENS
+# session_id -> (上次预警时的累计 tokens, 上次预警时的用户轮次数)
+_REPL_MEMORY_WARN_LAST: dict[str, tuple[int, int]] = {}
+
+
+_CONTEXT_FILE_TOOL_NAMES = frozenset(
+    {
+        'read_local_file',
+        'write_local_file',
+        'read_file',
+        'write_file',
+        'cat',
+        'patch',
+        'apply_patch',
+        'open_file',
+    }
+)
+
+# 高危工具：命中后需要用户审批（Human-in-the-loop）。
+_SENSITIVE_TOOLS = frozenset(
+    {
+        'execute_mac_bash',
+        'run_bash_command',
+        'execute_shell',
+        'write_local_file',
+        'write_file',
+        'patch',
+        'apply_patch',
+    }
+)
+
+
+def _ensure_active_context_files(engine: Any) -> set[str]:
+    cur = getattr(engine, 'active_context_files', None)
+    if isinstance(cur, set):
+        return cur
+    s: set[str] = set()
+    try:
+        setattr(engine, 'active_context_files', s)
+    except Exception:
+        pass
+    return s
+
+
+def _normalize_context_path(raw: str) -> str:
+    t = (raw or '').strip()
+    if not t:
+        return ''
+    p = t.replace('\\', '/')
+    if p.startswith('~'):
+        p = os.path.expanduser(p)
+    if os.path.isabs(p):
+        try:
+            rel = os.path.relpath(p, os.getcwd())
+            if not rel.startswith('..'):
+                p = rel
+        except Exception:
+            pass
+    return p.replace('\\', '/')
+
+
+def _extract_context_paths_from_args(tool_name: str, raw_args: str) -> list[str]:
+    if tool_name not in _CONTEXT_FILE_TOOL_NAMES:
+        return []
+    out: list[str] = []
+    try:
+        args = json.loads(raw_args or '{}')
+    except json.JSONDecodeError:
+        args = {}
+    if not isinstance(args, dict):
+        return out
+    for key in ('file_path', 'path', 'target_file', 'source_file'):
+        v = args.get(key)
+        if isinstance(v, str):
+            n = _normalize_context_path(v)
+            if n:
+                out.append(n)
+    paths = args.get('paths')
+    if isinstance(paths, list):
+        for p in paths:
+            if isinstance(p, str):
+                n = _normalize_context_path(p)
+                if n:
+                    out.append(n)
+    # 去重并保持顺序
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for p in out:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq.append(p)
+    return uniq
+
+
+def _track_active_context_files(engine: Any, tool_name: str, raw_args: str) -> None:
+    files = _ensure_active_context_files(engine)
+    for p in _extract_context_paths_from_args(tool_name, raw_args):
+        files.add(p)
+
+
+_DIFFABLE_WRITE_TOOL_NAMES = frozenset({'write_local_file', 'write_file'})
+
+
+def _pick_first_file_path_from_args(raw_args: str) -> str:
+    try:
+        args = json.loads(raw_args or '{}')
+    except json.JSONDecodeError:
+        return ''
+    if not isinstance(args, dict):
+        return ''
+    for key in ('file_path', 'path', 'target_file'):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ''
+
+
+def _extract_new_content_from_args(raw_args: str) -> str:
+    try:
+        args = json.loads(raw_args or '{}')
+    except json.JSONDecodeError:
+        return ''
+    if not isinstance(args, dict):
+        return ''
+    v = args.get('content')
+    return v if isinstance(v, str) else ''
+
+
+def _safe_json_object(raw_args: str) -> dict[str, Any]:
+    try:
+        obj = json.loads(raw_args or '{}')
+    except json.JSONDecodeError:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _read_old_file_content_for_diff(raw_path: str) -> tuple[str, str]:
+    shown = _normalize_context_path(raw_path)
+    p = raw_path
+    if p.startswith('~'):
+        p = os.path.expanduser(p)
+    abs_path = p if os.path.isabs(p) else os.path.join(os.getcwd(), p)
+    try:
+        from pathlib import Path
+
+        old = Path(abs_path).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        old = ''
+    return shown or p, old
+
+
+def _ensure_stdio_utf8() -> None:
+    """
+    将标准流尽量设为 UTF-8，避免区域设置为 C/latin-1 时中文在 prompt_toolkit 中显示为乱码。
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconf = getattr(stream, 'reconfigure', None)
+        if not callable(reconf):
+            continue
+        try:
+            reconf(encoding='utf-8', errors='replace')
+        except (OSError, ValueError, TypeError, io.UnsupportedOperation):
+            pass
+
+
+def _repl_terminal_soft_reset(console: Any | None) -> None:
+    """
+    Rich（Live / Status）与 prompt_toolkit 交替使用后，部分终端会残留光标或模式状态，
+    导致下一行输入错位或 UTF-8 字符显示异常；在每回合结束后做一次轻量恢复。
+    """
+    if console is not None:
+        try:
+            show = getattr(console, 'show_cursor', None)
+            if callable(show):
+                show(True)
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+
+
+def clear_all_repl_token_warnings() -> None:
+    """供 ``/new`` 等硬重置：清空记忆水位预警的会话缓存（展示层）。"""
+    _REPL_MEMORY_WARN_LAST.clear()
+
+
+def _try_persist_repl_session(engine: Any) -> None:
+    """每回合结束后写入 ``.port_sessions/``，便于关闭终端后自动续聊。"""
+    try:
+        engine.persist_session()
+    except OSError:
+        pass
+
+
+def repl_stdin_flush_pending_if_tty() -> None:
+    """
+    丢弃内核里已为 stdin 排队、但本进程尚未读取的字节。
+
+    在**成功从磁盘恢复会话之后**、首次 ``prompt``/``input`` 之前调用，可避免终端或宿主
+    误注入的上行（例如残留换行）被当成用户主动提交的第一句话，从而意外触发 LLM 回合。
+    非 TTY（管道/重定向）下不操作。
+    """
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+    except ImportError:
+        return
+    try:
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except (OSError, AttributeError):
+        pass
+
+
+def _repl_engine_autoresume(console: Any | None, *, use_rich: bool) -> Any:
+    """
+    若 ``.port_sessions/`` 下存在最近修改的会话 JSON，则 ``from_saved_session`` 恢复；否则空会话。
+    不改变 ``session_store`` 的读写格式，仅组合现有 API。
+    """
+    from .query_engine import QueryEnginePort
+    from .session_store import most_recent_saved_session_id
+
+    sid = most_recent_saved_session_id()
+    if not sid:
+        return QueryEnginePort.from_workspace()
+    try:
+        eng = QueryEnginePort.from_saved_session(sid)
+    except (OSError, FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return QueryEnginePort.from_workspace()
+    repl_stdin_flush_pending_if_tty()
+    if use_rich and console is not None:
+        console.print(
+            f'[dim]已自动恢复上次会话记忆 (ID: {sid})，如需开启全新对话请输出 /new[/dim]'
+        )
+    else:
+        print(
+            f'已自动恢复上次会话记忆 (ID: {sid})；全新对话请输入 /new',
+            flush=True,
+        )
+    return eng
+
+
+def _safe_close_generator(gen: Any) -> None:
+    """关闭事件生成器时吞掉各类异常，避免二次堆栈污染终端。"""
+    if gen is None:
+        return
+    try:
+        gen.close()
+    except BaseException:
+        pass
+
+
+def _token_warning_threshold_for_engine(engine: Any) -> int:
+    """优先读取 ``engine.config.token_warning_threshold``（若为正整数），否则默认 ``REPL_MEMORY_WARN_TOTAL_TOKENS``。"""
+    cfg = getattr(engine, 'config', None)
+    if cfg is None:
+        return REPL_MEMORY_WARN_TOTAL_TOKENS
+    raw = getattr(cfg, 'token_warning_threshold', None)
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    return REPL_MEMORY_WARN_TOTAL_TOKENS
+
+
+def _maybe_print_repl_memory_load_warning(
+    console: Any | None, engine: Any, *, use_rich: bool
+) -> None:
+    """
+    记忆水位预警：仅 ``console.print``，不截断、不改写 engine。
+    在流式回合正常结束后调用。首次在「累计 tokens ≥ 阈值」或「用户轮次 ≥ 阈值」时提示；
+    之后仅当 tokens 再增 ``REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA`` 或轮次再增
+    ``REPL_MEMORY_WARN_REPEAT_TURN_DELTA`` 时重复提示。token 与轮次均回落至阈值以下时重置。
+    """
+    try:
+        u = getattr(engine, 'total_usage', None)
+        if u is None:
+            return
+        inp = int(getattr(u, 'input_tokens', 0))
+        outp = int(getattr(u, 'output_tokens', 0))
+        current_tokens = inp + outp
+    except (TypeError, ValueError):
+        return
+
+    msgs = getattr(engine, 'mutable_messages', None) or []
+    try:
+        user_turns = len(msgs)
+    except TypeError:
+        user_turns = 0
+
+    token_th = _token_warning_threshold_for_engine(engine)
+    turn_th = REPL_MEMORY_WARN_USER_TURNS
+    sid = str(getattr(engine, 'session_id', '') or '') or str(id(engine))
+
+    below_tokens = current_tokens < token_th
+    below_turns = user_turns < turn_th
+    if below_tokens and below_turns:
+        _REPL_MEMORY_WARN_LAST.pop(sid, None)
+        return
+
+    prev = _REPL_MEMORY_WARN_LAST.get(sid)
+    if prev is None:
+        should_warn = True
+    else:
+        last_tok, last_turn = prev
+        should_warn = (
+            current_tokens - last_tok >= REPL_MEMORY_WARN_REPEAT_TOKEN_DELTA
+            or user_turns - last_turn >= REPL_MEMORY_WARN_REPEAT_TURN_DELTA
+        )
+
+    if not should_warn:
+        return
+
+    _REPL_MEMORY_WARN_LAST[sid] = (current_tokens, user_turns)
+
+    from .repl_ui_render import build_token_warning_panel, format_token_warning_plain
+
+    if use_rich and console is not None:
+        console.print()
+        console.print(build_token_warning_panel(current_tokens, token_th))
+        return
+
+    print(format_token_warning_plain(current_tokens, token_th), end='', flush=True)
+
+
+def _print_graceful_interrupt(console: Any | None, *, use_rich: bool) -> None:
+    """
+    Ctrl+C 后的统一提示：保留已输出内容，REPL 不退出，会话对象不丢弃。
+    """
+    primary = '⏸ 已手动中断'
+    hint = (
+        '当前已输出内容已保留。可直接输入下一句继续；本轮若未跑完则不会写入完整对话历史。'
+        '输入 exit 退出。'
+    )
+    if use_rich and console is not None:
+        console.print(f'[bold yellow]{primary}[/bold yellow]')
+        console.print(f'[dim]{hint}[/dim]')
+        return
+    print(f'\n{primary}。{hint}', flush=True)
+
+
+def print_project_memory_loaded_notice() -> None:
+    """Logo 之后调用：若工作区根下存在可用的项目记忆文件，打印一行绿色提示。"""
+    from .project_memory import project_memory_workspace_root, read_first_available_project_memory
+
+    name, _ = read_first_available_project_memory(project_memory_workspace_root())
+    if not name:
+        return
+    msg = f'[+] 已加载项目记忆文档: {name}'
+    try:
+        from rich.console import Console
+
+        Console().print(f'[bold green]{msg}[/bold green]')
+    except ImportError:
+        if sys.stdout.isatty():
+            print(f'\033[1;32m{msg}\033[0m', flush=True)
+        else:
+            print(msg, flush=True)
+
+
+def print_startup_banner(*, ensure_config: bool = True, compact: bool = False) -> None:
+    if ensure_config:
+        try:
+            from . import model_manager
+
+            model_manager.ensure_default_config_file()
+        except OSError:
+            pass
+
+    try:
+        from rich.align import Align
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.text import Text
+    except ImportError:
+        print(_logo_plain())
+        print()
+        return
+
+    console = Console()
+    if compact:
+        compact_text = Text.from_markup(
+            '[bold cyan]SCREAM CODE[/bold cyan]\n'
+            '[dim]Model Config Center[/dim]'
+        )
+        panel = Panel(
+            Align.center(compact_text),
+            border_style='bold cyan',
+            padding=(0, 1),
+            expand=True,
+        )
+    else:
+        logo_lines = list(_SLANT_LOGO_LINES)
+        max_logo_width = max(len(line) for line in logo_lines)
+        # 预留 Panel 左右边框与 padding，避免窄终端时被硬截断。
+        available = max(20, console.width - 6)
+        if available >= max_logo_width:
+            art = Text(_logo_plain(), style='bold cyan')
+            panel = Panel.fit(
+                Align.center(art),
+                border_style='bold cyan',
+                padding=(1, 2),
+            )
+        else:
+            compact_text = Text.from_markup(
+                '[bold cyan]SCREAM CODE[/bold cyan]\n'
+                '[dim]Neural CLI[/dim]'
+            )
+            panel = Panel(
+                Align.center(compact_text),
+                border_style='bold cyan',
+                padding=(0, 1),
+                expand=True,
+            )
+    console.print(panel)
+    console.print()
+
+
+def print_repl_llm_driver_banner(*, console: Any | None) -> None:
+    """REPL + --llm：Logo 之后展示当前激活模型或黄色未配置警告。"""
+    try:
+        from . import model_manager
+    except ImportError:
+        return
+
+    model_manager.ensure_default_config_file()
+    raw = model_manager.read_persisted_config_raw()
+    profile = model_manager.get_active_profile(raw) if raw else None
+
+    if console is None:
+        if profile is None:
+            print('⚠️ 当前无激活的大模型，请配置后再使用！')
+        else:
+            proto = profile.api_protocol if profile.api_protocol in ('openai', 'anthropic') else 'openai'
+            print(
+                f'协议: {proto} | 模型: {profile.model_name} | 状态: 已就绪'
+            )
+        print()
+        return
+
+    from rich.markup import escape
+    from rich.panel import Panel
+    from rich.text import Text
+
+    if profile is None:
+        body = Text.from_markup(
+            '[bold yellow]⚠️ 当前无激活的大模型，请配置后再使用！[/bold yellow]'
+        )
+        console.print(Panel(body, border_style='yellow', expand=True, padding=(0, 2)))
+    else:
+        proto = profile.api_protocol if profile.api_protocol in ('openai', 'anthropic') else 'openai'
+        inner = (
+            f'[bold green]协议: {escape(proto)} | '
+            f'模型: {escape(profile.model_name)} | '
+            f'状态: 已就绪[/bold green]'
+        )
+        body = Text.from_markup(inner)
+        console.print(Panel(body, border_style='bold green', expand=True, padding=(0, 2)))
+    console.print()
+
+
+def _print_assistant_output(console: object, text: str) -> None:
+    from .repl_ui_render import final_assistant_markdown_panel
+
+    stripped = text.strip()
+    if not stripped:
+        return
+    # Live（transient）清场后，仅此一份完整 Panel 写入 scrollback
+    console.print(final_assistant_markdown_panel(stripped))
+    console.print()
+
+
+def _print_assistant_error(console: object, message: str) -> None:
+    from rich.text import Text
+
+    from .repl_ui_render import assistant_panel
+
+    console.print(assistant_panel(Text(message, style='bold red')))
+    console.print()
+
+
+def _dedupe_assistant_scrollback_echoes(text: str) -> str:
+    """
+    折叠展示层偶发的「同段自我介绍 / 同句」重影：相邻完全相同的段落或文本行只保留一份。
+    不影响有意重复的结构化列表（仅合并**连续**相同块）。
+    """
+    raw = (text or '').strip()
+    if not raw:
+        return raw
+    paras = [p.strip() for p in raw.split('\n\n') if p.strip()]
+    merged_p: list[str] = []
+    for p in paras:
+        if merged_p and p == merged_p[-1]:
+            continue
+        merged_p.append(p)
+    t2 = '\n\n'.join(merged_p)
+    lines = t2.splitlines()
+    out_ln: list[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if s and out_ln and s == out_ln[-1].strip():
+            continue
+        out_ln.append(ln)
+    return '\n'.join(out_ln).strip()
+
+
+class _StreamingTurnSession:
+    """单次 LLM 流式回合：后台线程跑事件生成器，主线程或 asyncio 驱动 Rich Live 消费队列。"""
+
+    def __init__(
+        self,
+        engine: Any,
+        runtime: Any,
+        line: str,
+        console: Any,
+        *,
+        route_limit: int,
+        team: bool,
+        status_engine: Any | None,
+        on_team_agent: Any | None = None,
+    ) -> None:
+        self.engine = engine
+        self.runtime = runtime
+        self.line = line
+        self.console = console
+        self.route_limit = route_limit
+        self.team = team
+        self.status_engine = status_engine
+        self.on_team_agent = on_team_agent
+        self.use_live = bool(
+            getattr(console, 'is_terminal', False) and console.is_terminal
+        )
+        self.gen = engine.iter_repl_assistant_events_with_runtime(
+            line, runtime=runtime, route_limit=route_limit, team=team
+        )
+        import queue
+
+        self.outq: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=0)
+        self.buffer = ''
+        self.tool_streaming_buffer = ''
+        self.live: Any = None
+        self.round_saw_tool_json_stream = False
+        self.last_render_time = 0.0
+        self.last_painted_display_len = 0
+        self.approval_future: Any = None
+        self.is_hidden_analyst = False
+        self.chunker = StreamChunker(console, STREAMING_CODE_THEME)
+
+    def _sync_stream_status_label(self) -> None:
+        """根据 buffer / thinking / 工具流同步底部「📍」文案（含群狼角色名）。"""
+        try:
+            from .tui_app import get_current_team_agent, set_tui_stream_label
+        except Exception:
+            return
+        try:
+            agent = get_current_team_agent()
+        except Exception:
+            agent = None
+        think_short, think_dots = _tui_thinking_status_labels()
+        if getattr(self.chunker, 'in_thinking', False):
+            base = think_short
+        elif self.tool_streaming_buffer.strip():
+            base = '调用工具中'
+        elif self.buffer.strip():
+            base = '输出中'
+        else:
+            base = think_dots
+        if agent:
+            set_tui_stream_label(f'群狼 · {agent} · {base}')
+        else:
+            set_tui_stream_label(base)
+
+    def _is_sensitive_tool(self, tool_name: str) -> bool:
+        name = (tool_name or '').strip().lower()
+        if not name or name not in _SENSITIVE_TOOLS:
+            return False
+        if getattr(self.engine, 'session_auto_approve_all', False):
+            return False
+        try:
+            from .claw_config import get_auto_approve_tools
+
+            auto = get_auto_approve_tools()
+        except Exception:
+            auto = set()
+        return name not in auto
+
+    def _request_tool_approval_sync(self, tool_name: str, tool_args: str) -> bool:
+        from .repl_ui_render import render_and_print_file_diff, render_approval_card
+
+        args_obj = _safe_json_object(tool_args)
+
+        # 写文件工具优先展示 Diff 视图，拒绝盲盒审查
+        if tool_name in _DIFFABLE_WRITE_TOOL_NAMES:
+            raw_path = _pick_first_file_path_from_args(tool_args)
+            new_content = _extract_new_content_from_args(tool_args)
+            if raw_path and new_content:
+                self.console.print()
+                render_and_print_file_diff(self.console, raw_path, new_content)
+                self.console.print()
+        else:
+            self.console.print(render_approval_card(tool_name, args_obj))
+
+        try:
+            ans = input('同意执行吗？[y/a/N]: ').strip().lower()
+        except EOFError:
+            ans = 'n'
+        if ans == 'a':
+            setattr(self.engine, 'session_auto_approve_all', True)
+            self.console.print(
+                '[dim green]🚀 已开启最高权限，本次会话将自动放行所有操作。[/dim green]'
+            )
+            return True
+        if ans in ('y', 'yes'):
+            return True
+        # 将拒绝反馈给系统：复用现有中断链路，让后续 tool 调用收到中断标记。
+        try:
+            self.engine.request_stream_abort()
+        except Exception:
+            pass
+        self._drain_queue_after_interrupt()
+        self.console.print(
+            f'[bold red]✗ 已拒绝高危工具执行: {tool_name}[/bold red]\n'
+            '[dim red]本次工具调用已被用户拦截，已请求中断当前工具链。[/dim red]'
+        )
+        return False
+
+    def start_worker(self) -> None:
+        import threading
+
+        outq = self.outq
+        gen = self.gen
+
+        def _worker() -> None:
+            try:
+                for ev in gen:
+                    outq.put(('ok', ev))
+                outq.put(('stop', None))
+            except BaseException as exc:
+                outq.put(('err', exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _streaming_display_payload(self) -> str:
+        display_text = self.buffer
+        if self.tool_streaming_buffer:
+            tool_lines = self.tool_streaming_buffer.splitlines()
+            if len(tool_lines) > 15:
+                rolling_tool = '...\n' + '\n'.join(tool_lines[-15:])
+            else:
+                rolling_tool = self.tool_streaming_buffer
+            display_text += (
+                '\n\n> ⚙️ **正在编写代码与工具参数...**\n```json\n'
+                f'{rolling_tool}\n```'
+            )
+        return display_text
+
+    def _live_frame_renderable(self) -> Any:
+        from .repl_ui_render import (
+            STREAMING_CODE_THEME,
+            streaming_markdown_for_live,
+        )
+        from rich.console import Group
+        from rich.markdown import Markdown
+        from rich.text import Text
+
+        in_thinking = getattr(self.chunker, 'in_thinking', False)
+        buf_empty = not self.buffer.strip() and not self.tool_streaming_buffer.strip()
+
+        if in_thinking:
+            # 状态由底栏 📍 展示；无工具 JSON 时不占屏，避免与输入行叠字
+            if self.tool_streaming_buffer.strip():
+                tool_lines = self.tool_streaming_buffer.splitlines()
+                if len(tool_lines) > 15:
+                    rolling_tool = '...\n' + '\n'.join(tool_lines[-15:])
+                else:
+                    rolling_tool = self.tool_streaming_buffer
+                hint = (
+                    '\n\n> ⚙️ **正在编写代码与工具参数...**\n```json\n'
+                    f'{rolling_tool}\n```'
+                )
+                top = Markdown(hint, code_theme=STREAMING_CODE_THEME)
+            else:
+                top = Text('')
+        elif buf_empty:
+            top = Text('')
+        else:
+            text = strip_thinking_blocks_for_display(self.buffer)
+            if self.tool_streaming_buffer:
+                tool_lines = self.tool_streaming_buffer.splitlines()
+                if len(tool_lines) > 15:
+                    rolling_tool = '...\n' + '\n'.join(tool_lines[-15:])
+                else:
+                    rolling_tool = self.tool_streaming_buffer
+                text += (
+                    '\n\n> ⚙️ **正在编写代码与工具参数...**\n```json\n'
+                    f'{rolling_tool}\n```'
+                )
+            top = streaming_markdown_for_live(text, console=self.console)
+
+        if self.status_engine is None:
+            return top
+        from .tui_app import neural_status_stream_footer_markup
+
+        try:
+            w = int(
+                getattr(getattr(self.console, 'size', None), 'width', None) or 80
+            )
+        except (TypeError, ValueError):
+            w = 80
+        rule_w = max(24, min(max(w - 2, 24), 120))
+        rule = Text('▔' * rule_w, style='dim #0f172a')
+        foot = Text.from_markup(
+            neural_status_stream_footer_markup(self.status_engine)
+        )
+        foot.overflow = 'ellipsis'
+        foot.no_wrap = True
+        return Group(top, rule, foot)
+
+    def _apply_streaming_live(self, *, force: bool, queue_quiet: bool) -> None:
+        from .repl_ui_render import (
+            STREAM_LIVE_MIN_CHAR_DELTA,
+            STREAM_LIVE_MIN_INTERVAL_SEC,
+            STREAM_LIVE_THINKING_ANIM_INTERVAL_SEC,
+        )
+        from rich.live import Live
+
+        if not self.use_live:
+            return
+        display_text = self._streaming_display_payload()
+        dlen = len(display_text)
+        now = time.time()
+        in_thinking = getattr(self.chunker, 'in_thinking', False)
+        buf_empty = not self.buffer.strip() and not self.tool_streaming_buffer.strip()
+        idle_waiting = buf_empty and not in_thinking
+        if not force:
+            if idle_waiting or in_thinking:
+                if (
+                    self.live is not None
+                    and (now - self.last_render_time)
+                    < STREAM_LIVE_THINKING_ANIM_INTERVAL_SEC
+                ):
+                    return
+            else:
+                if dlen == self.last_painted_display_len:
+                    return
+                delta = dlen - self.last_painted_display_len
+                elapsed = now - self.last_render_time
+                if self.live is not None:
+                    if (
+                        delta < STREAM_LIVE_MIN_CHAR_DELTA
+                        and elapsed < STREAM_LIVE_MIN_INTERVAL_SEC
+                        and not queue_quiet
+                    ):
+                        return
+        frame = self._live_frame_renderable()
+        if self.live is None:
+            self.live = Live(
+                frame,
+                console=self.console,
+                auto_refresh=False,
+                transient=True,
+                vertical_overflow='crop',
+            )
+            self.live.start(refresh=True)
+        else:
+            try:
+                self.live.update(frame)
+            except BaseException:
+                pass
+        self.last_render_time = now
+        self.last_painted_display_len = dlen
+
+    def _squash_live_for_halt(self) -> None:
+        if self.use_live and self._streaming_display_payload().strip():
+            self._apply_streaming_live(force=True, queue_quiet=True)
+
+    def _stop_live(self) -> None:
+        if self.live is not None and getattr(self.live, 'is_started', False):
+            try:
+                # 使用 Rich 原生 transient 擦除流程退出，避免缩小边界导致残影。
+                self.live.stop()
+            except BaseException:
+                pass
+        self.live = None
+        self.last_render_time = 0.0
+        self.last_painted_display_len = 0
+
+    def _show_hidden_analyst_spinner(self) -> None:
+        from rich.live import Live
+        from rich.text import Text
+
+        _tui_set_stream_label(_tui_thinking_status_labels()[0])
+        if not self.use_live:
+            return
+        # 底栏已提示状态，Live 区保持空白，避免点阵与输入行叠字
+        blank = Text('')
+        if self.live is None:
+            self.live = Live(
+                blank,
+                console=self.console,
+                auto_refresh=False,
+                transient=True,
+                vertical_overflow='crop',
+            )
+            self.live.start(refresh=True)
+        else:
+            try:
+                self.live.update(blank)
+            except BaseException:
+                pass
+
+    @staticmethod
+    def _queue_try_get(outq: Any) -> tuple[str, Any] | None:
+        import queue
+
+        try:
+            return outq.get(timeout=0.12)
+        except queue.Empty:
+            return None
+
+    def _poll_sync(self) -> dict[str, Any] | None:
+        while True:
+            item = self._queue_try_get(self.outq)
+            if item is None:
+                # 空队列时仍驱动 Live 刷新；并避免 tight spin 占满 CPU
+                self._apply_streaming_live(force=False, queue_quiet=True)
+                time.sleep(0.05)
+                continue
+            kind, payload = item
+            if kind == 'ok':
+                return payload
+            if kind == 'stop':
+                return None
+            if kind == 'err':
+                if isinstance(payload, GeneratorExit):
+                    raise KeyboardInterrupt from None
+                raise payload
+
+    async def _poll_async(self) -> dict[str, Any] | None:
+        import asyncio
+        while True:
+            item = await asyncio.to_thread(self._queue_try_get, self.outq)
+            if item is None:
+                self._apply_streaming_live(force=False, queue_quiet=True)
+                await asyncio.sleep(0.05)
+                continue
+            kind, payload = item
+            if kind == 'ok':
+                return payload
+            if kind == 'stop':
+                return None
+            if kind == 'err':
+                if isinstance(payload, GeneratorExit):
+                    raise KeyboardInterrupt from None
+                raise payload
+
+    def _drain_queue_after_interrupt(self) -> None:
+        import queue
+
+        try:
+            while True:
+                self.outq.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _process_stream_deltas(self, ev: dict[str, Any]) -> None:
+        et = ev['type']
+        if et == 'text_delta':
+            delta = ev.get('text', '')
+            self.buffer += delta
+            self.chunker.process_and_flush(delta)
+        else:
+            self.tool_streaming_buffer += ev.get('fragment', '')
+            self.round_saw_tool_json_stream = True
+
+        while True:
+            try:
+                kind, payload = self.outq.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+
+            if kind != 'ok' or payload.get('type') not in ('text_delta', 'tool_delta'):
+                try:
+                    self.outq.put_nowait((kind, payload))
+                except Exception:
+                    pass
+                break
+
+            if payload.get('type') == 'text_delta':
+                text = payload.get('text', '')
+                self.buffer += text
+                self.chunker.process_and_flush(text)
+            else:
+                self.tool_streaming_buffer += payload.get('fragment', '')
+                self.round_saw_tool_json_stream = True
+
+        queue_quiet = self.outq.empty()
+        self._apply_streaming_live(force=False, queue_quiet=queue_quiet)
+        self._sync_stream_status_label()
+
+    def _render_finish_turn_success(self, ev: dict[str, Any]) -> None:
+        from .repl_ui_render import (
+            print_cyber_turn_divider,
+            print_solidified_assistant_markdown,
+            tool_params_stream_collapsed_panel,
+        )
+        out = ev.get('output', '')
+        show_tool_collapse = self.round_saw_tool_json_stream or bool(
+            self.tool_streaming_buffer.strip()
+        )
+        body = ''
+        if self.buffer.strip():
+            body = self.buffer.strip()
+        elif isinstance(out, str) and out.strip():
+            body = out.strip()
+        body = _dedupe_assistant_scrollback_echoes(body) if body else body
+        if body:
+            body = strip_thinking_blocks_for_display(body).strip()
+        if body:
+            # StreamChunker 已在流式过程中把「双换行安全段」静态落盘；此处只 flush 尾部，
+            # 避免再 print 整篇定稿 Panel 造成 scrollback 重复堆叠。
+            chunker_text = (getattr(self.chunker, 'full_buffer', None) or '').strip()
+            if chunker_text:
+                self.chunker.flush_remaining()
+            else:
+                print_solidified_assistant_markdown(self.console, body)
+        if show_tool_collapse:
+            self.console.print(
+                tool_params_stream_collapsed_panel(
+                    self.tool_streaming_buffer.strip() or None
+                )
+            )
+        if body or show_tool_collapse:
+            self.console.print('[dim #6b7280]╰─ Output ─────────────────────────────────────────[/dim #6b7280]')
+        if body or show_tool_collapse:
+            self.console.print()
+        print_cyber_turn_divider(self.console)
+        _tui_set_stream_label('已完成')
+
+    def _finish_turn_success(self, ev: dict[str, Any]) -> None:
+        # 不在此再 squash Live：最后一帧若经 transient Live 与定稿 Panel 双写，易造成 scrollback 重影。
+        _tui_set_stream_label('整理中')
+        self._stop_live()
+        # 给终端驱动一个最小调度片段，确保擦除帧先落地再打印定稿。
+        time.sleep(0.05)
+        _repl_terminal_soft_reset(self.console)
+        self._render_finish_turn_success(ev)
+        # 一个空行隔开输出区与下一轮输入
+        self.console.print()
+
+    async def _finish_turn_success_async(self, ev: dict[str, Any]) -> None:
+        import asyncio
+
+        _tui_set_stream_label('整理中')
+        self._stop_live()
+        await asyncio.sleep(0.05)
+        _repl_terminal_soft_reset(self.console)
+        self._render_finish_turn_success(ev)
+        self.console.print()
+
+    def run_sync_loop(self) -> None:
+        import traceback as _tb
+
+        from .repl_ui_render import (
+            print_cyber_turn_divider,
+            render_inline_diff,
+            tool_execution_status_message,
+        )
+
+        if self.use_live:
+            print_cyber_turn_divider(self.console)
+            self._apply_streaming_live(force=True, queue_quiet=False)
+
+        _tui_set_stream_label(_tui_thinking_status_labels()[1])
+
+        try:
+            pending: dict[str, Any] | None = self._poll_sync()
+            while pending is not None:
+                ev = pending
+                pending = None
+                et = ev['type']
+
+                if et == 'blocked':
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    _tui_set_stream_label('失败')
+                    _print_assistant_output(self.console, ev['output'])
+                    return
+                if et == 'llm_error':
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    _tui_set_stream_label('失败')
+                    _print_assistant_error(self.console, ev['output'])
+                    return
+                if et == 'team_agent':
+                    if callable(self.on_team_agent):
+                        try:
+                            self.on_team_agent(ev.get('agent'))
+                        except Exception:
+                            pass
+                    base_agent = str(ev.get('agent', 'Agent'))
+                    _tui_set_stream_label(f'群狼 · {base_agent}')
+                    self.is_hidden_analyst = base_agent == 'Analyst'
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    if self.is_hidden_analyst:
+                        self._show_hidden_analyst_spinner()
+                        pending = self._poll_sync()
+                        continue
+                    styles = {
+                        'Planner': 'bold cyan',
+                        'Coder': 'bold green',
+                        'Reviewer': 'bold yellow',
+                    }
+                    st = styles.get(base_agent, 'bold white')
+                    current_round = ev.get('round')
+                    max_rounds = ev.get('max_rounds')
+                    if current_round is not None and max_rounds is not None:
+                        self.console.print(
+                            f'[{st}]━━ {base_agent} (Round {current_round}/{max_rounds}) ━━[/{st}]'
+                        )
+                    else:
+                        self.console.print(f'[{st}]━━ {base_agent} ━━[/{st}]')
+                    pending = self._poll_sync()
+                    continue
+                if et == 'non_llm':
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    _tui_set_stream_label('已完成')
+                    _print_assistant_output(self.console, ev['output'])
+                    return
+                if et == 'tool_phase':
+                    _tui_set_stream_label('调用工具中')
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    label = ', '.join(ev['tools'])
+                    self.console.print(
+                        f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]'
+                    )
+                    pending = self._poll_sync()
+                    continue
+                if et == 'api_tool_op':
+                    _tui_set_stream_label('调用工具中')
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    if self.buffer.strip():
+                        _print_assistant_output(self.console, self.buffer)
+                    self.buffer = ''
+                    self.tool_streaming_buffer = ''
+                    tool_name = str(ev.get('tool_name', 'tool'))
+                    tool_args = str(ev.get('arguments', '') or '')
+                    if self._is_sensitive_tool(tool_name):
+                        approved = self._request_tool_approval_sync(tool_name, tool_args)
+                        if not approved:
+                            return
+                    diff_preview: tuple[str, str, str] | None = None
+                    if tool_name in _DIFFABLE_WRITE_TOOL_NAMES:
+                        raw_path = _pick_first_file_path_from_args(tool_args)
+                        new_content = _extract_new_content_from_args(tool_args)
+                        if raw_path and new_content:
+                            shown_path, old_content = _read_old_file_content_for_diff(raw_path)
+                            diff_preview = (shown_path, old_content, new_content)
+                    with self.console.status(
+                        tool_execution_status_message(tool_name),
+                        spinner='dots12',
+                        spinner_style='cyan',
+                    ):
+                        pending = self._poll_sync()
+                    if pending is not None and pending.get('type') == 'tool_error':
+                        pass
+                    else:
+                        _track_active_context_files(self.engine, tool_name, tool_args)
+                        # 幽灵模式：Diff 是唯一焦点，工具成功不留痕
+                        if diff_preview is not None:
+                            fp, old_c, new_c = diff_preview
+                            self.console.print(render_inline_diff(fp, old_c, new_c))
+                    continue
+                if et == 'tool_error':
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    _tui_set_stream_label('失败')
+                    tool_name = str(ev.get('tool_name', 'tool'))
+                    detail = str(
+                        ev.get('error') or ev.get('message') or ev.get('output') or '(无详细错误输出)'
+                    ).strip()
+                    self.console.print(
+                        f'[bold red]✗ 工具执行失败: {tool_name}[/bold red]\n'
+                        f'[dim red]{detail}[/dim red]'
+                    )
+                    continue
+                if et in ('text_delta', 'tool_delta'):
+                    if self.is_hidden_analyst and et == 'text_delta':
+                        pending = self._poll_sync()
+                        continue
+                    self._process_stream_deltas(ev)
+                    pending = self._poll_sync()
+                    continue
+                if et == 'finished':
+                    self._finish_turn_success(ev)
+                    return
+
+                pending = self._poll_sync()
+        except KeyboardInterrupt:
+            self._squash_live_for_halt()
+            self._stop_live()
+            _tui_set_stream_label('已中断')
+            self.console.print(
+                '\n[bold yellow]🛑 用户强行中断。引擎状态已安全保存。[/bold yellow]'
+            )
+            return
+        except Exception as e:
+            self._squash_live_for_halt()
+            self._stop_live()
+            _tui_set_stream_label('失败')
+            self.console.print(f'\n[bold red]💥 引擎发生严重异常，但已被系统拦截！[/bold red]')
+            self.console.print(f'[dim red]{_tb.format_exc()}[/dim red]')
+            self.console.print('[yellow]引擎状态已重置，你可以继续输入新的指令。[/yellow]')
+            return
+
+    async def run_async_loop(self) -> None:
+        import traceback as _tb
+
+        from .repl_ui_render import (
+            print_cyber_turn_divider,
+            render_approval_card,
+            render_inline_diff,
+            tool_execution_status_message,
+        )
+
+        if self.use_live:
+            print_cyber_turn_divider(self.console)
+            self._apply_streaming_live(force=True, queue_quiet=False)
+
+        _tui_set_stream_label(_tui_thinking_status_labels()[1])
+
+        try:
+            pending: dict[str, Any] | None = await self._poll_async()
+            while pending is not None:
+                ev = pending
+                pending = None
+                et = ev['type']
+
+                if et == 'blocked':
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    _tui_set_stream_label('失败')
+                    _print_assistant_output(self.console, ev['output'])
+                    return
+                if et == 'llm_error':
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    _tui_set_stream_label('失败')
+                    _print_assistant_error(self.console, ev['output'])
+                    return
+                if et == 'team_agent':
+                    if callable(self.on_team_agent):
+                        try:
+                            self.on_team_agent(ev.get('agent'))
+                        except Exception:
+                            pass
+                    base_agent = str(ev.get('agent', 'Agent'))
+                    _tui_set_stream_label(f'群狼 · {base_agent}')
+                    self.is_hidden_analyst = base_agent == 'Analyst'
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    if self.is_hidden_analyst:
+                        self._show_hidden_analyst_spinner()
+                        pending = await self._poll_async()
+                        continue
+                    styles = {
+                        'Planner': 'bold cyan',
+                        'Coder': 'bold green',
+                        'Reviewer': 'bold yellow',
+                    }
+                    st = styles.get(base_agent, 'bold white')
+                    current_round = ev.get('round')
+                    max_rounds = ev.get('max_rounds')
+                    if current_round is not None and max_rounds is not None:
+                        self.console.print(
+                            f'[{st}]━━ {base_agent} (Round {current_round}/{max_rounds}) ━━[/{st}]'
+                        )
+                    else:
+                        self.console.print(f'[{st}]━━ {base_agent} ━━[/{st}]')
+                    pending = await self._poll_async()
+                    continue
+                if et == 'non_llm':
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    _tui_set_stream_label('已完成')
+                    _print_assistant_output(self.console, ev['output'])
+                    return
+                if et == 'tool_phase':
+                    _tui_set_stream_label('调用工具中')
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    label = ', '.join(ev['tools'])
+                    self.console.print(
+                        f'[bold yellow]⚙️ 正在执行工具: {label}[/bold yellow]'
+                    )
+                    pending = await self._poll_async()
+                    continue
+                if et == 'api_tool_op':
+                    _tui_set_stream_label('调用工具中')
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    if self.buffer.strip():
+                        _print_assistant_output(self.console, self.buffer)
+                    self.buffer = ''
+                    self.tool_streaming_buffer = ''
+                    tool_name = str(ev.get('tool_name', 'tool'))
+                    tool_args = str(ev.get('arguments', '') or '')
+                    if self._is_sensitive_tool(tool_name):
+                        import asyncio
+
+                        self._squash_live_for_halt()
+                        self._stop_live()
+                        args_obj = _safe_json_object(tool_args)
+                        if hasattr(self, 'chunker'):
+                            self.chunker.process_and_flush('')
+                        # 写文件工具优先展示 Diff 视图，拒绝盲盒审查
+                        if tool_name in _DIFFABLE_WRITE_TOOL_NAMES:
+                            raw_path = _pick_first_file_path_from_args(tool_args)
+                            new_content = _extract_new_content_from_args(tool_args)
+                            if raw_path and new_content:
+                                self.console.print()
+                                render_and_print_file_diff(self.console, raw_path, new_content)
+                                self.console.print()
+                        else:
+                            self.console.print(render_approval_card(tool_name, args_obj))
+                            self.console.print()
+
+                        self.approval_future = asyncio.get_running_loop().create_future()
+                        self.engine.pending_tool_approval = self.approval_future
+
+                        from prompt_toolkit.application import get_app
+                        try:
+                            get_app().invalidate()
+                        except Exception:
+                            pass
+
+                        await asyncio.sleep(0.05)
+
+                        answer = await self.approval_future
+                        self.approval_future = None
+                        self.engine.pending_tool_approval = None
+
+                        from prompt_toolkit.application import get_app
+                        try:
+                            get_app().invalidate()
+                        except Exception:
+                            pass
+
+                        ans = str(answer).strip().lower()
+                        if ans in ('y', 'yes'):
+                            self.console.print(
+                                f'[dim green]✓ 已同意执行: {tool_name}[/dim green]'
+                            )
+                        elif ans in ('a', 'all'):
+                            setattr(self.engine, 'session_auto_approve_all', True)
+                            self.console.print(
+                                '[dim green]🚀 已开启最高权限，本次会话将自动放行所有操作。[/dim green]'
+                            )
+                        elif ans in ('n', 'no', ''):
+                            try:
+                                self.engine.request_stream_abort()
+                            except Exception:
+                                pass
+                            self._drain_queue_after_interrupt()
+                            self.console.print(
+                                f'[bold red]✗ 已拒绝高危工具执行: {tool_name}[/bold red]\n'
+                                '[dim red]本次工具调用已被用户拦截，已请求中断当前工具链。[/dim red]'
+                            )
+                            _tui_set_stream_label('失败')
+                            return
+                        else:
+                            self.console.print(
+                                '[yellow]⚠️ 引擎已挂起：当前有修改代码的高危操作。请输入 [bold]Y[/] (允许) 或 [bold]N[/] (拒绝)。'
+                                '若要继续聊天，请先输入 [bold]N[/] 中断操作。[/yellow]'
+                            )
+                            continue
+                    diff_preview: tuple[str, str, str] | None = None
+                    if tool_name in _DIFFABLE_WRITE_TOOL_NAMES:
+                        raw_path = _pick_first_file_path_from_args(tool_args)
+                        new_content = _extract_new_content_from_args(tool_args)
+                        if raw_path and new_content:
+                            shown_path, old_content = _read_old_file_content_for_diff(raw_path)
+                            diff_preview = (shown_path, old_content, new_content)
+                    with self.console.status(
+                        tool_execution_status_message(tool_name),
+                        spinner='dots12',
+                        spinner_style='cyan',
+                    ):
+                        pending = await self._poll_async()
+                    if pending is not None and pending.get('type') == 'tool_error':
+                        pass
+                    else:
+                        _track_active_context_files(self.engine, tool_name, tool_args)
+                        # 幽灵模式：Diff 是唯一焦点，工具成功不留痕
+                        if diff_preview is not None:
+                            fp, old_c, new_c = diff_preview
+                            self.console.print(render_inline_diff(fp, old_c, new_c))
+                    continue
+                if et == 'tool_error':
+                    self._squash_live_for_halt()
+                    self._stop_live()
+                    _tui_set_stream_label('失败')
+                    tool_name = str(ev.get('tool_name', 'tool'))
+                    detail = str(
+                        ev.get('error') or ev.get('message') or ev.get('output') or '(无详细错误输出)'
+                    ).strip()
+                    self.console.print(
+                        f'[bold red]✗ 工具执行失败: {tool_name}[/bold red]\n'
+                        f'[dim red]{detail}[/dim red]'
+                    )
+                    continue
+                if et in ('text_delta', 'tool_delta'):
+                    if self.is_hidden_analyst and et == 'text_delta':
+                        pending = await self._poll_async()
+                        continue
+                    self._process_stream_deltas(ev)
+                    pending = await self._poll_async()
+                    continue
+                if et == 'finished':
+                    await self._finish_turn_success_async(ev)
+                    return
+
+                pending = await self._poll_async()
+        except KeyboardInterrupt:
+            self._squash_live_for_halt()
+            self._stop_live()
+            _tui_set_stream_label('已中断')
+            self.console.print(
+                '\n[bold yellow]🛑 用户强行中断。引擎状态已安全保存。[/bold yellow]'
+            )
+            return
+        except Exception as e:
+            self._squash_live_for_halt()
+            self._stop_live()
+            _tui_set_stream_label('失败')
+            self.console.print(f'\n[bold red]💥 引擎发生严重异常，但已被系统拦截！[/bold red]')
+            self.console.print(f'[dim red]{_tb.format_exc()}[/dim red]')
+            self.console.print('[yellow]引擎状态已重置，你可以继续输入新的指令。[/yellow]')
+            return
+
+    def finalize(self) -> None:
+        self._stop_live()
+        _repl_terminal_soft_reset(self.console)
+
+
+# REPL 单行历史仅驻内存；限制条数避免极长会话下 list 膨胀拖慢 prompt_toolkit
+_REPL_HISTORY_MAX_ITEMS = 512
+
+
+def _build_prompt_session() -> Any | None:
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.shortcuts import CompleteStyle
+        from prompt_toolkit.completion import ThreadedCompleter
+        from prompt_toolkit.history import InMemoryHistory
+    except ImportError:
+        return None
+
+    if not sys.stdin.isatty():
+        return None
+
+    from .repl_slash_helpers import (
+        SlashCommandCompleter,
+        prompt_toolkit_scream_slash_style,
+        prompt_toolkit_slash_completion_enter_bindings,
+    )
+
+    class _BoundedInMemoryHistory(InMemoryHistory):
+        """不启用 FileHistory；超限时丢弃最旧条目，避免历史列表无限增长。"""
+
+        def __init__(self, cap: int) -> None:
+            super().__init__()
+            self._cap = max(32, cap)
+
+        def store_string(self, string: str) -> None:
+            super().store_string(string)
+            over = len(self._storage) - self._cap
+            if over > 0:
+                del self._storage[0:over]
+
+    history = _BoundedInMemoryHistory(_REPL_HISTORY_MAX_ITEMS)
+    # 与 Rich 共用同一 stdin/stdout 句柄，避免编码/缓冲与 PTY 状态分裂导致中文乱码
+    try:
+        from prompt_toolkit.input.defaults import create_input
+        from prompt_toolkit.output.defaults import create_output
+    except ImportError:
+        create_input = None  # type: ignore[misc, assignment]
+        create_output = None  # type: ignore[misc, assignment]
+
+    kw: dict[str, Any] = {
+        'history': history,
+        'completer': ThreadedCompleter(SlashCommandCompleter()),
+        'complete_while_typing': True,
+        'complete_style': CompleteStyle.MULTI_COLUMN,
+        'reserve_space_for_menu': 8,
+        'validate_while_typing': False,
+        'mouse_support': False,
+        'enable_suspend': False,
+        'style': prompt_toolkit_scream_slash_style(),
+        'key_bindings': prompt_toolkit_slash_completion_enter_bindings(),
+    }
+    if create_input is not None and create_output is not None:
+        kw['input'] = create_input()
+        kw['output'] = create_output()
+    # 斜杠指令：边输边弹出补全（与 ``tui_app`` 一致）；mouse/suspend 仍关闭以免与 Rich 争用终端
+    return PromptSession(**kw)
+
+
+def _repl_read_line(
+    *,
+    pt_session: Any | None,
+    console: Any,
+    use_rich_input: bool,
+) -> str | None:
+    """返回 None 表示 EOF；空串表示仅刷新提示（如 Ctrl+C 已处理）。"""
+    try:
+        if pt_session is not None:
+            from prompt_toolkit.formatted_text import HTML
+
+            return pt_session.prompt(
+                HTML('<ansibrightmagenta><b>尖叫&gt; </b></ansibrightmagenta>')
+            ).strip()
+        if use_rich_input:
+            return console.input('[bold magenta]尖叫> [/bold magenta]').strip()
+        return input('尖叫> ').strip()
+    except EOFError:
+        return None
+    except KeyboardInterrupt:
+        _print_graceful_interrupt(console, use_rich=use_rich_input)
+        return ''
+
+
+def _consume_llm_events_plain(
+    engine: Any,
+    runtime: Any,
+    line: str,
+    *,
+    route_limit: int,
+    team: bool,
+) -> None:
+    """无 Rich 时仍走同一事件流（含多代理），仅打印纯文本。"""
+    gen = engine.iter_repl_assistant_events_with_runtime(
+        line, runtime=runtime, route_limit=route_limit, team=team
+    )
+    buf = ''
+    try:
+        for ev in gen:
+            et = ev.get('type')
+            if et == 'team_agent':
+                agent = str(ev.get('agent', 'Agent'))
+                current_round = ev.get('round')
+                max_rounds = ev.get('max_rounds')
+                if current_round is not None and max_rounds is not None:
+                    label = f'{agent} Round {current_round}/{max_rounds}'
+                else:
+                    label = agent
+                print(f"\n>>> [{label}]\n", flush=True)
+                continue
+            if et == 'text_delta':
+                piece = str(ev.get('text', '') or '')
+                print(piece, end='', flush=True)
+                buf += piece
+                continue
+            if et == 'api_tool_op':
+                print(
+                    f"\n[tool] {ev.get('tool_name')} {ev.get('arguments', '')}\n",
+                    flush=True,
+                )
+                continue
+            if et == 'finished':
+                print()
+                if not buf.strip():
+                    out = ev.get('output', '')
+                    if isinstance(out, str) and out.strip():
+                        print(out)
+                print()
+                return
+            if et in ('blocked', 'non_llm'):
+                print(ev.get('output', ''))
+                print()
+                return
+            if et == 'llm_error':
+                print(ev.get('output', ''))
+                print()
+                return
+    except KeyboardInterrupt:
+        _safe_close_generator(gen)
+        _print_graceful_interrupt(None, use_rich=False)
+    except Exception as exc:
+        _safe_close_generator(gen)
+        print(f'[LLM] 事件流异常: {type(exc).__name__}: {exc}', flush=True)
+
+
+def _run_streaming_turn(
+    engine: Any,
+    runtime: Any,
+    line: str,
+    console: Any,
+    *,
+    route_limit: int,
+    team: bool = False,
+    status_engine: Any | None = None,
+) -> None:
+    from .agent_cancel import request_agent_cancel
+
+    sess = _StreamingTurnSession(
+        engine,
+        runtime,
+        line,
+        console,
+        route_limit=route_limit,
+        team=team,
+        status_engine=status_engine,
+    )
+    sess.start_worker()
+    try:
+        from prompt_toolkit.patch_stdout import patch_stdout
+
+        with patch_stdout(raw=True):
+            sess.run_sync_loop()
+    except KeyboardInterrupt:
+        _safe_close_generator(sess.gen)
+        sess._drain_queue_after_interrupt()
+        sess._squash_live_for_halt()
+        sess._stop_live()
+        try:
+            engine.request_stream_abort()
+        except Exception:
+            request_agent_cancel()
+        _print_graceful_interrupt(console, use_rich=True)
+    finally:
+        _tui_set_stream_label('等待指令')
+        sess.finalize()
+
+
+def _run_streaming_turn_tui_concurrent(
+    session: Any,
+    engine: Any,
+    runtime: Any,
+    line: str,
+    console: Any,
+    *,
+    route_limit: int,
+    team: bool,
+    status_engine: Any | None,
+    prompt_message_html: Any,
+    bottom_toolbar: Any,
+    rprompt: Any | None = None,
+    on_stream_input_feedback: Any | None = None,
+    on_stream_output_started: Any | None = None,
+    on_stream_heartbeat: Any | None = None,
+    on_team_agent: Any | None = None,
+) -> None:
+    import asyncio
+
+    from prompt_toolkit.patch_stdout import patch_stdout
+
+    from .agent_cancel import request_agent_cancel
+
+    # 并发 TUI 模式下底部交互由 prompt_toolkit 独占，避免与 Rich Live 页脚双层叠加。
+    sess = _StreamingTurnSession(
+        engine,
+        runtime,
+        line,
+        console,
+        route_limit=route_limit,
+        team=team,
+        status_engine=None,
+        on_team_agent=on_team_agent,
+    )
+    stream_output_started = False
+    _orig_process_stream_deltas = sess._process_stream_deltas
+
+    def _process_stream_deltas_with_signal(ev: dict[str, Any]) -> None:
+        nonlocal stream_output_started
+        if (
+            not stream_output_started
+            and ev.get('type') in ('text_delta', 'tool_delta')
+            and callable(on_stream_output_started)
+        ):
+            stream_output_started = True
+            try:
+                on_stream_output_started()
+            except Exception:
+                pass
+        _orig_process_stream_deltas(ev)
+
+    sess._process_stream_deltas = _process_stream_deltas_with_signal  # type: ignore[method-assign]
+    sess.start_worker()
+    turn_done = asyncio.Event()
+    active_prompt_task: asyncio.Task[str] | None = None
+
+    async def _cancel_active_prompt_task() -> None:
+        nonlocal active_prompt_task
+        t = active_prompt_task
+        if t is None:
+            return
+        if not t.done():
+            t.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(t), timeout=0.15)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception:
+                pass
+        if not t.done():
+            try:
+                buf = getattr(session, 'default_buffer', None)
+                if buf is not None:
+                    buf.text = ''
+            except Exception:
+                pass
+            try:
+                app = getattr(session, 'app', None)
+                is_running = bool(getattr(app, 'is_running', False)) if app is not None else False
+                if app is not None and is_running:
+                    app.exit(result=None)
+            except Exception:
+                pass
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        active_prompt_task = None
+
+    async def _drive_input() -> None:
+        nonlocal active_prompt_task
+
+        try:
+            while not turn_done.is_set():
+                if callable(on_stream_input_feedback):
+                    try:
+                        on_stream_input_feedback('')
+                    except Exception:
+                        pass
+                _pa_kw: dict[str, Any] = {
+                    'bottom_toolbar': bottom_toolbar,
+                    'handle_sigint': True,
+                    'validate_while_typing': False,
+                }
+                if rprompt is not None:
+                    _pa_kw['rprompt'] = rprompt
+                prompt_task = asyncio.create_task(
+                    session.prompt_async(prompt_message_html, **_pa_kw)
+                )
+                active_prompt_task = prompt_task
+                wait_turn = asyncio.create_task(turn_done.wait())
+                done, _ = await asyncio.wait(
+                    {prompt_task, wait_turn},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if wait_turn in done:
+                    await _cancel_active_prompt_task()
+                    return
+                wait_turn.cancel()
+                try:
+                    await wait_turn
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    text = prompt_task.result()
+                except asyncio.CancelledError:
+                    active_prompt_task = None
+                    return
+                except KeyboardInterrupt:
+                    active_prompt_task = None
+                    try:
+                        engine.request_stream_abort()
+                    except Exception:
+                        request_agent_cancel()
+                    await turn_done.wait()
+                    return
+                active_prompt_task = None
+                if turn_done.is_set():
+                    return
+                if getattr(sess, 'approval_future', None) is not None and not sess.approval_future.done():
+                    sess.approval_future.set_result(text.strip())
+                    continue
+                if (text or '').strip() == '/stop':
+                    try:
+                        engine.request_stream_abort()
+                    except Exception:
+                        request_agent_cancel()
+                    await turn_done.wait()
+                    return
+                if callable(on_stream_input_feedback):
+                    try:
+                        on_stream_input_feedback('[仅支持 /stop]')
+                    except Exception:
+                        pass
+        finally:
+            if callable(on_stream_input_feedback):
+                try:
+                    on_stream_input_feedback('')
+                except Exception:
+                    pass
+            # 兜底触发一次安全刷新，避免 prompt_toolkit 残影带入下一轮。
+            try:
+                console.print('', end='')
+            except Exception:
+                pass
+
+    async def _drive_stream() -> None:
+        try:
+            with patch_stdout(raw=True):
+                await sess.run_async_loop()
+        finally:
+            turn_done.set()
+            await _cancel_active_prompt_task()
+
+    async def _runner() -> None:
+        stream_task = asyncio.create_task(_drive_stream())
+        input_task = asyncio.create_task(_drive_input())
+        heartbeat_task: asyncio.Task[None] | None = None
+        if callable(on_stream_heartbeat):
+            async def _heartbeat_loop() -> None:
+                while not turn_done.is_set():
+                    try:
+                        on_stream_heartbeat()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.4)
+            heartbeat_task = asyncio.create_task(_heartbeat_loop())
+        try:
+            await stream_task
+        finally:
+            turn_done.set()
+            await _cancel_active_prompt_task()
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            try:
+                await input_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+    try:
+        with _safe_prompt_toolkit_exit_patch():
+            asyncio.run(_runner())
+    except KeyboardInterrupt:
+        _safe_close_generator(sess.gen)
+        sess._drain_queue_after_interrupt()
+        try:
+            engine.request_stream_abort()
+        except Exception:
+            request_agent_cancel()
+        sess._squash_live_for_halt()
+        sess._stop_live()
+        _print_graceful_interrupt(console, use_rich=True)
+    finally:
+        if callable(on_team_agent):
+            try:
+                on_team_agent(None)
+            except Exception:
+                pass
+        _tui_set_stream_label('等待指令')
+        sess.finalize()
+
+
+def run_repl_interactive_loop(*, llm_enabled: bool, route_limit: int = 5) -> int:
+    """打印 Logo 后进入交互：默认可用大模型路径为 prompt_toolkit + Rich Live 流式 Markdown。"""
+    from dataclasses import replace
+
+    try:
+        from rich.console import Console
+        from rich.rule import Rule
+    except ImportError:
+        Console = None  # type: ignore[misc, assignment]
+
+    from .runtime import PortRuntime
+
+    print_startup_banner(ensure_config=True)
+    print_project_memory_loaded_notice()
+    if not llm_enabled:
+        print(build_repl_banner())
+        return 0
+
+    if Console is None:
+        print('大模型 REPL：将调用 API。输入 exit / quit 结束。')
+        print(
+            '斜杠指令: /help · /new /memo · doctor cost diff status · team · 记忆/体检/引擎类\n'
+        )
+        print_repl_llm_driver_banner(console=None)
+        from .repl_slash_commands import dispatch_repl_slash_command
+
+        runtime = PortRuntime()
+        engine = _repl_engine_autoresume(None, use_rich=False)
+        engine.config = replace(engine.config, llm_enabled=True)
+        while True:
+            try:
+                line = input('尖叫> ').strip()
+            except EOFError:
+                print('\n再见。')
+                return 0
+            except KeyboardInterrupt:
+                _print_graceful_interrupt(None, use_rich=False)
+                continue
+            if not line:
+                continue
+            if line.lower() in ('exit', 'quit', 'q'):
+                print('再见。')
+                return 0
+            handled, new_eng, slash_outcome = dispatch_repl_slash_command(
+                line, console=None, engine=engine
+            )
+            if new_eng is not None:
+                engine = new_eng
+            if handled:
+                want_follow = (
+                    slash_outcome is not None
+                    and slash_outcome.trigger_llm_followup
+                    and (slash_outcome.followup_prompt or '').strip()
+                )
+                if want_follow:
+                    reset_agent_cancel()
+                    fp = slash_outcome.followup_prompt.strip()
+                    use_team = bool(engine.repl_team_mode)
+                    _consume_llm_events_plain(
+                        engine, runtime, fp, route_limit=route_limit, team=use_team
+                    )
+                    _maybe_print_repl_memory_load_warning(None, engine, use_rich=False)
+                    _try_persist_repl_session(engine)
+                continue
+            use_team = bool(engine.repl_team_mode)
+            msg = line
+            if msg.startswith('$team'):
+                msg = msg[5:].strip()
+                use_team = True
+            if not msg:
+                continue
+            reset_agent_cancel()
+            _consume_llm_events_plain(
+                engine, runtime, msg, route_limit=route_limit, team=use_team
+            )
+            _maybe_print_repl_memory_load_warning(None, engine, use_rich=False)
+            _try_persist_repl_session(engine)
+
+    _ensure_stdio_utf8()
+    console = Console(force_terminal=True, color_system='truecolor')
+    print_repl_llm_driver_banner(console=console)
+    console.print(
+        '[dim]大模型 REPL；exit / quit 退出；Ctrl+C 中断当前生成（保留已输出，REPL 不退出）。[/dim]'
+    )
+    console.print(
+        '[dim]斜杠: [bold]/help[/bold] · [bold]/new[/bold] [bold]/memo[/bold] · /doctor /cost /diff /status · '
+        '/team 或 [bold]$team[/bold] 前缀 · 记忆 /summary /flush /stop /sessions /load · '
+        '/audit /report · /subsystems /graph[/dim]'
+    )
+
+    pt_session = _build_prompt_session()
+
+    from .repl_slash_commands import dispatch_repl_slash_command
+
+    runtime = PortRuntime()
+    engine = _repl_engine_autoresume(console, use_rich=True)
+    engine.config = replace(engine.config, llm_enabled=True)
+    engine.ui_console = console
+
+    # 启动沉底：在首轮 prompt 弹出让之前，用几个空行把 Logo / Banner 区与输入提示符拉开距离。
+    console.print()
+    console.print()
+    console.print()
+
+    while True:
+        console.print()
+        console.print(Rule(style='dim #334155'))
+        console.print()
+        line = _repl_read_line(
+            pt_session=pt_session,
+            console=console,
+            use_rich_input=True,
+        )
+        if line is None:
+            console.print('[dim]再见。[/dim]')
+            return 0
+        if line == '':
+            continue
+        if line.lower() in ('exit', 'quit', 'q'):
+            console.print('[dim]再见。[/dim]')
+            return 0
+
+        handled, new_eng, slash_outcome = dispatch_repl_slash_command(
+            line, console=console, engine=engine
+        )
+        if new_eng is not None:
+            engine = new_eng
+        if handled:
+            want_follow = (
+                slash_outcome is not None
+                and slash_outcome.trigger_llm_followup
+                and (slash_outcome.followup_prompt or '').strip()
+            )
+            if want_follow:
+                reset_agent_cancel()
+                fp = slash_outcome.followup_prompt.strip()
+                use_team = bool(engine.repl_team_mode)
+                try:
+                    _run_streaming_turn(
+                        engine, runtime, fp, console, route_limit=route_limit, team=use_team
+                    )
+                except KeyboardInterrupt:
+                    _print_graceful_interrupt(console, use_rich=True)
+                except Exception as exc:
+                    try:
+                        console.print(
+                            f'[bold red]本回合展示层异常（已释放 Live/Status）: '
+                            f'{type(exc).__name__}: {exc}[/bold red]'
+                        )
+                    except Exception:
+                        print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
+                finally:
+                    repl_stdin_flush_pending_if_tty()
+                _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
+                _try_persist_repl_session(engine)
+            continue
+
+        use_team = bool(engine.repl_team_mode)
+        msg = line
+        if msg.startswith('$team'):
+            msg = msg[5:].strip()
+            use_team = True
+        if not msg:
+            continue
+
+        reset_agent_cancel()
+        from .utils.snapshot_manager import clear_snapshot
+        from .project_memory import project_memory_workspace_root
+
+        clear_snapshot(project_memory_workspace_root())
+        try:
+            _run_streaming_turn(
+                engine, runtime, msg, console, route_limit=route_limit, team=use_team
+            )
+        except KeyboardInterrupt:
+            # 理论上由内层 _run_streaming_turn 已处理；此处兜底防止遗漏路径导致进程退出
+            _print_graceful_interrupt(console, use_rich=True)
+            continue
+        except Exception as exc:
+            # Rich / prompt_toolkit 混用时，Python 层渲染异常不应整进程退出（无法拦截原生 SIGSEGV）
+            try:
+                console.print(
+                    f'[bold red]本回合展示层异常（已释放 Live/Status）: '
+                    f'{type(exc).__name__}: {exc}[/bold red]'
+                )
+            except Exception:
+                print(f'本回合异常: {type(exc).__name__}: {exc}', flush=True)
+            continue
+        finally:
+            repl_stdin_flush_pending_if_tty()
+        _maybe_print_repl_memory_load_warning(console, engine, use_rich=True)
+        _try_persist_repl_session(engine)
+
+
+def _repl_engine_json_resume() -> Any:
+    """恢复最近会话但不打印横幅（供 Rust TUI 的 json-stdio 后端）。"""
+    from .query_engine import QueryEnginePort
+    from .session_store import most_recent_saved_session_id
+
+    sid = most_recent_saved_session_id()
+    if not sid:
+        return QueryEnginePort.from_workspace()
+    try:
+        return QueryEnginePort.from_saved_session(sid)
+    except (OSError, FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return QueryEnginePort.from_workspace()
+
+
+def run_repl_json_stdio_loop(*, llm_enabled: bool, route_limit: int = 5) -> int:
+    """
+    行协议 JSON over stdio：Rust 全屏 TUI 等前端专用。
+
+    - stdin：每行一个 JSON 对象，例如 ``{"op":"submit","text":"你好"}``、``{"op":"stop"}``、
+      ``{"op":"shutdown"}``。
+    - stdout：每行一个 JSON；首条为 ``{"type":"ready",...}``；LLM 事件与
+      :meth:`QueryEnginePort.iter_repl_assistant_events_with_runtime` 产出一致；每回合以
+      ``{"type":"turn_done"}`` 结束。
+    """
+    import os
+    import queue
+    import threading
+    from dataclasses import replace
+
+    from rich.console import Console
+
+    from .repl_slash_commands import dispatch_repl_slash_command
+    from .runtime import PortRuntime
+
+    os.environ['SCREAM_REPL_JSON_STDIO'] = '1'
+    _ensure_stdio_utf8()
+
+    cmd_q: queue.Queue[str | None] = queue.Queue()
+
+    def _stdin_reader() -> None:
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except (OSError, ValueError, RuntimeError):
+                cmd_q.put(None)
+                return
+            if line == '':
+                cmd_q.put(None)
+                return
+            cmd_q.put(line.rstrip('\n\r'))
+
+    threading.Thread(target=_stdin_reader, daemon=True).start()
+
+    capture = io.StringIO()
+    cap_console = Console(
+        file=capture,
+        force_terminal=False,
+        width=120,
+        markup=True,
+        highlight=False,
+    )
+
+    runtime = PortRuntime()
+    engine = _repl_engine_json_resume()
+    engine.config = replace(engine.config, llm_enabled=llm_enabled)
+    engine.ui_console = None
+
+    stop_evt = threading.Event()
+
+    def _emit(obj: dict[str, Any]) -> None:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False, default=str) + '\n')
+        sys.stdout.flush()
+
+    def _display_model() -> str:
+        raw = (engine.config.llm_model or '').strip()
+        if raw:
+            return raw
+        try:
+            from .llm_settings import read_llm_connection_settings
+
+            return (read_llm_connection_settings().model or '').strip()
+        except Exception:
+            return ''
+
+    _emit(
+        {
+            'type': 'ready',
+            'model': _display_model(),
+            'repl_team_mode': bool(engine.repl_team_mode),
+            'cumulative_input_tokens': int(engine.total_usage.input_tokens),
+            'cumulative_output_tokens': int(engine.total_usage.output_tokens),
+        }
+    )
+
+    def _emit_state() -> None:
+        _emit(
+            {
+                'type': 'state',
+                'model': _display_model(),
+                'repl_team_mode': bool(engine.repl_team_mode),
+                'cumulative_input_tokens': int(engine.total_usage.input_tokens),
+                'cumulative_output_tokens': int(engine.total_usage.output_tokens),
+            }
+        )
+
+    while True:
+        raw_line = cmd_q.get()
+        if raw_line is None:
+            _try_persist_repl_session(engine)
+            return 0
+        try:
+            req = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            _emit({'type': 'error', 'message': f'invalid json: {exc}'})
+            _emit({'type': 'turn_done'})
+            continue
+
+        op = req.get('op')
+        if op == 'shutdown':
+            _try_persist_repl_session(engine)
+            _emit({'type': 'shutdown_ack'})
+            return 0
+        if op == 'stop':
+            reset_agent_cancel()
+            stop_evt.set()
+            _emit(
+                {
+                    'type': 'system',
+                    'text': '已请求中断当前工具链（agent_cancel）。',
+                }
+            )
+            _emit({'type': 'turn_done'})
+            continue
+
+        if op != 'submit':
+            _emit({'type': 'error', 'message': f'unknown op: {op!r}'})
+            _emit({'type': 'turn_done'})
+            continue
+
+        text = str(req.get('text', '') or '')
+        stop_evt.clear()
+
+        if not text.strip():
+            _emit({'type': 'turn_done'})
+            continue
+
+        if text.strip().lower() in ('exit', 'quit', 'q'):
+            _try_persist_repl_session(engine)
+            _emit({'type': 'shutdown_ack'})
+            return 0
+
+        capture.seek(0)
+        capture.truncate(0)
+        followup_from_slash = False
+        handled, new_eng, slash_outcome = dispatch_repl_slash_command(
+            text, console=cap_console, engine=engine
+        )
+        if new_eng is not None:
+            engine = new_eng
+            engine.config = replace(engine.config, llm_enabled=llm_enabled)
+
+        if handled:
+            followup_from_slash = (
+                slash_outcome is not None
+                and slash_outcome.trigger_llm_followup
+                and llm_enabled
+                and (slash_outcome.followup_prompt or '').strip()
+            )
+            out = capture.getvalue().strip()
+            if out:
+                _emit({'type': 'system', 'text': out})
+            if not followup_from_slash:
+                _try_persist_repl_session(engine)
+                _emit_state()
+                _emit({'type': 'turn_done'})
+                continue
+
+        use_team = bool(engine.repl_team_mode)
+        if followup_from_slash:
+            assert slash_outcome is not None
+            msg = slash_outcome.followup_prompt.strip()
+        else:
+            msg = text
+            if msg.startswith('$team'):
+                msg = msg[5:].strip()
+                use_team = True
+        if not msg:
+            _emit({'type': 'turn_done'})
+            continue
+
+        reset_agent_cancel()
+        from .utils.snapshot_manager import clear_snapshot
+        from .project_memory import project_memory_workspace_root
+
+        clear_snapshot(project_memory_workspace_root())
+        gen = engine.iter_repl_assistant_events_with_runtime(
+            msg, runtime=runtime, route_limit=route_limit, team=use_team
+        )
+
+        ev_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+        def _llm_worker() -> None:
+            try:
+                it = iter(gen)
+                while True:
+                    if stop_evt.is_set():
+                        _safe_close_generator(it)
+                        break
+                    try:
+                        ev = next(it)
+                    except StopIteration:
+                        break
+                    ev_q.put(ev)
+            except BaseException as exc:
+                ev_q.put({'type': 'llm_error', 'output': f'{type(exc).__name__}: {exc}'})
+            finally:
+                ev_q.put(None)
+
+        threading.Thread(target=_llm_worker, daemon=True).start()
+
+        stdin_closed = False
+        while True:
+            while True:
+                try:
+                    sneaky = cmd_q.get_nowait()
+                except queue.Empty:
+                    break
+                if sneaky is None:
+                    stop_evt.set()
+                    stdin_closed = True
+                    break
+                try:
+                    extra = json.loads(sneaky)
+                except json.JSONDecodeError:
+                    continue
+                if extra.get('op') == 'stop':
+                    reset_agent_cancel()
+                    stop_evt.set()
+            if stdin_closed:
+                _try_persist_repl_session(engine)
+                return 0
+            try:
+                ev = ev_q.get(timeout=0.08)
+            except queue.Empty:
+                continue
+            if ev is None:
+                break
+            _emit(ev)
+
+        _try_persist_repl_session(engine)
+        _emit_state()
+        _emit({'type': 'turn_done'})

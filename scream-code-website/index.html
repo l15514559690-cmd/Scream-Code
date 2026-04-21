@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scream Code · 尖叫代码 | 终端中的 AI 超能力</title>
+    <meta name="description" content="One terminal. One command. Local-first AI that actually ships. 纯本地优先的 AI 编程助手，让终端拥有超能力。">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0a0a0f;
+            --bg-card: #12121a;
+            --bg-card-hover: #1a1a25;
+            --primary: #6366f1;
+            --primary-glow: rgba(99, 102, 241, 0.5);
+            --secondary: #8b5cf6;
+            --accent-cyan: #22d3ee;
+            --accent-pink: #f472b6;
+            --accent-green: #34d399;
+            --text-primary: #ffffff;
+            --text-secondary: #a1a1aa;
+            --text-muted: #71717a;
+            --border: rgba(255, 255, 255, 0.1);
+            --glow-intensity: 0.8;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        /* Canvas Background */
+        #bg-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            opacity: 0.6;
+        }
+
+        /* Scanline Effect */
+        .scanlines {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 1;
+            background: repeating-linear-gradient(
+                0deg,
+                rgba(0, 0, 0, 0.03),
+                rgba(0, 0, 0, 0.03) 1px,
+                transparent 1px,
+                transparent 2px
+            );
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 2rem;
+            position: relative;
+            z-index: 2;
+        }
+
+        /* Navigation */
+        nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 100;
+            padding: 1rem 2rem;
+            background: rgba(10, 10, 15, 0.8);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .nav-inner {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+            font-size: 1.25rem;
+            color: var(--text-primary);
+            text-decoration: none;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            animation: pulse-glow 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse-glow {
+            0%, 100% { box-shadow: 0 0 20px var(--primary-glow); }
+            50% { box-shadow: 0 0 40px var(--primary-glow), 0 0 60px var(--primary-glow); }
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            list-style: none;
+        }
+
+        .nav-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.3s;
+        }
+
+        .nav-links a:hover {
+            color: var(--primary);
+        }
+
+        .nav-cta {
+            padding: 0.5rem 1.25rem;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-family: inherit;
+        }
+
+        .nav-cta:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px var(--primary-glow);
+        }
+
+        /* Hero Section */
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 8rem 2rem 4rem;
+        }
+
+        .hero-content {
+            max-width: 900px;
+        }
+
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: rgba(99, 102, 241, 0.1);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            border-radius: 100px;
+            font-size: 0.85rem;
+            color: var(--primary);
+            margin-bottom: 2rem;
+            animation: fade-in-up 0.6s ease-out;
+        }
+
+        .hero-badge::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            animation: blink 1.5s infinite;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .hero h1 {
+            font-size: clamp(2.5rem, 8vw, 5rem);
+            font-weight: 700;
+            line-height: 1.1;
+            margin-bottom: 1.5rem;
+            animation: fade-in-up 0.6s ease-out 0.1s backwards;
+        }
+
+        .hero h1 .gradient-text {
+            background: linear-gradient(135deg, var(--primary), var(--accent-cyan), var(--accent-pink));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero-description {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin: 0 auto 2.5rem;
+            animation: fade-in-up 0.6s ease-out 0.2s backwards;
+        }
+
+        .hero-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+            animation: fade-in-up 0.6s ease-out 0.3s backwards;
+        }
+
+        .btn-primary {
+            padding: 1rem 2rem;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border: none;
+            border-radius: 12px;
+            color: white;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            text-decoration: none;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 20px 40px var(--primary-glow);
+        }
+
+        .btn-secondary {
+            padding: 1rem 2rem;
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-decoration: none;
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-card);
+            border-color: var(--primary);
+        }
+
+        @keyframes fade-in-up {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Terminal Demo */
+        .terminal-demo {
+            margin-top: 4rem;
+            animation: fade-in-up 0.6s ease-out 0.4s backwards;
+        }
+
+        .terminal-window {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 40px 80px rgba(0, 0, 0, 0.5);
+        }
+
+        .terminal-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 1rem 1.5rem;
+            background: rgba(255, 255, 255, 0.03);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .terminal-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .terminal-dot.red { background: #ff5f57; }
+        .terminal-dot.yellow { background: #ffbd2e; }
+        .terminal-dot.green { background: #28ca42; }
+
+        .terminal-title {
+            margin-left: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .terminal-body {
+            padding: 1.5rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            line-height: 1.8;
+        }
+
+        .terminal-line {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+        }
+
+        .terminal-prompt {
+            color: var(--accent-green);
+            user-select: none;
+        }
+
+        .terminal-command {
+            color: var(--text-primary);
+        }
+
+        .terminal-output {
+            color: var(--text-secondary);
+            padding-left: 1.5rem;
+        }
+
+        .terminal-output .highlight {
+            color: var(--accent-cyan);
+        }
+
+        .terminal-output .success {
+            color: var(--accent-green);
+        }
+
+        .terminal-output .info {
+            color: var(--primary);
+        }
+
+        .typing-cursor {
+            display: inline-block;
+            width: 8px;
+            height: 1.2em;
+            background: var(--accent-cyan);
+            margin-left: 4px;
+            animation: cursor-blink 0.8s infinite;
+        }
+
+        @keyframes cursor-blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
+
+        /* Features Section */
+        .section {
+            padding: 6rem 2rem;
+        }
+
+        .section-header {
+            text-align: center;
+            margin-bottom: 4rem;
+        }
+
+        .section-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            color: var(--primary);
+            margin-bottom: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .section-title {
+            font-size: clamp(2rem, 5vw, 3rem);
+            font-weight: 700;
+            margin-bottom: 1rem;
+        }
+
+        .section-desc {
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .feature-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 2rem;
+            transition: all 0.3s;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .feature-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .feature-card:hover {
+            transform: translateY(-5px);
+            border-color: var(--primary);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+        }
+
+        .feature-card:hover::before {
+            opacity: 1;
+        }
+
+        .feature-icon {
+            width: 56px;
+            height: 56px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .feature-card:nth-child(1) .feature-icon {
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.05));
+            color: var(--primary);
+        }
+
+        .feature-card:nth-child(2) .feature-icon {
+            background: linear-gradient(135deg, rgba(34, 211, 238, 0.2), rgba(34, 211, 238, 0.05));
+            color: var(--accent-cyan);
+        }
+
+        .feature-card:nth-child(3) .feature-icon {
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(139, 92, 246, 0.05));
+            color: var(--secondary);
+        }
+
+        .feature-card:nth-child(4) .feature-icon {
+            background: linear-gradient(135deg, rgba(244, 114, 182, 0.2), rgba(244, 114, 182, 0.05));
+            color: var(--accent-pink);
+        }
+
+        .feature-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 0.75rem;
+        }
+
+        .feature-desc {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+        }
+
+        /* Commands Showcase */
+        .commands-section {
+            background: linear-gradient(180deg, var(--bg-dark) 0%, rgba(99, 102, 241, 0.05) 50%, var(--bg-dark) 100%);
+        }
+
+        .commands-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+
+        .command-item {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            transition: all 0.3s;
+            cursor: default;
+        }
+
+        .command-item:hover {
+            border-color: var(--primary);
+            transform: translateX(5px);
+        }
+
+        .command-slash {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--primary);
+            font-weight: 600;
+            font-size: 1.1rem;
+        }
+
+        .command-name {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-primary);
+        }
+
+        .command-desc {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-left: auto;
+        }
+
+        /* Installation Section */
+        .install-section {
+            background: var(--bg-card);
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .install-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4rem;
+            align-items: center;
+        }
+
+        @media (max-width: 768px) {
+            .install-content {
+                grid-template-columns: 1fr;
+                gap: 2rem;
+            }
+        }
+
+        .install-code {
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 2rem;
+            font-family: 'JetBrains Mono', monospace;
+            position: relative;
+        }
+
+        .install-code pre {
+            font-size: 1rem;
+            line-height: 1.8;
+            color: var(--text-primary);
+        }
+
+        .install-code .comment {
+            color: var(--text-muted);
+        }
+
+        .install-code .command {
+            color: var(--accent-green);
+        }
+
+        .install-code .highlight {
+            color: var(--accent-cyan);
+        }
+
+        .copy-btn {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .copy-btn:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+
+        .install-info h3 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .install-info p {
+            color: var(--text-secondary);
+            margin-bottom: 1.5rem;
+        }
+
+        .install-steps {
+            list-style: none;
+        }
+
+        .install-steps li {
+            display: flex;
+            align-items: flex-start;
+            gap: 1rem;
+            margin-bottom: 1rem;
+            color: var(--text-secondary);
+        }
+
+        .step-number {
+            width: 24px;
+            height: 24px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+
+        /* Stats Section */
+        .stats-section {
+            padding: 4rem 2rem;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 2rem;
+        }
+
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-number {
+            font-size: 3rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary), var(--accent-cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            line-height: 1.2;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            margin-top: 0.5rem;
+        }
+
+        /* Footer */
+        footer {
+            padding: 4rem 2rem;
+            border-top: 1px solid var(--border);
+            text-align: center;
+        }
+
+        .footer-content {
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .footer-logo {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+        }
+
+        .footer-logo .logo-icon {
+            width: 28px;
+            height: 28px;
+            font-size: 0.85rem;
+        }
+
+        .footer-desc {
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+        }
+
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+        }
+
+        .footer-links a {
+            color: var(--text-muted);
+            text-decoration: none;
+            transition: color 0.3s;
+        }
+
+        .footer-links a:hover {
+            color: var(--primary);
+        }
+
+        .footer-copy {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+
+        .footer-copy .heart {
+            color: var(--accent-pink);
+        }
+
+        /* Mobile Menu */
+        .mobile-menu-btn {
+            display: none;
+            background: none;
+            border: none;
+            color: var(--text-primary);
+            font-size: 1.5rem;
+            cursor: pointer;
+        }
+
+        @media (max-width: 768px) {
+            .nav-links, .nav-cta {
+                display: none;
+            }
+
+            .mobile-menu-btn {
+                display: block;
+            }
+
+            .nav-links.active {
+                display: flex;
+                flex-direction: column;
+                position: absolute;
+                top: 100%;
+                left: 0;
+                right: 0;
+                background: var(--bg-card);
+                border-bottom: 1px solid var(--border);
+                padding: 1rem;
+            }
+        }
+
+        /* Scroll animations */
+        .animate-on-scroll {
+            opacity: 0;
+            transform: translateY(30px);
+            transition: all 0.6s ease-out;
+        }
+
+        .animate-on-scroll.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    </style>
+</head>
+<body>
+    <canvas id="bg-canvas"></canvas>
+    <div class="scanlines"></div>
+
+    <!-- Navigation -->
+    <nav>
+        <div class="nav-inner">
+            <a href="#" class="logo">
+                <div class="logo-icon">⚡</div>
+                <span>Scream Code</span>
+            </a>
+            <ul class="nav-links">
+                <li><a href="#features">特性</a></li>
+                <li><a href="#commands">命令</a></li>
+                <li><a href="#install">安装</a></li>
+                <li><a href="#stats">统计</a></li>
+            </ul>
+            <button class="nav-cta" onclick="document.getElementById('install').scrollIntoView({behavior: 'smooth'})">快速开始</button>
+            <button class="mobile-menu-btn" onclick="document.querySelector('.nav-links').classList.toggle('active')">☰</button>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="hero-content">
+            <div class="hero-badge">v2.0 · 全新发布</div>
+            <h1>
+                <span class="gradient-text">尖叫代码</span><br>
+                终端中的 AI 超能力
+            </h1>
+            <p class="hero-description">
+                One terminal. One command. Local-first AI that actually ships.<br>
+                一个命令，一个终端，本地优先的 AI 编程助手，让你的终端拥有超能力。
+            </p>
+            <div class="hero-buttons">
+                <a href="#install" class="btn-primary">
+                    <span>🚀</span>
+                    立即安装
+                </a>
+                <a href="#features" class="btn-secondary">
+                    <span>📖</span>
+                    了解更多
+                </a>
+            </div>
+
+            <!-- Terminal Demo -->
+            <div class="terminal-demo">
+                <div class="terminal-window">
+                    <div class="terminal-header">
+                        <span class="terminal-dot red"></span>
+                        <span class="terminal-dot yellow"></span>
+                        <span class="terminal-dot green"></span>
+                        <span class="terminal-title">scream — zsh</span>
+                    </div>
+                    <div class="terminal-body" id="terminal-output">
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">➜</span>
+                            <span class="terminal-command">scream "帮我写一个快速排序算法"</span>
+                        </div>
+                        <div class="terminal-output">
+                            <span class="info">🤖 Scream Code 正在思考...</span>
+                        </div>
+                        <div class="terminal-line" style="margin-top: 0.5rem;">
+                            <span class="terminal-prompt">➜</span>
+                            <span class="terminal-command">/sandbox on</span>
+                        </div>
+                        <div class="terminal-output">
+                            <span class="success">✓ Docker sandbox 已启动</span>
+                        </div>
+                        <div class="terminal-line">
+                            <span class="terminal-prompt">➜</span>
+                            <span class="terminal-command">/look https://github.com<span class="typing-cursor"></span></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section class="section" id="features">
+        <div class="container">
+            <div class="section-header animate-on-scroll">
+                <div class="section-label">四大引擎</div>
+                <h2 class="section-title">为什么选择 Scream Code？</h2>
+                <p class="section-desc">集成四大核心能力，让你的终端拥有超乎想象的生产力</p>
+            </div>
+            <div class="features-grid">
+                <div class="feature-card animate-on-scroll">
+                    <div class="feature-icon">🔌</div>
+                    <h3 class="feature-title">Skill Registry</h3>
+                    <p class="feature-desc">BaseSkill + ~/.scream/skills/ 热插拔架构，/help 与补全动态反映注册表，开箱即用的扩展能力。</p>
+                </div>
+                <div class="feature-card animate-on-scroll">
+                    <div class="feature-icon">🛡️</div>
+                    <h3 class="feature-title">Docker Sandbox</h3>
+                    <p class="feature-desc">/sandbox on 终端执行进容器，挂载 /workspace，安全隔离执行环境，危险操作也能放心跑。</p>
+                </div>
+                <div class="feature-card animate-on-scroll">
+                    <div class="feature-icon">🧠</div>
+                    <h3 class="feature-title">Core Memory</h3>
+                    <p class="feature-desc">SCREAM.md 叙事 + 规则，工具与 /memory 运维，持久化记忆让你与 AI 的协作永不断档。</p>
+                </div>
+                <div class="feature-card animate-on-scroll">
+                    <div class="feature-icon">👁️</div>
+                    <h3 class="feature-title">Playwright Vision</h3>
+                    <p class="feature-desc">/look 截图 + 多模态，让 AI「看见」网页 UI，视觉诊断与截图分析一体化。</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Commands Showcase -->
+    <section class="section commands-section" id="commands">
+        <div class="container">
+            <div class="section-header animate-on-scroll">
+                <div class="section-label">斜杠宇宙</div>
+                <h2 class="section-title">一个命令，掌控一切</h2>
+                <p class="section-desc">丰富的斜杠指令，让复杂操作化繁为简</p>
+            </div>
+            <div class="commands-grid">
+                <div class="command-item animate-on-scroll">
+                    <span class="command-slash">/</span>
+                    <span class="command-name">help</span>
+                    <span class="command-desc">帮助</span>
+                </div>
+                <div class="command-item animate-on-scroll">
+                    <span class="command-slash">/</span>
+                    <span class="command-name">look</span>
+                    <span class="command-desc">网页截图</span>
+                </div>
+                <div class="command-item animate-on-scroll">
+                    <span class="command-slash">/</span>
+                    <span class="command-name">sandbox</span>
+                    <span class="command-desc">沙箱</span>
+                </div>
+                <div class="command-item animate-on-scroll">
+                    <span class="command-slash">/</span>
+                    <span class="command-name">memory</span>
+                    <span class="command-desc">记忆</span>
+                </div>
+                <div class="command-item animate-on-scroll">
+                    <span class="command-slash">/</span>
+                    <span class="command-name">team</span>
+                    <span class="command-desc">群狼编排</span>
+                </div>
+                <div class="command-item animate-on-scroll">
+                    <span class="command-slash">/</span>
+                    <span class="command-name">diff</span>
+                    <span class="command-desc">Git 变更</span>
+                </div>
+                <div class="command-item animate-on-scroll">
+                    <span class="command-slash">/</span>
+                    <span class="command-name">cost</span>
+                    <span class="command-desc">账单</span>
+                </div>
+                <div class="command-item animate-on-scroll">
+                    <span class="command-slash">/</span>
+                    <span class="command-name">doctor</span>
+                    <span class="command-desc">体检</span>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Installation Section -->
+    <section class="section install-section" id="install">
+        <div class="container">
+            <div class="install-content">
+                <div class="install-code animate-on-scroll">
+                    <button class="copy-btn" onclick="copyInstallCode()">复制</button>
+                    <pre><span class="comment"># 一键安装，开箱即用</span>
+
+<span class="command">chmod</span> +x install.sh && ./install.sh
+
+<span class="comment"># 或者直接运行</span>
+<span class="command">bash</span> <(curl -sL https://scream.sh/install)
+
+<span class="comment"># 启动 Scream Code</span>
+<span class="highlight">scream</span></pre>
+                </div>
+                <div class="install-info animate-on-scroll">
+                    <h3>安装只需一步</h3>
+                    <p>脚本会替你完成环境探针、依赖安装、Playwright 初始化等所有脏活累活。</p>
+                    <ul class="install-steps">
+                        <li>
+                            <span class="step-number">1</span>
+                            <span>克隆仓库或下载安装脚本</span>
+                        </li>
+                        <li>
+                            <span class="step-number">2</span>
+                            <span>执行安装脚本，自动配置环境</span>
+                        </li>
+                        <li>
+                            <span class="step-number">3</span>
+                            <span>输入 API Key，立即开始使用</span>
+                        </li>
+                    </ul>
+                    <button class="btn-primary" style="margin-top: 1.5rem;">
+                        <span>⚡</span>
+                        立即体验
+                    </button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Stats Section -->
+    <section class="section stats-section" id="stats">
+        <div class="container">
+            <div class="stats-grid">
+                <div class="stat-item animate-on-scroll">
+                    <div class="stat-number">141</div>
+                    <div class="stat-label">内建命令</div>
+                </div>
+                <div class="stat-item animate-on-scroll">
+                    <div class="stat-number">207</div>
+                    <div class="stat-label">工具条目</div>
+                </div>
+                <div class="stat-item animate-on-scroll">
+                    <div class="stat-number">184</div>
+                    <div class="stat-label">技能模块</div>
+                </div>
+                <div class="stat-item animate-on-scroll">
+                    <div class="stat-number">100%</div>
+                    <div class="stat-label">本地优先</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <div class="footer-content">
+            <div class="footer-logo">
+                <div class="logo-icon">⚡</div>
+                <span>Scream Code</span>
+            </div>
+            <p class="footer-desc">
+                One terminal. One command. Local-first AI that actually ships.
+            </p>
+            <div class="footer-links">
+                <a href="#">GitHub</a>
+                <a href="#">文档</a>
+                <a href="#">Discord</a>
+                <a href="#">Twitter</a>
+            </div>
+            <p class="footer-copy">
+                Made with <span class="heart">❤</span> by developers, for developers
+            </p>
+        </div>
+    </footer>
+
+    <script>
+        // Canvas Background Animation
+        const canvas = document.getElementById('bg-canvas');
+        const ctx = canvas.getContext('2d');
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        // Particle system
+        class Particle {
+            constructor() {
+                this.reset();
+            }
+
+            reset() {
+                this.x = Math.random() * canvas.width;
+                this.y = Math.random() * canvas.height;
+                this.size = Math.random() * 2 + 0.5;
+                this.speedX = (Math.random() - 0.5) * 0.5;
+                this.speedY = (Math.random() - 0.5) * 0.5;
+                this.opacity = Math.random() * 0.5 + 0.2;
+                this.hue = Math.random() > 0.5 ? 240 : 280; // Indigo or Purple
+            }
+
+            update() {
+                this.x += this.speedX;
+                this.y += this.speedY;
+
+                if (this.x < 0 || this.x > canvas.width || this.y < 0 || this.y > canvas.height) {
+                    this.reset();
+                }
+            }
+
+            draw() {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fillStyle = `hsla(${this.hue}, 70%, 60%, ${this.opacity})`;
+                ctx.fill();
+            }
+        }
+
+        // Grid lines
+        function drawGrid() {
+            const gridSize = 60;
+            ctx.strokeStyle = 'rgba(99, 102, 241, 0.05)';
+            ctx.lineWidth = 1;
+
+            for (let x = 0; x < canvas.width; x += gridSize) {
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, canvas.height);
+                ctx.stroke();
+            }
+
+            for (let y = 0; y < canvas.height; y += gridSize) {
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(canvas.width, y);
+                ctx.stroke();
+            }
+        }
+
+        // Create particles
+        const particles = [];
+        const particleCount = Math.min(100, Math.floor((canvas.width * canvas.height) / 15000));
+        for (let i = 0; i < particleCount; i++) {
+            particles.push(new Particle());
+        }
+
+        // Animation loop
+        function animate() {
+            ctx.fillStyle = 'rgba(10, 10, 15, 0.1)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            drawGrid();
+
+            particles.forEach(particle => {
+                particle.update();
+                particle.draw();
+            });
+
+            // Draw connections
+            particles.forEach((p1, i) => {
+                particles.slice(i + 1).forEach(p2 => {
+                    const dx = p1.x - p2.x;
+                    const dy = p1.y - p2.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+
+                    if (distance < 150) {
+                        ctx.beginPath();
+                        ctx.moveTo(p1.x, p1.y);
+                        ctx.lineTo(p2.x, p2.y);
+                        ctx.strokeStyle = `rgba(99, 102, 241, ${0.1 * (1 - distance / 150)})`;
+                        ctx.stroke();
+                    }
+                });
+            });
+
+            requestAnimationFrame(animate);
+        }
+        animate();
+
+        // Scroll animations
+        const observerOptions = {
+            threshold: 0.1,
+            rootMargin: '0px 0px -50px 0px'
+        };
+
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('visible');
+                }
+            });
+        }, observerOptions);
+
+        document.querySelectorAll('.animate-on-scroll').forEach(el => {
+            observer.observe(el);
+        });
+
+        // Copy installation code
+        function copyInstallCode() {
+            const code = `chmod +x install.sh && ./install.sh`;
+            navigator.clipboard.writeText(code).then(() => {
+                const btn = document.querySelector('.copy-btn');
+                btn.textContent = '已复制!';
+                setTimeout(() => {
+                    btn.textContent = '复制';
+                }, 2000);
+            });
+        }
+
+        // Smooth scroll for navigation
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function(e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({ behavior: 'smooth' });
+                }
+            });
+        });
+
+        // Typing effect for terminal
+        const terminalCommands = [
+            { cmd: 'scream "帮我分析这段代码"', output: '✓ 已为您分析完成，发现 3 处优化点' },
+            { cmd: '/team 前端架构审查', output: '✓ 团队已组建，3 个 Agent 正在并行工作' },
+            { cmd: '/memory set python.style "双引号+类型注解"', output: '✓ 规则已保存，将在各会话中生效' }
+        ];
+
+        let currentCmdIndex = 0;
+
+        function typeNextCommand() {
+            if (currentCmdIndex >= terminalCommands.length) {
+                currentCmdIndex = 0;
+            }
+
+            const terminalBody = document.getElementById('terminal-output');
+            const cmd = terminalCommands[currentCmdIndex];
+
+            // Add new command
+            const line = document.createElement('div');
+            line.className = 'terminal-line';
+            line.style.marginTop = '1rem';
+            line.innerHTML = `
+                <span class="terminal-prompt">➜</span>
+                <span class="terminal-command">${cmd.cmd}</span>
+            `;
+            terminalBody.appendChild(line);
+
+            // Add output
+            const output = document.createElement('div');
+            output.className = 'terminal-output';
+            output.innerHTML = `<span class="success">${cmd.output}</span>`;
+            terminalBody.appendChild(output);
+
+            // Scroll to bottom
+            terminalBody.scrollTop = terminalBody.scrollHeight;
+
+            currentCmdIndex++;
+        }
+
+        // Execute typing effect every 5 seconds
+        setInterval(typeNextCommand, 5000);
+    </script>
+</body>
+</html>
